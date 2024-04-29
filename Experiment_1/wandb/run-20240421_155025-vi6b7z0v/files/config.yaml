@@ -1,0 +1,90 @@
+wandb_version: 1
+
+_wandb:
+  desc: null
+  value:
+    python_version: 3.11.9
+    cli_version: 0.16.5
+    framework: lightning
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1713711025.0
+    t:
+      1:
+      - 1
+      - 9
+      - 55
+      - 103
+      2:
+      - 1
+      - 9
+      - 55
+      - 103
+      3:
+      - 7
+      - 23
+      4: 3.11.9
+      5: 0.16.5
+      8:
+      - 5
+      13: linux-x86_64
+    m:
+    - 1: trainer/global_step
+      6:
+      - 3
+    - 1: train_loss_step
+      5: 1
+      6:
+      - 1
+    - 1: epoch
+      5: 1
+      6:
+      - 1
+    - 1: val_loss
+      5: 1
+      6:
+      - 1
+    - 1: predictions_vs_actuals._type
+      5: 1
+      6:
+      - 1
+    - 1: predictions_vs_actuals.sha256
+      5: 1
+      6:
+      - 1
+    - 1: predictions_vs_actuals.size
+      5: 1
+      6:
+      - 1
+    - 1: predictions_vs_actuals.path
+      5: 1
+      6:
+      - 1
+    - 1: predictions_vs_actuals.format
+      5: 1
+      6:
+      - 1
+    - 1: predictions_vs_actuals.width
+      5: 1
+      6:
+      - 1
+    - 1: predictions_vs_actuals.height
+      5: 1
+      6:
+      - 1
+    - 1: train_loss_epoch
+      5: 1
+      6:
+      - 1
+output_dim:
+  desc: null
+  value: 2
+hidden_dim:
+  desc: null
+  value: 64
+latent_dim:
+  desc: null
+  value: 8
+learning_rate:
+  desc: null
+  value: 0.001

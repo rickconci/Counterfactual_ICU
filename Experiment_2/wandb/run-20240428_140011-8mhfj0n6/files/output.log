@@ -1,0 +1,75 @@
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [GPU-8a20deb1-e8a8-fdfe-cb99-24483695d004]
+  | Name      | Type   | Params
+-------------------------------------
+0 | VAE_model | ODEVAE | 80.8 K
+-------------------------------------
+80.8 K    Trainable params
+0         Non-trainable params
+80.8 K    Total params
+0.323     Total estimated model params size (MB)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Epoch 0: 100%|██████████| 50/50 [01:03<00:00,  0.78it/s, v_num=j0n6, train_recon_loss_step=0.743, train_kl_loss_step=0.0113, train_total_loss_step=0.755]
+Validation DataLoader 0:  36%|█████████████████████████████████                                                           | 9/25 [00:01<00:01,  8.19it/s]
+Traceback (most recent call last):
+  File "/home/rc667/Experiment_2/main_2.py", line 96, in <module>
+    main(args)
+  File "/home/rc667/Experiment_2/main_2.py", line 68, in main
+    trainer.fit(ode_vae_model, cv_data_module)
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/trainer.py", line 544, in fit
+    call._call_and_handle_interrupt(
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/call.py", line 44, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/trainer.py", line 580, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/trainer.py", line 989, in _run
+    results = self._run_stage()
+              ^^^^^^^^^^^^^^^^^
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/trainer.py", line 1035, in _run_stage
+    self.fit_loop.run()
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/loops/fit_loop.py", line 203, in run
+    self.on_advance_end()
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/loops/fit_loop.py", line 374, in on_advance_end
+    call._call_callback_hooks(trainer, "on_train_epoch_end", monitoring_callbacks=True)
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/call.py", line 208, in _call_callback_hooks
+    fn(trainer, trainer.lightning_module, *args, **kwargs)
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/callbacks/early_stopping.py", line 183, in on_train_epoch_end
+    self._run_early_stopping_check(trainer)
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/callbacks/early_stopping.py", line 194, in _run_early_stopping_check
+    if trainer.fast_dev_run or not self._validate_condition_metric(  # disable early_stopping with fast_dev_run
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/callbacks/early_stopping.py", line 149, in _validate_condition_metric
+    raise RuntimeError(error_msg)
+
+RuntimeError: Early stopping conditioned on metric `val_loss` which is not available. Pass in or modify your `EarlyStopping` callback to use any of the following: `train_recon_loss`, `train_recon_loss_step`, `train_kl_loss`, `train_kl_loss_step`, `train_total_loss`, `train_total_loss_step`, `val_recon_loss`, `val_kl_loss`, `val_total_loss`, `train_recon_loss_epoch`, `train_kl_loss_epoch`, `train_total_loss_epoch`

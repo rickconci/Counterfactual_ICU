@@ -1,0 +1,49 @@
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [GPU-8a20deb1-e8a8-fdfe-cb99-24483695d004]
+  | Name      | Type   | Params
+-------------------------------------
+0 | VAE_model | ODEVAE | 84.9 K
+-------------------------------------
+84.9 K    Trainable params
+0         Non-trainable params
+84.9 K    Total params
+0.340     Total estimated model params size (MB)
+Traceback (most recent call last):
+  File "/home/rc667/Experiment_2/main_2.py", line 44, in <module>
+    main()
+  File "/home/rc667/Experiment_2/main_2.py", line 37, in main
+    trainer.fit(ode_vae_model, cv_data_module)
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/trainer.py", line 544, in fit
+    call._call_and_handle_interrupt(
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/call.py", line 44, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/trainer.py", line 580, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/trainer.py", line 989, in _run
+    results = self._run_stage()
+              ^^^^^^^^^^^^^^^^^
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/trainer.py", line 1033, in _run_stage
+    self._run_sanity_check()
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/trainer.py", line 1062, in _run_sanity_check
+    val_loop.run()
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/loops/utilities.py", line 182, in _decorator
+    return loop_run(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/loops/evaluation_loop.py", line 134, in run
+    self._evaluation_step(batch, batch_idx, dataloader_idx, dataloader_iter)
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/loops/evaluation_loop.py", line 391, in _evaluation_step
+    output = call._call_strategy_hook(trainer, hook_name, *step_args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/call.py", line 309, in _call_strategy_hook
+    output = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/strategies/strategy.py", line 403, in validation_step
+    return self.lightning_module.validation_step(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rc667/Experiment_2/models_2.py", line 513, in validation_step
+    self.plot_trajectories( X, Y, Y_hat, chart_type = "val" )
+  File "/home/rc667/Experiment_2/models_2.py", line 574, in plot_trajectories
+    "Blood Pressure": Y[:, dim],
+                      ~^^^^^^^^
+IndexError: index 1 is out of bounds for dimension 1 with size 1
+Sanity Checking DataLoader 0:   0%|                                                                                    | 0/2 [00:00<?, ?it/s]

@@ -1,0 +1,23 @@
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [GPU-8a20deb1-e8a8-fdfe-cb99-24483695d004]
+  | Name      | Type   | Params
+-------------------------------------
+0 | VAE_model | ODEVAE | 322 K
+-------------------------------------
+322 K     Trainable params
+0         Non-trainable params
+322 K     Total params
+1.289     Total estimated model params size (MB)
+
+Sanity Checking DataLoader 0:   0%|                                                                                    | 0/2 [00:00<?, ?it/s]
+/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/loops/fit_loop.py:293: PossibleUserWarning:
+The number of training batches (12) is smaller than the logging interval Trainer(log_every_n_steps=50). Set a lower value for log_every_n_steps if you want to see logs for the training epoch.
+
+
+
+
+
+
+Epoch 0:  67%|████████████████████████████████████████▋                    | 8/12 [00:12<00:06,  0.63it/s, v_num=z76n, train_loss_step=5.420]
+/home/rc667/.conda/envs/exp1/lib/python3.11/site-packages/pytorch_lightning/trainer/call.py:54: UserWarning:
+
+Epoch 0:  75%|█████████████████████████████████████████████▊               | 9/12 [00:14<00:04,  0.64it/s, v_num=z76n, train_loss_step=3.480]
