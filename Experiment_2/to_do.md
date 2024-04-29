@@ -1,29 +1,35 @@
 
-Improve code running
-[] place code on github & have strict version control
-[] complete full run on test set as well to make sure that fully saves
-[] make sure model checkpoints will reload the best for test/ further comparison
-[] set up HPC cluster access!!
+## TO DO
 
-[] Switch from pytorch lightning to lightning
-[] set up multi GPU processing
-[] check pytorch profiler to see how can optimise training speed & efficiency
+Improve code running
+
+- [x] place code on github & have strict version control
+- [ ] complete full run on test set as well to make sure that fully saves
+- [ ] make sure model checkpoints will reload the best for test/ further comparison
+- [ ] set up HPC cluster access!!
+
+- [ ] Switch from pytorch lightning to lightning
+- [ ] set up multi GPU processing
+- [ ] check pytorch profiler to see how can optimise training speed & efficiency
 
 -- Assuming we have baseline!
 
 Run BO CDE on HPC
-[] adjust to include L1, L2 and KL penalty on RNN
-[] adjust to have BO loop for hyperparam optim
-[] adjust to have plots occur not so often
-[] adjust plots so they include whether treated or not + other..?
+
+- [ ] adjust to include L1, L2 and KL penalty on RNN
+- [ ] adjust to have BO loop for hyperparam optim
+- [ ] adjust to have plots occur not so often
+- [ ] adjust plots so they include whether treated or not + other..?
 
 Improve the quality of code/models
-[] add batch norm?
-[] add learning rate scheduler if not already there
+
+- [ ] add batch norm?
+- [ ] add learning rate scheduler if not already there
 
 Convert from CDE to SCDE
-[] adjust hyland SDE code to CDE version
-[] understand aspects of SDE code in case missed something important
+
+- [ ] adjust hyland SDE code to CDE version
+- [ ] understand aspects of SDE code in case missed something important
 
 Integrate basic cardiovascular modelling equations as priors in CDEs
 
@@ -33,23 +39,19 @@ Integrate basic cardiovascular modelling equations as priors in CDEs
 
 [] Find best ways of clustering pts through time (read paper)
 
-TO DO
+## Questions
 
-DOING
-
-DONE
-
-##  time forwards or time backwords for the RNN?
+###  Time forwards or time backwords for the RNN?
 In predictive tasks where you're trying to forecast future states based on past observations, encoding with time forwards is generally more appropriate. However, if you're trying to infer the current state based on a full history that includes more relevant recent events, then time backwards might be beneficial.
 
-## KL loss for the encoder or L1/L2 loss?
+### KL loss for the encoder or L1/L2 loss?
 
-## How to best integrate the treatment function in the ODE?
+### How to best integrate the treatment function in the ODE?
 
 currently the treatment_fun takes in the tx and the time, and outputs a function for each timestep... but as an MLP...
 not completely sure if the tx is being applied at every input, and therefore if it could be adjusted if for example the dose changes as well over time (in a continuous setting)...
 
-## Does it make more sense to apply the output function as a pointwise transformation from the latent to the observed... or to take the whole latent as an input and give the whole observed as output??
+### Does it make more sense to apply the output function as a pointwise transformation from the latent to the observed... or to take the whole latent as an input and give the whole observed as output??
 
  Pointwise Transformation
 Advantages:
