@@ -72,14 +72,15 @@ def main(args):
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
         devices= 'auto',
+        deterministic=True,
         logger=wandb_logger,
         log_every_n_steps=50,
         callbacks=callbacks  # Add only initialized callbacks
     )
     
     trainer.fit(ode_vae_model, cv_data_module)
-
-    trainer.test(ode_vae_model, cv_data_module)
+    
+    trainer.test(ckpt_path='best', dataloaders = cv_data_module.test_dataloader())
 
 
 
@@ -109,8 +110,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--learning_rate', type=float, default=2e-3, help='Learning rate for the optimizer')
     parser.add_argument('--batch_size', type=int, default=64, help='Training batch size')
-    parser.add_argument('--max_epochs', type=int, default=30, help='Maximum number of epochs to train')
-    parser.add_argument('--accelerator', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
+    parser.add_argument('--max_epochs', type=int, default=1, help='Maximum number of epochs to train')
+    parser.add_argument('--accelerator', type=str, default='mps', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
     #parser.add_argument('--devices', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which number of devices to use')
 
     
