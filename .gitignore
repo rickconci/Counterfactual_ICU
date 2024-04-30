@@ -1,0 +1,4 @@
+Experiment_*/__pycache__/
+Experiment_*/lightning_logs/
+Experiment_*/model_checkpoints/
+Experiment_*/wandb/

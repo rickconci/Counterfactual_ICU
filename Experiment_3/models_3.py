@@ -22,7 +22,8 @@ from torch.autograd import Variable
 from torch import float32
 from torch.utils.data import Dataset, DataLoader, Subset
 
-import pytorch_lightning as pl
+import lightning as L
+from lightning import LightningModule
 
 from torchdiffeq import odeint_adjoint as odeint
 import wandb
@@ -59,17 +60,17 @@ class MLPSimple(nn.Module):
         ])
 
     def forward(self, x):
-        #print(f"Forward pass started with input shape: {x.shape}")
+        ##print(f"Forward pass started with input shape: {x.shape}")
         x = self.input_layer(x)
-        #print(f"Post input layer shape: {x.shape}")
+        ##print(f"Post input layer shape: {x.shape}")
         
         for i, mod in enumerate(self.layers):
             x_old_shape = x.shape
             x = mod(x)
-            #print(f"Layer {i+1}: input shape: {x_old_shape}, output shape: {x.shape}")
+            ##print(f"Layer {i+1}: input shape: {x_old_shape}, output shape: {x.shape}")
         
         x = self.output_layer(x)
-        #print(f"Post output layer shape: {x.shape}")
+        ##print(f"Post output layer shape: {x.shape}")
         return x
 
 
@@ -79,10 +80,10 @@ class RNNEncoder(nn.Module):
         super(RNNEncoder, self).__init__()
         self.input_dim = input_dim  # input = output = 2
         self.hidden_dim = hidden_dim  # hidden_dim = 64
-        self.latent_dim = latent_dim  # latent_dim = 3
+        self.latent_dim = latent_dim  # latent_dim = 
 
         self.rnn = nn.GRU(input_dim + 1, hidden_dim, batch_first=True)
-        self.hid2lat = nn.Linear(hidden_dim, 2 * latent_dim)
+        self.hid2lat = nn.Linear(hidden_dim, latent_dim)
 
     def forward(self, x, t):
         #print('Initial x shape:', x.shape)  # Expected: [batch_size, seq_length, input_dim]
@@ -101,8 +102,7 @@ class RNNEncoder(nn.Module):
 
         # Reverse the sequence along the time dimension
         #xt = xt.flip(dims=[1])
-        
-        #print('Reversed xt shape:', xt_reversed.shape)  # Should match xt's shape
+        ##print('reversed xt shape:', xt.shape)  # Should match xt's shape
 
         # Apply the RNN
         _, h0 = self.rnn(xt)
@@ -110,79 +110,31 @@ class RNNEncoder(nn.Module):
 
         # Process the last hidden state to produce latent variables
         z0 = self.hid2lat(h0.squeeze(0))  # Remove the first dimension
-        ##print('Latent variable z0 shape:', z0.shape)  # Expected: [batch_size, 2 * latent_dim]
+        #print('Latent variable z0 shape:', z0.shape)  # Expected: [batch_size, 2 * latent_dim]
 
         # Split the output into mean and log-variance components
         z0_mean = z0[:, :self.latent_dim]
-        z0_log_var = z0[:, self.latent_dim:]
+        #z0_log_var = z0[:, self.latent_dim:]
         #print('z0_mean shape:', z0_mean.shape)  # Expected: [batch_size, latent_dim]
-        #print('z0_log_var shape:', z0_log_var.shape)  # Expected: [batch_size, latent_dim]
+        ##print('z0_log_var shape:', z0_log_var.shape)  # Expected: [batch_size, latent_dim]
 
-        return z0_mean, z0_log_var
+        return z0_mean #z0_log_var
 
 
-
-'''
-class ControlledODE(nn.Module):
-    def __init__(self, latent_dim, hidden_dim, Tx_dim, theta, mu):
-        super().__init__()
-        
-        self.theta = theta
-        self.mu = mu
-        
-        self.Tx_dim = Tx_dim
-        u_dim = int(latent_dim / 2)
-        self.treatment_fun = MLPSimple(input_dim=Tx_dim, output_dim=u_dim, hidden_dim=hidden_dim, depth=4, activations=[nn.ReLU() for _ in range(4)])
-        self.ode_drift = MLPSimple(input_dim=latent_dim + u_dim, output_dim=latent_dim, hidden_dim=4*hidden_dim, depth=4, activations=[nn.Tanh() for _ in range(4)])
-    
-    def fun_treatment(self, t):
-        #this is the control process 
-        return self.treatment_fun(t)
-
-    def h(self, t, y):
-        #this is the mean reverting process
-        return self.theta * (self.mu - y)
-
-    def f_aug(self, t, y, T):
-        #this is the drift process 
-        u = self.fun_treatment(t.repeat(y.shape[0], 1))
-        u_t = u * T[:, None]
-        #print('u_t', u_t.shape)
-        y_and_u = torch.cat((y, u_t), -1)
-
-        drift = self.ode_drift(y_and_u)
-        #print('drift', drift.shape)
-        correction = self.h(t, y) #the correction is a mean reverting process
-        #print('correction', correction.shape) 
-        corrected_drift = drift - correction
-
-        null_dim = torch.zeros(corrected_drift.shape[0], self.Tx_dim, device=corrected_drift.device)
-        augmented_corrected_drift = torch.cat([corrected_drift, null_dim], dim=-1)
-        #print('augmented_corrected_drift', augmented_corrected_drift.shape)
-
-        return augmented_corrected_drift
-    
-    def forward(self, t, y):
-        T = y[:, -1]  # Last dimension for control variable
-        y = y[:, 0:-1]  # Remaining dimensions for state
-        #print('T', T.shape)
-        #print('y', y.shape)
-        return self.f_aug(t, y, T)
-
-'''
 
 class LatentSDE(torchsde.SDEIto):
-    def __init__(self,theta,mu, sigma, embedding_dim):
+    def __init__(self,latent_dim, hidden_dim, Tx_dim, theta, mu, sigma):
+
         super().__init__(noise_type="diagonal")
     
         self.theta = theta
         self.mu = mu
         self.register_buffer("sigma", torch.tensor([[sigma]]))
         
-        u_dim = int(embedding_dim/5)
+        u_dim = int(latent_dim/5)
         self.treatment_fun = MLPSimple(input_dim = 1, output_dim = u_dim, hidden_dim = 20, depth = 4, activations = [nn.ReLU() for _ in range(4)] )
         
-        self.sde_drift = MLPSimple(input_dim = embedding_dim + u_dim, output_dim = embedding_dim, hidden_dim = 4*embedding_dim, depth = 4, activations = [nn.Tanh() for _ in range(4)])
+        self.sde_drift = MLPSimple(input_dim = latent_dim + u_dim, output_dim = latent_dim, hidden_dim = 4*latent_dim, depth = 4, activations = [nn.Tanh() for _ in range(4)])
    
     
     def fun_treatment(self,t):
@@ -217,36 +169,50 @@ class LatentSDE(torchsde.SDEIto):
 
 
 class Neural_SDE_integrator(nn.Module):
-    def __init__(self, latent_dim, hidden_dim, Tx_dim, theta, mu):
+    def __init__(self, latent_dim, hidden_dim, num_samples, Tx_dim, theta, mu, sigma):
         super(Neural_SDE_integrator, self).__init__()
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
-
+        self.num_samples = num_samples
         self.Tx_dim = Tx_dim
         self.theta = theta
         self.mu = mu
+        self.sigma = sigma
                         #theta,mu, sigma, embedding_dim
         self.sde_func = LatentSDE(latent_dim= latent_dim, 
                                       hidden_dim=hidden_dim, 
                                       Tx_dim= Tx_dim,
                                       theta = theta, 
-                                      mu = mu)
+                                      mu = mu, 
+                                      sigma = sigma)
 
     def forward(self, z0, t, Tx):
+
         batch_size = z0.shape[0]
+    
         
 
         t = t[0] if t.ndim > 1 else t
         t = t.flatten()  
         #print('time dim for ODE', t.shape) #= [time]
 
-        
+        #print('Z0',z0.shape )
+        #print('aug_num_samples', torch.zeros(batch_size,self.num_samples, 1).shape)
+
+        #print('Tx', Tx.shape) # shape = batch
+        # let's convert now to batch x num_samples x 1
+        Tx = Tx.unsqueeze(1).unsqueeze(2)
+        Tx = Tx.repeat(1, self.num_samples, 1)  
+        #print('Aug Tx', Tx.shape)
 
         # For each SDE sample, adding Tx as part of the initial state + an empty dim for the LogQ for that SDE sample
-        aug_y0 = torch.cat([z0, torch.zeros(self.num_samples,batch_size, 1).to(z0), Tx.repeat(self.num_samples,1)[...,None].to(z0)], dim=-1)
+        aug_y0 = torch.cat([z0, torch.zeros(batch_size,self.num_samples, 1).to(z0), Tx.to(z0)], dim=-1)
+
+        #print('aug_y0', aug_y0.shape)
         dim_aug = aug_y0.shape[-1]
         aug_y0 = aug_y0.reshape(-1,dim_aug)
-        #print('augmented_init_state', augmented_init_state.shape)
+        #print('augmented_init_state', aug_y0.shape)
+
 
 
         options = {'dtype': torch.float32} 
@@ -275,21 +241,20 @@ class Neural_SDE_integrator(nn.Module):
 
 class SDE_VAE(nn.Module):
     def __init__(self, 
-                 input_dim, output_dim, hidden_dim, latent_dim, 
+                 input_dim, output_dim, hidden_dim, latent_dim, num_samples,  
                  use_whole_trajectory, post_tx_ode_len, Tx_dim,
-                 theta, mu ):
+                 theta, mu, sigma, dropout_p= 0.2):
         
         super(SDE_VAE, self).__init__()
         self.input_dim = input_dim #dim of input in observed space 
         self.output_dim = output_dim #dim of the output in the observed space
         self.latent_dim = latent_dim #dim of the latent space  
         self.hidden_dim = hidden_dim #dim of the hidden layers in NNs
+        self.num_samples = num_samples #number of latent SDE samples
 
         self.post_tx_ode_len = post_tx_ode_len
         self.use_whole_trajectory = use_whole_trajectory #whether the output fun is applied pointwise to the latent ODE or takes in the whole traj and then converts to observed
         
-        self.augmented_dim = latent_dim + Tx_dim #augmented dim depends on num_samples + logqp gaps 
-
         self.encoder = RNNEncoder(input_dim, 
                                   hidden_dim, 
                                   latent_dim)
@@ -297,75 +262,69 @@ class SDE_VAE(nn.Module):
         self.forward_SDE_latent = Neural_SDE_integrator(latent_dim = latent_dim, 
                                                    hidden_dim = hidden_dim, 
                                                    Tx_dim= Tx_dim,
+                                                   num_samples = num_samples, 
                                                    theta= theta, 
-                                                   mu=mu) 
+                                                   mu=mu, 
+                                                   sigma = sigma) 
 
-        self.output_fun = MLPSimple(input_dim=self.augmented_dim * (post_tx_ode_len if self.use_whole_trajectory else 1),
+        self.output_fun = MLPSimple(input_dim=self.latent_dim * (post_tx_ode_len if self.use_whole_trajectory else 1),
                             output_dim=self.output_dim * (post_tx_ode_len if self.use_whole_trajectory else 1),
                             hidden_dim=self.hidden_dim,
                             depth=3,
                             activations=[nn.ReLU() for _ in range(3)],
                             dropout_p=[0.5 for _ in range(3)])
         
-        self.output_fun_2 = MLPSimple(input_dim = self.augmented_dim, output_dim= self.output_dim , hidden_dim = self.augmented_dim, depth = 3, activations = [nn.ReLU(),nn.ReLU(),nn.Tanh()], dropout_p = [dropout_p,dropout_p,dropout_p])
-
 
         
 
-    def forward(self, x, Tx, time_in, time_out,  MAP=False):
+    def forward(self, x, Tx, time_in, time_out,  MAP=True):
         # takes in:
         # x:  observed trajectory until treatment time 
         # time_in: time from start to treatment time 
         # time_out: time form treatment time to finish
         # Tx: treatment presence: binary vector with 1 = treated, 0 = untreated
 
-        #In Hyland they have: 
-        #   output, hn = self.encoder(X), where encoder is GRU
-        #   encoding_ts = self.out_encoder(hn)[-1]
-
         #We instead have the RNN to have the option of having a variational RNN latent, so split between the mean and var 
-        z_mean, z_log_var = self.encoder(x, time_in)
-        z = z_mean if MAP else z_mean + torch.randn_like(z_mean) * torch.exp(0.5 * z_log_var) #if MAP then we do NOT sample (for validation), otherwise we sample
+        z_mean = self.encoder(x, time_in)
+        z = z_mean #if MAP else z_mean + torch.randn_like(z_mean) * torch.exp(0.5 * z_log_var) #if MAP then we do NOT sample, so effectively it's not longer variational, otherwise we sample
 
 
-        # Repeat the z encoding for each number of samples that we will generate with the SDE
-        z = z.repeat(self.num_samples,1,1)
+        # z shape starts as batch x latent, and I want to convert it to batch x num_samples x latent 
+        z = z.unsqueeze(1)  # Add an extra dimension: shape becomes [batch, 1, latent]
+        z = z.repeat(1, self.num_samples, 1) 
     
         # Generating latent dynamics using the SDE
         latent_traj, logqp = self.forward_SDE_latent(z, time_out, Tx)
-        print('latentSDEoutput', latent_traj.shape) #batch_size x num_samples x times x dim
+        #print('latentSDEoutput', latent_traj.shape) #batch_size x num_samples x times x latent_dim
         
 
         # Apply the output function based on the configuration (need to correct!!)
         if self.use_whole_trajectory:
             batch_size, num_samples, seq_len , _ = latent_traj.shape
-
             latent_traj_flat = latent_traj.reshape(batch_size, -1)  # Flatten the entire trajectory
-            observed_traj_flat = self.output_fun(latent_traj_flat)  # Process the whole trajectory
-            observed_traj = observed_traj_flat.reshape(batch_size, seq_len, self.output_dim)  # Reshape back
+            pred_traj_flat = self.output_fun(latent_traj_flat)  # Process the whole trajectory
+            predicted_traj = pred_traj_flat.reshape(batch_size, num_samples, seq_len, self.output_dim)  # Reshape back
         else:
             # Flatten for pointwise processing
             batch_size, num_samples, seq_len , _ = latent_traj.shape
-            latent_traj_flat = latent_traj.reshape(batch_size * seq_len * num_samples, self.augmented_dim) #in this case the augmented dim depends on num_samples
-            observed_traj_flat = self.output_fun(latent_traj_flat)
-            observed_traj = observed_traj_flat.reshape(batch_size, seq_len, self.output_dim)
+            latent_traj_flat = latent_traj.reshape(-1, self.latent_dim)  
+            pred_traj_flat = self.output_fun(latent_traj_flat)
+            predicted_traj = pred_traj_flat.reshape(batch_size, num_samples, seq_len, self.output_dim)
 
-
-        #might not work as output_fun expects a different shape for input!
-        observed_traj = self.output_fun_2(latent_traj).permute(1,2,0,3) # num_samples x batch x times x dims
 
         #may also want to adjust output so it's still:  batch x num_samples x times x dims
 
-        return z, z_mean, z_log_var, latent_traj, logqp, observed_traj,
+        return z, latent_traj, logqp, predicted_traj
+        
 
     
 
 
 
-class SDE_VAE_Lightning(pl.LightningModule):
+class SDE_VAE_Lightning(LightningModule):
     def __init__(self, input_dim, output_dim, hidden_dim, latent_dim, 
                  use_whole_trajectory, post_tx_ode_len, Tx_dim, 
-                 theta, mu, KL_weighting, learning_rate, 
+                 theta, mu, sigma,  KL_weighting, learning_rate, 
                  num_samples=5, 
                  output_scale = 0.01,
                  start_scheduler = 200, 
@@ -376,17 +335,20 @@ class SDE_VAE_Lightning(pl.LightningModule):
                                 output_dim = output_dim, 
                                 hidden_dim = hidden_dim, 
                                 latent_dim = latent_dim, 
+                                num_samples = num_samples, 
                                 use_whole_trajectory = use_whole_trajectory, 
                                 post_tx_ode_len = post_tx_ode_len,
                                 Tx_dim = Tx_dim, 
                                 theta = theta, 
-                                mu=mu)
+                                mu=mu, 
+                                sigma = sigma)
         
 
         self.post_tx_ode_len = post_tx_ode_len
         self.num_samples = num_samples
 
         self.loss = GaussianNLLLoss(reduction = "none")
+        self.MSE_loss = nn.MSELoss(reduction = "none")
         self.output_scale = torch.tensor([output_scale], requires_grad = False, device = self.device)
 
         self.KL_weighting = KL_weighting
@@ -398,40 +360,60 @@ class SDE_VAE_Lightning(pl.LightningModule):
     def forward(self, x, t, MAP=False):
         return self.VAE_model(x, t, MAP)
     
-    def compute_factual_loss(self,Y,Y_hat,logqp):
+    def compute_factual_loss(self, Y, Y_hat, logqp):
+        #print('Y initial:', Y.shape)  # Shape of ground truth data
+        #print('Y_hat initial:', Y_hat.shape)  # Shape of predicted data from SDE
 
-        print('Y', Y.shape)
-        print('Y_hat', Y_hat.shape)
+        # Convert Y_true to match Y_hat shape: batch x num_samples x times x dims, by repeating for each num_sample 
+        # so that each sample can be compared to the ground truth. Also make sure that the Y sequence length is as
+        # previously established (the gap between t* and the end), given by post_tx_ode_len
+        Y_expanded = Y[:, :self.post_tx_ode_len, :].unsqueeze(1)
+        Y_true = Y_expanded.repeat(1, self.num_samples, 1, 1)  
+        #print('Y_true after repeat:', Y_true.shape)
 
-        #convert Y_true to match Y_hat shape: batch x num_samples x times x dims, by repeating for each num_sample (sample from the SDE) so that each sample can be compared to the ground truth
-        # Also make sure that the Y sequence length is as previously established (the gap between t* and the end), given by post_tx_ode_len
-        Y_true = Y[:,:self.post_tx_ode_len,:].repeat(self.num_samples,1,1,1)
+        # Apply the negative gaussian log likelihood loss between the true trajectory and the predicted SDE trajectories,
+        # with a Standard dev preset by output_scale (why preset?)
+        fact_loss = self.loss(Y_true, Y_hat, self.output_scale.repeat(Y_hat.shape).to(self.device))
+        fact_loss = fact_loss.sum((2, 3))  # sum across times and dims (keeping for each batch and SDE sample)
+        #print('fact_loss after sum:', fact_loss.shape)
 
-
-        #Apply the negative gaussian log likelihood loss between the true trajectory and the predicted SDE trajectories, with a Standard dev preset by output_scale (why preset?)
-        fact_loss = self.loss(Y_true,Y_hat, self.output_scale.repeat(Y_hat.shape).to(self.device))
-        fact_loss = fact_loss.sum((2,3))  # sum across times and dims (keeping for each batch and SDE sample )
-
-        #MSE loss between the Y true and the MEAN of the SDE samples predictions
-        mse_recon_loss = torch.sqrt(self.MSE_loss(Y[:,:self.post_tx_ode_len,:],Y_hat.mean(1))).mean()
-        #now find the mean of the standard devs of the predictions across the SDE samples
+        # MSE loss between the Y true and the MEAN of the SDE samples predictions
+        mse_recon_loss = torch.sqrt(self.MSE_loss(Y[:, :self.post_tx_ode_len, :], Y_hat.mean(1))).mean()
+        # Now find the mean of the standard devs of the predictions across the SDE samples
         std_preds = Y_hat.std(1).mean()
 
-        #now find the total loss: the average gaussian log likelihood across across SDE samples for the batch + mean logQP across samples & batch 
-        SDE_loss = fact_loss.mean() + self.kl_param * logqp.mean() * self.kl_scheduler.val 
+        # Now find the total loss: the average gaussian log likelihood across SDE samples for the batch + mean logQP across samples & batch
+        SDE_loss = fact_loss.mean() + self.KL_weighting * logqp.mean() * self.kl_scheduler.val 
+        #print('Final SDE loss:', SDE_loss)
 
         return SDE_loss, mse_recon_loss, std_preds
 
-    def compute_counterfactual_loss(self,Y,Y_cf, Y_hat,Y_hat_cf):
+    
+    def compute_counterfactual_loss(self, Y, Y_cf, Y_hat, Y_hat_cf):
+        #print('Y:', Y.shape)
+        #print('Y_cf:', Y_cf.shape)
+        #print('Y_hat:', Y_hat.shape)
+        #print('Y_hat_cf:', Y_hat_cf.shape)
 
-        mse_cf = torch.sqrt(self.MSE_loss(Y_cf[:,:self.post_tx_ode_len,:],Y_hat_cf.mean(1))).mean()
+        # MSE loss between the counterfactual Y and the MEAN of the SDE counterfactual predictions
+        mse_cf = torch.sqrt(self.MSE_loss(Y_cf[:, :self.post_tx_ode_len, :], Y_hat_cf.mean(1))).mean()
+        #print('mse_cf:', mse_cf)
+
+        # Standard deviation of predictions across the SDE counterfactual samples
         std_preds_cf = Y_hat_cf.std(1).mean()
+        #print('std_preds_cf:', std_preds_cf)
 
-        ite  = (Y_cf[:,:self.post_tx_ode_len,:] - Y[:,:self.post_tx_ode_len,:])
+        # Individual Treatment Effect computed as the difference between Y_cf and Y
+        ite = (Y_cf[:, :self.post_tx_ode_len, :] - Y[:, :self.post_tx_ode_len, :])
+        #print('ite:', ite.shape)
 
-        ite_hat = (Y_hat_cf.mean(1)-Y_hat.mean(1)) #average across the num_samples
+        # Predicted Individual Treatment Effect computed as the difference between the mean predictions of Y_hat_cf and Y_hat
+        ite_hat = (Y_hat_cf.mean(1) - Y_hat.mean(1))
+        #print('ite_hat:', ite_hat.shape)
+
+        # MSE of the ITE
         mse_ite = torch.sqrt(self.MSE_loss(ite, ite_hat)).mean()
-
+        #print('mse_ite:', mse_ite)
 
         return mse_cf, mse_ite, std_preds_cf
 
@@ -439,8 +421,8 @@ class SDE_VAE_Lightning(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         #print("Variatinal SDE BEGIN TRAINING STEP")
         X, Y, T, Y_cf, p, thetas_0, time_X, time_Y = batch
-                
-        z, z_mean, z_log_var, latent_traj, logqp, Y_hat = self.VAE_model(X, T, 
+
+        z, latent_traj, logqp, Y_hat = self.VAE_model(X, T, 
                                                              time_in = time_X, 
                                                              time_out = time_Y, 
                                                              MAP=True) 
@@ -462,19 +444,27 @@ class SDE_VAE_Lightning(pl.LightningModule):
         X, Y, T, Y_cf, p, thetas_0, time_X, time_Y = batch
         #print('X', X.shape)
         #print('Y', Y.shape)
-        #print('Y_hat',Y_hat.shape )
+        
        
         #MAP = true as you don't sample the encoder variational latents during validation step 
-        z, z_mean, z_log_var, latent_traj, logqp, Y_hat = self.VAE_model(X, T, 
+        z, latent_traj, logqp, Y_hat  = self.VAE_model(X, T, 
                                                              time_in = time_X, 
                                                              time_out = time_Y,
                                                              MAP=True)
         
+        #print('Y_hat',Y_hat.shape )
+        #print('logqp',logqp.shape )
+        #print('latent_traj', latent_traj.shape)
+        
         SDE_loss, mse, std_preds = self.compute_factual_loss(Y, Y_hat, logqp)
+
+        #print('SDE_loss', SDE_loss.shape)
+        #print('mse_loss', mse.shape)
+        #print('std_preds', std_preds.shape)
 
         
         T_cf = (~T.bool()).long()
-        _, _, _, latent_traj_cf, _, Y_hat_cf = self.VAE_model(X, T_cf, 
+        _, latent_traj_cf, _, Y_hat_cf = self.VAE_model(X, T_cf, 
                                                              time_in = time_X, 
                                                              time_out = time_Y,
                                                              MAP=True)
@@ -504,7 +494,7 @@ class SDE_VAE_Lightning(pl.LightningModule):
        
        
         #MAP = true as you don't sample the encoder variational latents during validation step 
-        z, z_mean, z_log_var, latent_traj, logqp, Y_hat = self.VAE_model(X, T, 
+        z, latent_traj, logqp, Y_hat = self.VAE_model(X, T, 
                                                              time_in = time_X, 
                                                              time_out = time_Y,
                                                              MAP=True)
@@ -513,7 +503,7 @@ class SDE_VAE_Lightning(pl.LightningModule):
 
         
         T_cf = (~T.bool()).long()
-        _, _, _, latent_traj_cf, _, Y_hat_cf = self.VAE_model(X, T_cf, 
+        _, latent_traj_cf, _, Y_hat_cf = self.VAE_model(X, T_cf, 
                                                              time_in = time_X, 
                                                              time_out = time_Y,
                                                              MAP=True)
@@ -532,7 +522,7 @@ class SDE_VAE_Lightning(pl.LightningModule):
         self.log('test_std_preds_cf', std_preds_cf, on_epoch=True, prog_bar=True, logger=True)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr = self.lr)
+        optimizer = torch.optim.Adam(self.parameters(), lr = self.learning_rate)
         
         scheduler = {"monitor": "val_SDE_loss", "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, mode = "min", factor = 0.5, patience = 50, verbose = True)}
         return {"optimizer": optimizer, "lr_scheduler":scheduler}
@@ -761,62 +751,52 @@ class RNNEncoder(nn.Module):
         return z0_mean, z0_log_var
 
 
-''' 
-
-
-
-'''
-
-class LatentSDE(torchsde.SDEIto):
-    def __init__(self,theta,mu, sigma, embedding_dim):
-        super().__init__(noise_type="diagonal")
-    
+class ControlledODE(nn.Module):
+    def __init__(self, latent_dim, hidden_dim, Tx_dim, theta, mu):
+        super().__init__()
+        
         self.theta = theta
         self.mu = mu
-        self.register_buffer("sigma", torch.tensor([[sigma]]))
         
-        u_dim = int(embedding_dim/5)
-        self.treatment_fun = MLPSimple(input_dim = 1, output_dim = u_dim, hidden_dim = 20, depth = 4, activations = [nn.ReLU() for _ in range(4)] )
-        
-        self.sde_drift = MLPSimple(input_dim = embedding_dim + u_dim, output_dim = embedding_dim, hidden_dim = 4*embedding_dim, depth = 4, activations = [nn.Tanh() for _ in range(4)])
-   
+        self.Tx_dim = Tx_dim
+        u_dim = int(latent_dim / 2)
+        self.treatment_fun = MLPSimple(input_dim=Tx_dim, output_dim=u_dim, hidden_dim=hidden_dim, depth=4, activations=[nn.ReLU() for _ in range(4)])
+        self.ode_drift = MLPSimple(input_dim=latent_dim + u_dim, output_dim=latent_dim, hidden_dim=4*hidden_dim, depth=4, activations=[nn.Tanh() for _ in range(4)])
     
-    def fun_treatment(self,t):
+    def fun_treatment(self, t):
+        #this is the control process 
         return self.treatment_fun(t)
 
-    def g(self,t,y):
-        return self.sigma.repeat(y.shape)
+    def h(self, t, y):
+        #this is the mean reverting process
+        return self.theta * (self.mu - y)
 
-    def h(self,t,y):
-        return self.theta * (self.mu-y)
+    def f_aug(self, t, y, T):
+        #this is the drift process 
+        u = self.fun_treatment(t.repeat(y.shape[0], 1))
+        u_t = u * T[:, None]
+        #print('u_t', u_t.shape)
+        y_and_u = torch.cat((y, u_t), -1)
 
-    def f(self,t,y, T):
-        u = self.fun_treatment(t.repeat(y.shape[0],1))
-        u_t = u * T[:,None]
-        y_and_u = torch.cat((y,u_t),-1)
-        return self.sde_drift(y_and_u) - self.h(t,y)
+        drift = self.ode_drift(y_and_u)
+        #print('drift', drift.shape)
+        correction = self.h(t, y) #the correction is a mean reverting process
+        #print('correction', correction.shape) 
+        corrected_drift = drift - correction
+
+        null_dim = torch.zeros(corrected_drift.shape[0], self.Tx_dim, device=corrected_drift.device)
+        augmented_corrected_drift = torch.cat([corrected_drift, null_dim], dim=-1)
+        #print('augmented_corrected_drift', augmented_corrected_drift.shape)
+
+        return augmented_corrected_drift
     
-    def f_aug(self, t, y):  # Drift for augmented dynamics with logqp term.
-        T = y[:,-1]
-        y = y[:, 0:-2]
-        f, g, h = self.f(t, y, T), self.g(t, y), self.h(t, y)
-        u = _stable_division(f - h, g)
-        f_logqp = .5 * (u ** 2).sum(dim=1, keepdim=True)
-        return torch.cat([f, f_logqp, torch.zeros_like(f_logqp)], dim=1)
-    
-    def h_aug(self, t, y):  # Drift for augmented dynamics with logqp term.
-        T = y[:,-1]
-        y = y[:, 0:-2]
-        f, g, h = self.f(t, y, T), self.g(t, y), self.h(t, y)
-        u = _stable_division(f - h, g)
-        f_logqp = .5 * (u ** 2).sum(dim=1, keepdim=True)
-        return torch.cat([h, f_logqp, torch.zeros_like(f_logqp)], dim=1)
-    
-    def g_aug(self, t, y):  # Diffusion for augmented dynamics with logqp term.
-        y = y[:, 0:-2]
-        g = self.g(t, y)
-        g_logqp = torch.zeros((y.shape[0],2), device = y.device)
-        return torch.cat([g, g_logqp], dim=1)
+    def forward(self, t, y):
+        T = y[:, -1]  # Last dimension for control variable
+        y = y[:, 0:-1]  # Remaining dimensions for state
+        #print('T', T.shape)
+        #print('y', y.shape)
+        return self.f_aug(t, y, T)
+
 
 
 

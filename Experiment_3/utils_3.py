@@ -1,4 +1,6 @@
 import torch
+from torch import Tensor
+
 
 
 def _stable_division(a, b, epsilon=1e-7):

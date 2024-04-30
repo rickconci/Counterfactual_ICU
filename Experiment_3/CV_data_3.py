@@ -13,7 +13,7 @@ from torch.nn  import functional as F
 from torch.autograd import Variable
 
 
-import pytorch_lightning as pl
+import lightning as L
 
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
@@ -259,7 +259,7 @@ class CVDataset(Dataset):
     def __len__(self):
         return self.X.shape[0]
 
-class CVDataModule(pl.LightningDataModule):
+class CVDataModule(L.LightningDataModule):
     def __init__(self,batch_size, seed, N_ts, gamma, noise_std, t_span, t_treatment, num_workers = 4, **kwargs):
         
         super().__init__()
