@@ -1,0 +1,11 @@
+name: expLight
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - lightning
+  - matplotlib
+  - pandas
+  - plotly
+  - wandb
+prefix: /home/rc667/.conda/envs/expLight
