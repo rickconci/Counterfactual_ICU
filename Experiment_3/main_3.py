@@ -27,11 +27,15 @@ def set_seed(seed):
 
 def main(args):
     print(torch.cuda.is_available())
+    if args.HPC_run:
+        saving_dir = r'/home/rc667/rds/hpc-work/CF_ICU'
+    else:
+        saving_dir = r'.'
 
     set_seed(args.seed)
 
     if args.log_wandb:
-        wandb_logger = WandbLogger(project=args.project_name, log_model='all')
+        wandb_logger = WandbLogger(project=args.project_name, log_model='all', save_dir = os.path.join(saving_dir, 'model_logs'))
     else:
         wandb_logger = None
 
@@ -51,7 +55,7 @@ def main(args):
     if args.model_checkpoint:
         checkpoint_callback = ModelCheckpoint(
             monitor='val_SDE_loss',        # Ensure this is the exact name used in your logging
-            dirpath='./model_checkpoints',  # Directory to save checkpoints
+            dirpath= os.path.join(saving_dir, 'model_checkpoints'),  # Directory to save checkpoints
             filename='best-checkpoint-{epoch:02d}-{val_SDE_loss:.2f}',
             save_top_k=1,                   # Save only the top 1 model
             mode='min',                     # Minimize the monitored value
@@ -86,6 +90,8 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train a model on CV dataset")
+    parser.add_argument('--HPC_run', action='store_true', help='HPC run or not')
+
     parser.add_argument('--seed', type=int, default=1234, help='Random seed for initialization')
     parser.add_argument('--project_name', type=str, default='SDE_CV', help='Wandb project name')
     parser.add_argument('--log_wandb', type=bool, default=True, help='Whether to log to Weights & Biases')

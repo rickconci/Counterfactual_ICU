@@ -2,6 +2,8 @@ name: expLight
 channels:
   - conda-forge
   - defaults
+  - pytorch
+  - nvidia
 dependencies:
   - lightning
   - matplotlib
@@ -9,6 +11,10 @@ dependencies:
   - plotly
   - wandb
   - scipy
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
   - pip:
       - git+https://github.com/rtqichen/torchdiffeq
       - torchsde
