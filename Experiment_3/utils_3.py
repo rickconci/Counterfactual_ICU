@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+import numpy as np
 
 
 
@@ -7,8 +8,8 @@ def _stable_division(a, b, epsilon=1e-7):
     b = torch.where(b.abs().detach() > epsilon, b, torch.full_like(b, fill_value=epsilon) * ((b>0).float()*2-1))
     return a / b
 
-
-def interpolate_colors(self, color1, color2, num_colors):
+'''
+def interpolate_colors(color1, color2, num_colors):
         colors = []
         for t in np.linspace(0, 1, num_colors):
             r = int(color1[0] + (color2[0] - color1[0]) * t)
@@ -16,6 +17,16 @@ def interpolate_colors(self, color1, color2, num_colors):
             b = int(color1[2] + (color2[2] - color1[2]) * t)
             colors.append(f'rgb({r}, {g}, {b})')
         return colors
+''' 
+
+def interpolate_colors(color1, color2, num_colors):
+    colors = []
+    for t in np.linspace(0, 1, num_colors):
+        r = int(color1[0] + (color2[0] - color1[0]) * t)
+        g = int(color1[1] + (color2[1] - color1[1]) * t)
+        b = int(color1[2] + (color2[2] - color1[2]) * t)
+        colors.append((r, g, b))  # Store as tuple instead of string
+    return colors
 
 
 class LinearScheduler(object):

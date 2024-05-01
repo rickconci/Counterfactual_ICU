@@ -254,7 +254,6 @@ class SDE_VAE(nn.Module):
 
         self.post_tx_ode_len = post_tx_ode_len
         self.use_whole_trajectory = use_whole_trajectory #whether the output fun is applied pointwise to the latent ODE or takes in the whole traj and then converts to observed
-        
         self.encoder = RNNEncoder(input_dim, 
                                   hidden_dim, 
                                   latent_dim)
@@ -324,9 +323,8 @@ class SDE_VAE(nn.Module):
 class SDE_VAE_Lightning(LightningModule):
     def __init__(self, input_dim, output_dim, hidden_dim, latent_dim, 
                  use_whole_trajectory, post_tx_ode_len, Tx_dim, 
-                 theta, mu, sigma,  KL_weighting, learning_rate, 
-                 num_samples=5, 
-                 output_scale = 0.01,
+                 theta, mu, sigma,  KL_weighting, learning_rate, log_wandb, 
+                 num_samples, output_scale,
                  start_scheduler = 200, 
                  iter_scheduler = 600):
         super().__init__()
@@ -353,6 +351,9 @@ class SDE_VAE_Lightning(LightningModule):
 
         self.KL_weighting = KL_weighting
         self.learning_rate = learning_rate
+
+        self.log_wandb = log_wandb
+
 
         self.kl_scheduler = LinearScheduler(start = start_scheduler, iters = iter_scheduler)
         self.save_hyperparameters()
@@ -475,7 +476,8 @@ class SDE_VAE_Lightning(LightningModule):
 
         if batch_idx ==0:
             #self.plot_trajectories( X, Y, Y_hat,latent_traj,  chart_type = "val" )
-            self.plot_SDE_trajectories( X, Y, Y_hat,latent_traj,  chart_type = "val" )
+            if self.log_wandb:
+                self.plot_SDE_trajectories( X, Y, Y_hat, Y_cf, Y_hat_cf, latent_traj,  chart_type = "val" )
             
 
         self.log('val_SDE_loss', SDE_loss, on_epoch=True, prog_bar=True, logger=True)
@@ -511,7 +513,8 @@ class SDE_VAE_Lightning(LightningModule):
         mse_cf, mse_ite, std_preds_cf = self.compute_counterfactual_loss(Y,Y_cf, Y_hat,Y_hat_cf)
 
         if batch_idx ==0:
-            self.plot_SDE_trajectories( X, Y, Y_hat,latent_traj,  chart_type = "test" )
+            if self.log_wandb: 
+                self.plot_SDE_trajectories( X, Y, Y_hat, Y_cf, Y_hat_cf, latent_traj,  chart_type = "test" )
 
         self.log('test_SDE_loss', SDE_loss, on_epoch=True, prog_bar=True, logger=True)
         self.log('test_recon_loss', mse, on_epoch=True, prog_bar=True, logger=True)
@@ -524,15 +527,149 @@ class SDE_VAE_Lightning(LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr = self.learning_rate)
         
-        scheduler = {"monitor": "val_SDE_loss", "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, mode = "min", factor = 0.5, patience = 50, verbose = True)}
+        scheduler = {"monitor": "val_SDE_loss", "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, mode = "min", factor = 0.5, patience = 50)}
         return {"optimizer": optimizer, "lr_scheduler":scheduler}
     
 
-    
-    
-    def plot_SDE_trajectories(self, X, Y, Y_hat,latent_traj,  chart_type = "val"):
+    def plot_latent_trajectories(self, latent_traj, chart_type="val"):
+        start_color = (0,255,127)  # Royal blue
+        end_color = (238,130,238)     # Dark orange
+        
+        latent_colors = interpolate_colors(start_color, end_color, latent_traj.shape[2])
 
-        pass
+        fig = go.Figure()
+        time_latent = np.arange(latent_traj.shape[1])
+        for i in range(latent_traj.shape[2]):
+            mean_latent = np.mean(latent_traj[:, :, i], axis=0)
+            std_latent = np.std(latent_traj[:, :, i], axis=0)
+            upper_bound = mean_latent + std_latent
+            lower_bound = mean_latent - std_latent
+            
+            r, g, b = latent_colors[i]
+            main_color = f'rgb({r}, {g}, {b})'
+            light_color_rgba = f'rgba({r}, {g}, {b}, 0.2)'
+
+
+            fig.add_trace(
+                go.Scatter(x=time_latent, y=mean_latent, mode='lines', name=f'Latent Dim {i}', line=dict(color=main_color))
+            )
+            fig.add_trace(
+                go.Scatter(x=time_latent, y=upper_bound, line=dict(color=light_color_rgba), showlegend=False)
+            )
+            fig.add_trace(
+                go.Scatter(x=time_latent, y=lower_bound, line=dict(color=light_color_rgba), fill='tonexty', showlegend=False)
+            )
+
+        fig.update_layout(height=600, width=800, title_text=f"Latent Trajectories")
+        fig.update_xaxes(title_text="Time Steps")
+        fig.update_yaxes(title_text="Values")
+
+        wandb.log({"Latent SDE trajectories": fig})
+
+    def plot_factual_predicted_trajectories(self, X, Y, Y_hat, chart_type="val"):
+        base_colors = ['dodgerblue', 'sandybrown', 'mediumseagreen', 'mediumorchid', 'coral', 'slategray']
+        light_colors = ['lightblue', 'peachpuff', 'lightgreen', 'plum', 'lightsalmon', 'lightgray']
+        dark_colors = ['darkblue', 'darkorange', 'darkgreen', 'darkorchid', 'darkred', 'darkslategray']
+
+        fig = go.Figure()
+        time_x = np.arange(X.shape[0])
+        time_y = time_x[-1] + 1 + np.arange(Y.shape[0])
+
+        for i in range(max(X.shape[1], Y.shape[1])):  # Handle different dimensions for X and Y/Y_hat
+            if i < Y_hat.shape[2]:  # Ensure we do not go out of index for Y_hat
+                mean_y_hat = np.mean(Y_hat[:, :, i], axis=0)
+                std_y_hat = np.std(Y_hat[:, :, i], axis=0)
+                upper_bound = mean_y_hat + std_y_hat
+                lower_bound = mean_y_hat - std_y_hat
+
+            if i < X.shape[1]:
+                fig.add_trace(
+                    go.Scatter(x=time_x, y=X[:, i], mode='lines', name=f'Input_{i}', line=dict(color=base_colors[i % len(base_colors)]))
+                )
+            if i < Y.shape[1]:
+                fig.add_trace(
+                    go.Scatter(x=time_y, y=Y[:, i], mode='lines', name=f'Factual_{i}', line=dict(color=base_colors[i % len(base_colors)]))
+                )
+                if i < Y_hat.shape[2]:  # Check again to ensure Y_hat has this index
+                    fig.add_trace(
+                        go.Scatter(x=time_y, y=mean_y_hat, mode='lines', name=f'Predicted_{i}', line=dict(color=dark_colors[i % len(dark_colors)]))
+                    )
+                    fig.add_trace(
+                        go.Scatter(x=time_y, y=upper_bound, line=dict(color=light_colors[i % len(light_colors)]), showlegend=False)
+                    )
+                    fig.add_trace(
+                        go.Scatter(x=time_y, y=lower_bound, line=dict(color=light_colors[i % len(light_colors)]), fill='tonexty', showlegend=False)
+                    )
+
+        fig.update_layout(height=600, width=800, title_text=f"Observed & Predicted Trajectories")
+        fig.update_xaxes(title_text="Time Steps")
+        fig.update_yaxes(title_text="Values")
+        wandb.log({"Factual observed & predicted": fig})
+
+    def plot_counterfactual_predicted_trajectories(self, X, Y_cf, Y_hat_cf, chart_type="val"):
+        base_colors = ['dodgerblue', 'sandybrown', 'mediumseagreen', 'mediumorchid', 'coral', 'slategray']
+        light_colors = ['lightblue', 'peachpuff', 'lightgreen', 'plum', 'lightsalmon', 'lightgray']
+        dark_colors = ['darkblue', 'darkorange', 'darkgreen', 'darkorchid', 'darkred', 'darkslategray']
+
+        fig = go.Figure()
+        time_x = np.arange(X.shape[0])
+        time_y = time_x[-1] + 1 + np.arange(Y_cf.shape[0])
+
+        for i in range(max(X.shape[1], Y_cf.shape[1])):  # Handle different dimensions for X and Y/Y_hat
+            if i < Y_hat_cf.shape[2]:  # Ensure we do not go out of index for Y_hat
+                mean_y_hat = np.mean(Y_hat_cf[:, :, i], axis=0)
+                std_y_hat = np.std(Y_hat_cf[:, :, i], axis=0)
+                upper_bound = mean_y_hat + std_y_hat
+                lower_bound = mean_y_hat - std_y_hat
+
+            if i < X.shape[1]:
+                fig.add_trace(
+                    go.Scatter(x=time_x, y=X[:, i], mode='lines', name=f'Input_{i}', line=dict(color=base_colors[i % len(base_colors)]))
+                )
+            if i < Y_cf.shape[1]:
+                fig.add_trace(
+                    go.Scatter(x=time_y, y=Y_cf[:, i], mode='lines', name=f'Counterfactual{i}', line=dict(color=base_colors[i % len(base_colors)]))
+                )
+                if i < Y_hat_cf.shape[2]:  # Check again to ensure Y_hat has this index
+                    fig.add_trace(
+                        go.Scatter(x=time_y, y=mean_y_hat, mode='lines', name=f'Predicted_Counterfactual_{i}', line=dict(color=dark_colors[i % len(dark_colors)]))
+                    )
+                    fig.add_trace(
+                        go.Scatter(x=time_y, y=upper_bound, line=dict(color=light_colors[i % len(light_colors)]), showlegend=False)
+                    )
+                    fig.add_trace(
+                        go.Scatter(x=time_y, y=lower_bound, line=dict(color=light_colors[i % len(light_colors)]), fill='tonexty', showlegend=False)
+                    )
+
+        fig.update_layout(height=600, width=800, title_text=f"Counterfactual 'observed' & predicted")
+        fig.update_xaxes(title_text="Time Steps")
+        fig.update_yaxes(title_text="Values")
+
+        wandb.log({"Counterfactual 'observed' & predicted": fig})
+        
+
+    
+    def plot_SDE_trajectories(self, X, Y, Y_hat, Y_cf, Y_hat_cf, latent_traj, chart_type="val"):
+        # Ensure tensors are on CPU for plotting
+        X = X.cpu().numpy()
+        Y = Y.cpu().numpy()
+        Y_hat = Y_hat.cpu().numpy()
+        Y_cf = Y_cf.cpu().numpy()
+        Y_hat_cf = Y_hat_cf.cpu().numpy()
+        latent_traj = latent_traj.cpu().numpy()
+
+        # Only take the first item of the batch for simplicity
+        X = X[0]
+        Y = Y[0]
+        Y_hat = Y_hat[0]
+        Y_cf = Y_cf[0]
+        Y_hat_cf = Y_hat_cf[0]
+        latent_traj = latent_traj[0]
+
+        self.plot_latent_trajectories(latent_traj, chart_type)
+        self.plot_factual_predicted_trajectories( X, Y, Y_hat, chart_type)
+        self.plot_counterfactual_predicted_trajectories(X, Y_cf, Y_hat_cf, chart_type)
+
 
 
     def plot_trajectories(self, X, Y, Y_hat, latent_traj, chart_type="val"):

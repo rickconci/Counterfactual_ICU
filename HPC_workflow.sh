@@ -18,3 +18,11 @@ module load miniconda/3              # REQUIRED - loads the basic environment
 python main_3.py 
 
 sinfo
+
+
+sintr -t 1:0:0 --gres=gpu:1 -A YOURPROJECT-GPU -p ampere
+
+
+sintr -t 00:20:00 --nodes=1 --gres=gpu:1 --ntasks-per-node=1 --cpus-per-task=3 --partition=ampere -A COMPUTERLAB-SL3-GPU --qos=INTR
+
+sintr -t 00:20:00 --nodes=1 --gres=gpu:1 --ntasks-per-node=1 --partition=ampere -A COMPUTERLAB-SL3-GPU --qos=INTR

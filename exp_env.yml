@@ -9,6 +9,7 @@ dependencies:
   - matplotlib
   - pandas
   - plotly
+  - numpy
   - wandb
   - scipy
   - pytorch
