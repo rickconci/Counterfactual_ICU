@@ -37,7 +37,7 @@
 - CV splits
 - multi-seed runs
 
-Improve code running
+**Improve code running**
 
 - [x] place code on github & have strict version control
 - [x] complete full run on test set as well to make sure that fully saves

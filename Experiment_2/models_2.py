@@ -143,8 +143,9 @@ class ControlledODE(nn.Module):
         return self.theta * (self.mu - y)
 
     def f_aug(self, t, y, T):
-        #this is the drift process 
+        #this is the drift process (t needs to be adjusted to have batches)
         u = self.fun_treatment(t.repeat(y.shape[0], 1))
+
         u_t = u * T[:, None]
         #print('u_t', u_t.shape)
         y_and_u = torch.cat((y, u_t), -1)
