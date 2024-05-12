@@ -3,11 +3,9 @@
 
 **Deadline 7th May**:
 
-- [ ] fix output function of experiment 3 (make sure it's the same as hyland)
-- [ ] rerun exp3 on HPC as batch job using Hyland values
+- [ ]
 - [ ] get hyland paper also on HPC so can run to double check that doing the same
 - [ ] plot the tx function learned by the model
-- [ ] Read and understand VDS code + meet w Francesco
 - [ ] Integrate VDS w Hyland and show uncertainty drop in experiments
 - [ ] Integrate basic cardiovascular modelling equations as priors in CDEs
 - [ ] Go through causal ML to clarify link between current work and standard double ML methods

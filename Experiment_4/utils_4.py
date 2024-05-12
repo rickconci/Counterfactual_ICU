@@ -3,6 +3,27 @@ from torch import Tensor
 import numpy as np
 
 
+CV_params = {"r_tpr_mod": 0.,
+            "f_hr_max": 3.0,
+            "f_hr_min": 2.0 / 3.0,
+            "r_tpr_max": 2.134,
+            "r_tpr_min": 0.5335,
+            "sv_mod": 0.001,
+            "ca": 4.0,
+            "cv": 111.0,
+
+            # dS/dt parameters
+            "k_width": 0.1838,
+            "p_aset": 70,
+            "tau": 20,
+            "p_0lv": 2.03,
+            "r_valve": 0.0025,
+            "k_elv": 0.066,
+            "v_ed0": 7.14,
+            "T_sys": 4. / 15.,
+            "cprsw_max": 103.8,
+            "cprsw_min": 25.9
+}
 
 def _stable_division(a, b, epsilon=1e-7):
     b = torch.where(b.abs().detach() > epsilon, b, torch.full_like(b, fill_value=epsilon) * ((b>0).float()*2-1))

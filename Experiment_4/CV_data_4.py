@@ -1,6 +1,10 @@
 import math
 import numpy as np
 from tqdm import tqdm_notebook as tqdm
+import os
+import pickle
+from pathlib import Path
+
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -264,7 +268,7 @@ class CVDataset(Dataset):
         return self.X.shape[0]
 
 class CVDataModule(L.LightningDataModule):
-    def __init__(self,batch_size, seed, N_ts, gamma, noise_std, t_span, t_treatment, num_workers = 4, **kwargs):
+    def __init__(self,batch_size, seed, N_ts, gamma, noise_std, t_span, t_treatment, data_dir, num_workers = 4,  **kwargs):
         
         super().__init__()
         self.batch_size = batch_size
@@ -276,29 +280,49 @@ class CVDataModule(L.LightningDataModule):
         self.input_dim = 2
         self.output_dim = 1 # number of dimensions to reconstruct in the time series 
 
-        self.N = N_ts
+        self.N_ts = N_ts
         self.gamma = gamma
         self.noise_std = noise_std
         self.t_span = t_span
         self.t_treatment = t_treatment
 
-    def prepare_data(self):
+        self.data_dir = Path(data_dir)
+        self.data_file = self.data_dir/"cv_data_module.pkl"
 
-        dataset = CVDataset(N = self.N, gamma = self.gamma,noise_std =  self.noise_std, seed = self.seed, t_span = self.t_span, t_treatment = self.t_treatment)       
+    def prepare_data(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         
-        self.Tx_dim = dataset.Tx_dim
-        self.post_tx_ode_len = dataset.post_tx_ode_len
+        if self.data_file.exists():
+            print("Loading dataset from pickle file!")
+            with open(self.data_file, "rb") as file:
+                dataset = pickle.load(file)
+        else:
+            print("Creating dataset!")
+            dataset = self.create_data()  # This should return an instance of CVDataset
+            with open(self.data_file, "wb") as file:
+                pickle.dump(dataset, file)
+            print("Data saved to", self.data_file)
+
+        # Splitting the dataset
+        self.setup_splits(dataset)
+
+        return dataset
+
+    def create_data(self):
+        # Your data creation logic here
+        return CVDataset(N=self.N_ts, gamma=self.gamma, noise_std=self.noise_std, t_span=self.t_span, t_treatment=self.t_treatment, seed=self.seed)
+
+    def setup_splits(self, dataset):
         
         train_idx = np.arange(len(dataset))[:int(0.5*len(dataset))]
         val_idx = np.arange(len(dataset))[int(0.5*len(dataset)):]
         test_idx = val_idx[int(len(val_idx)/2):]
         val_idx = val_idx[:int(len(val_idx)/2)]
 
-
         self.train = Subset(dataset,train_idx)
         self.val = Subset(dataset,val_idx)
         self.test = Subset(dataset,test_idx)
-    
+
     def train_dataloader(self):
         return DataLoader(
             self.train,
