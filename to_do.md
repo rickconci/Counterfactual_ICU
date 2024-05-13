@@ -1,4 +1,14 @@
 
+## Debugging SDE
+
+- outputfun: tanh at the last layer not relu
+- optimisers scheduler = {"monitor": "train_total_loss",} instead of val_loss (in case we only calculate the val every n training steps)
+- the encoder in Hyland was NOT including the time.... so now added encode_with_time_dim to select whether to include time or not. Also increased GRU depth to 2 (was 1) and set ```out_encoder(h0)[-1]``` as per hyland paper
+- dropping first time step of predicted traj?
+- adjusted output dim to 1 instead of 2
+- adjusted horizon to 10 seconds instead of 15
+- got rid of: #deterministic=True, #check_val_every_n_epoch=1,  #devices= 'auto', #profiler="simple"   #this helps to identify bottlenecks
+
 ## TO DO
 
 **Deadline 7th May**:

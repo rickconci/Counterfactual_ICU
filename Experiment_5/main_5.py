@@ -12,8 +12,8 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
 
-from CV_data_4 import CVDataModule
-from models_4 import SDE_VAE_Lightning
+from CV_data_5 import CVDataModule
+from models_5 import SDE_VAE_Lightning
 
 
 
@@ -49,8 +49,8 @@ def main(args):
 
     
     cv_data_module = CVDataModule(batch_size=args.batch_size, seed=args.seed, N_ts=1000,
-                                  gamma=args.gamma, noise_std=args.noise_std, t_span=30, t_treatment=15, 
-                                  data_dir = os.path.join(saving_dir, 'data'))
+                                  gamma=args.gamma, noise_std=args.noise_std, t_span=26, t_treatment=15, output_dims=[1],
+                                  data_dir = os.path.join(saving_dir, 'data'), num_workers=4)
     
     cv_data = cv_data_module.prepare_data()
 
@@ -127,16 +127,14 @@ def main(args):
     trainer = Trainer(
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
-        devices= 'auto',
-        deterministic=True,
         logger=wandb_logger,
-        log_every_n_steps=50,
-        check_val_every_n_epoch=1,   #this is so the model isn't clogged up by loggers 
-        callbacks=callbacks,  # Add only initialized callbacks
-        profiler="simple"   #this helps to identify bottlenecks 
-
+        log_every_n_steps=5,
+        callbacks=callbacks
+        #deterministic=True,
+        #check_val_every_n_epoch=1,  
+        #devices= 'auto',
+        #profiler="simple"   #this helps to identify bottlenecks 
     )
-    
     trainer.fit(ode_vae_model, cv_data_module)
     
     trainer.test(ckpt_path='best', dataloaders = cv_data_module.test_dataloader())
@@ -154,13 +152,13 @@ if __name__ == '__main__':
 
     # Data specific args
     parser.add_argument('--gamma', type=float, default=10, help='Gamma defines how confounded the data is. the higher, the less overlap. the lower the more overlap')
-    parser.add_argument('--noise_std', type=float, default=0.005, help='Noise defines how noisy the data is ')
+    parser.add_argument('--noise_std', type=float, default=0.0, help='Noise defines how noisy the data is ')
 
     # Model specific args
     parser.add_argument('--encoder_model', type=str, default='GRU', choices=['LSTM', 'GRU', 'RNN'], help='the type of encoder model')
     parser.add_argument('--latent_type', type=str, default='SDE', choices=['expert', 'hybrid_SDE', 'SDE'], help='the type of model')
-    parser.add_argument('--latent_dim', type=int, default=64, help='Latent dimension for the CDE')
-    parser.add_argument('--hidden_dim', type=int, default=16, help='Hidden dimension across models')
+    parser.add_argument('--latent_dim', type=int, default=32, help='Latent dimension for the CDE')
+    parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension across models')
     parser.add_argument('--use_whole_traj', type=bool, default=False, help='Whether to use the whole trajectory to convert from latent to observed or pointwise')
     parser.add_argument('--output_then_join', type=bool, default=False, help='Whether to convert the expert and SDE latents to output dims then join or to join in latent and then pass to output function MLP')
     parser.add_argument('--dropout_p', type=float, default=0.0, help='Drop out in MLP models ')
@@ -179,7 +177,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for the optimizer')
     parser.add_argument('--batch_size', type=int, default=64, help='Training batch size')
-    parser.add_argument('--max_epochs', type=int, default=4, help='Maximum number of epochs to train')
+    parser.add_argument('--max_epochs', type=int, default=40, help='Maximum number of epochs to train')
     parser.add_argument('--accelerator', type=str, default='mps', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
     #parser.add_argument('--devices', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which number of devices to use')
 

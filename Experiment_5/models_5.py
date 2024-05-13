@@ -19,8 +19,8 @@ import wandb
 import torchsde
 
 
-from utils_4 import _stable_division, GaussianNLLLoss, LinearScheduler, interpolate_colors, CV_params
-from plotting_4 import plot_SDE_trajectories
+from utils_5 import _stable_division, GaussianNLLLoss, LinearScheduler, interpolate_colors, CV_params, print_model_details
+from plotting_5 import plot_trajectories
 
 use_cuda = torch.cuda.is_available()
 
@@ -65,7 +65,7 @@ class MLPSimple(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_dim, variational,encoder_model = 'LSTM', reverse=False):
+    def __init__(self, input_dim, hidden_dim, latent_dim, variational,encode_with_time_dim, encoder_num_layers, encoder_model = 'GRU', reverse=False):
         super(Encoder, self).__init__()
         self.input_dim = input_dim  # obs dim + tx dim
         self.hidden_dim = hidden_dim   
@@ -73,11 +73,13 @@ class Encoder(nn.Module):
         self.encoder_model = encoder_model 
         self.variational = variational
         self.reverse = reverse
-
+        self.encode_with_time_dim = encode_with_time_dim
+        self.encoder_num_layers = encoder_num_layers
+        
         if encoder_model == 'LSTM':
-            self.rnn = nn.LSTM(input_dim + 1, hidden_dim, batch_first=True)
+            self.rnn = nn.LSTM(input_dim + 1 if encode_with_time_dim else input_dim, hidden_dim, num_layers = encoder_num_layers, batch_first=True)
         elif encoder_model == 'GRU':
-            self.rnn = nn.GRU(input_dim + 1, hidden_dim, batch_first=True)
+            self.rnn = nn.GRU(input_dim + 1 if encode_with_time_dim else input_dim, hidden_dim, num_layers = encoder_num_layers, batch_first=True)
 
         if variational:
             self.hid2lat = nn.Linear(hidden_dim, 2*latent_dim)
@@ -90,32 +92,35 @@ class Encoder(nn.Module):
         #print('Initial x shape:', x.shape)  # Expected: [batch_size, seq_length, input_dim]
         #print('Initial t shape:', t.shape)  # Expected: [batch_size, seq_length, 1]
 
+        if self.encode_with_time_dim: # this is how VDS does it 
+            # Calculate the time differences
+            t_diff = torch.zeros_like(t)
+            t_diff[:, 1:] = t[:, 1:] - t[:, :-1]  # Forward differences
+            t_diff[:, 0] = 0.
+            t_diff = t_diff.unsqueeze(-1) 
+            #print('Time differences shape:', t_diff.shape)  # Should match t's shape
 
-        # Calculate the time differences
-        t_diff = torch.zeros_like(t)
-        t_diff[:, 1:] = t[:, 1:] - t[:, :-1]  # Forward differences
-        t_diff[:, 0] = 0.
-        t_diff = t_diff.unsqueeze(-1) 
-        #print('Time differences shape:', t_diff.shape)  # Should match t's shape
-
-        xt = torch.cat((x, t_diff), dim=-1)  # Concatenate along the feature dimension
-        #print('Concatenated xt shape:', xt.shape)  # Expected: [batch_size, seq_length, input_dim + 1]
+            xt = torch.cat((x, t_diff), dim=-1)  # Concatenate along the feature dimension
+            #print('Concatenated xt shape:', xt.shape)  # Expected: [batch_size, seq_length, input_dim + 1]
+        
+        else: # this is how Hyland does it 
+            xt = x
 
         # Reverse the sequence along the time dimension
         if self.reverse:
             xt = xt.flip(dims=[1])
-        ##print('reversed xt shape:', xt.shape)  # Should match xt's shape
+            #print('reversed xt shape:', xt.shape)  # Should match xt's shape
 
-        # Apply the RNN
         _, h0 = self.rnn(xt)
-        #print('Output hidden state h0 shape:', h0.shape)  # Expected: [1, batch_size, hidden_dim]
-
+        #print('Output hidden state h0 shape:', h0.shape)  # Expected: [depth, batch_size, hidden_dim]
+        #print('output_last_dim', h0[-1].shape)
+        
         # Process the last hidden state to produce latent variables
-        z0 = self.hid2lat(h0.squeeze(0))  # Remove the first dimension
-        #print('Latent variable z0 shape:', z0.shape)  # Expected: [batch_size, 2 * latent_dim]
+        z0 = self.hid2lat(h0)[-1]
 
         # Split the output into mean and log-variance components
         if self.variational:
+            
             z0_mean = z0[:, :self.latent_dim]
             z0_log_var = z0[:, self.latent_dim:]
             #print('z0_mean shape:', z0_mean.shape)  # Expected: [batch_size, latent_dim]
@@ -124,7 +129,7 @@ class Encoder(nn.Module):
             return z0_mean, z0_log_var
         
         else:
-            z0_mean = z0[:, :self.latent_dim]
+            z0_mean = z0[:, :]
             #print('z0_mean shape:', z0_mean.shape)  # Expected: [batch_size, latent_dim]
 
             return z0_mean
@@ -167,7 +172,9 @@ class LatentSDE(torchsde.SDEIto):
         y = y[:, 0:-2]
         f, g, h = self.f(t, y, T), self.g(t, y), self.h(t, y)
         u = _stable_division(f - h, g)
+        #print('u', u.shape)
         f_logqp = .5 * (u ** 2).sum(dim=1, keepdim=True)
+        #print('f_logqp', f_logqp.shape)
         return torch.cat([f, f_logqp, torch.zeros_like(f_logqp)], dim=1)
     
     def g_aug(self, t, y):  # Diffusion for augmented dynamics with logqp term.
@@ -311,18 +318,18 @@ class Neural_Expert_SDE_integrator(nn.Module):
         #print('augmented_init_state', aug_y0.shape)
 
 
-        options = {'dtype': torch.float32} 
+        #options = {'dtype': torch.float32} 
 
         aug_ys = torchsde.sdeint(sde=self.sde_func,
                 y0=aug_y0,
                 ts=t,
-                method="srk",
+                method="euler",
                 dt=0.05,
                 adaptive=False,
                 rtol=1e-3,
                 atol=1e-3,
-                names={'drift': "f_aug", 'diffusion': 'g_aug'},
-                options = options)
+                names={'drift': "f_aug", 'diffusion': 'g_aug'})
+                #options = options)
                 
         aug_ys = aug_ys.reshape(-1, self.num_samples, len(t),dim_aug) # reshape for # batch_size x num_samples x times x dim
 
@@ -404,6 +411,8 @@ class SDE_VAE(nn.Module):
                                latent_dim = expert_ODE_size, 
                                variational = True,
                                encoder_model = encoder_model, 
+                               encode_with_time_dim = True, ### Should this be true or false?
+                               encoder_num_layers = 2, ## Set this to be flexible??
                                reverse=False)
         #print('Initialising Encoder non-variational')
         self.encoder_NonVar = Encoder(input_dim = input_dim, 
@@ -411,6 +420,8 @@ class SDE_VAE(nn.Module):
                                latent_dim = latent_dim, 
                                variational = False,
                                encoder_model = encoder_model, 
+                               encode_with_time_dim = False, 
+                               encoder_num_layers = 2, ## Set this to be flexible??
                                reverse=False)
         #print('Initialising Neural_Expert_SDE_integrator')
         self.latent_model = Neural_Expert_SDE_integrator(latent_dim = latent_dim, 
@@ -436,21 +447,21 @@ class SDE_VAE(nn.Module):
                 output_dim=self.output_dim * (post_tx_ode_len if self.use_whole_trajectory else 1),
                 hidden_dim=output_fun_input_dim_expert,
                 depth=output_fun_depth,
-                activations=[nn.ReLU() for _ in range(output_fun_depth)],
+                activations=[nn.ReLU() for _ in range(output_fun_depth - 1)] + [nn.Tanh()], 
                 dropout_p=[dropout_p for _ in range(output_fun_depth)])
         
         self.output_fun_SDE = MLPSimple(input_dim=output_fun_input_dim_SDE * (post_tx_ode_len * num_samples if self.use_whole_trajectory else 1),
                 output_dim=self.output_dim * (post_tx_ode_len * num_samples if self.use_whole_trajectory else 1),
                 hidden_dim=output_fun_input_dim_SDE,
                 depth=output_fun_depth,
-                activations=[nn.ReLU() for _ in range(output_fun_depth)],
+                activations=[nn.ReLU() for _ in range(output_fun_depth - 1)] + [nn.Tanh()], 
                 dropout_p=[dropout_p for _ in range(output_fun_depth)])
         
         self.output_fun = MLPSimple(input_dim=output_fun_input_dim * (post_tx_ode_len if self.use_whole_trajectory else 1),
                         output_dim=self.output_dim * (post_tx_ode_len if self.use_whole_trajectory else 1),
                         hidden_dim=output_fun_input_dim,
                         depth=output_fun_depth,
-                        activations=[nn.ReLU() for _ in range(output_fun_depth)],
+                        activations=[nn.ReLU() for _ in range(output_fun_depth - 1)] + [nn.Tanh()], 
                         dropout_p=[dropout_p for _ in range(output_fun_depth)])
 
         
@@ -515,7 +526,7 @@ class SDE_VAE(nn.Module):
         else:
             predicted_traj = output_function_any(latent_traj)
 
-        return predicted_traj
+        return predicted_traj # here Hyland drops the frist time step 
 
 
     def forward(self, x, Tx, time_in, time_out,  MAP=True):
@@ -564,6 +575,9 @@ class SDE_VAE(nn.Module):
 
 
         #print('predicted_traj_hybrid',predicted_traj_hybrid.shape if predicted_traj_hybrid != None else None)
+        predicted_traj_exp = predicted_traj_exp.contiguous() if predicted_traj_exp != None else None
+        predicted_traj_SDE = predicted_traj_SDE.contiguous() if predicted_traj_SDE != None else None
+        predicted_traj_hybrid = predicted_traj_hybrid.contiguous() if predicted_traj_hybrid != None else None
 
         return z_expt, z_expt_mean, z_log_var_exp, latent_traj_expt, predicted_traj_exp, z_SDE, latent_traj_SDE, logqp_SDE, predicted_traj_SDE, predicted_traj_hybrid
         
@@ -625,6 +639,10 @@ class SDE_VAE_Lightning(LightningModule):
         self.log_wandb = log_wandb
         self.save_hyperparameters()
 
+    def on_fit_start(self):
+        print_model_details(self.VAE_model)
+
+
     def forward(self, x, t, MAP=False):
         return self.VAE_model(x, t, MAP)
     
@@ -637,7 +655,6 @@ class SDE_VAE_Lightning(LightningModule):
         Y_true_SDE_shape = Y_expanded.repeat(1, self.num_samples, 1, 1)  
         #print('Y_true after repeat:', Y_true_SDE_shape.shape)
 
-        #print('Y_hat_SDE', Y_hat_SDE.shape)
 
         ## Apply the negative gaussian log likelihood loss between the enhanced true trajectory and the predicted SDE trajectories,
         ## with a Standard dev preset by output_scale (why preset?)
@@ -667,7 +684,7 @@ class SDE_VAE_Lightning(LightningModule):
         # Now find the mean of the standard devs of the predictions across the SDE samples
         std_preds = Y_hat.std(1).mean()
 
-        # SDE KL LOSS
+        
         if self.latent_type == 'expert':
             kl_expt_loss = self.expert_KL_loss(z_expt_mean, z_log_var_exp)
             SDE_loss, fact_loss, logqp_SDE_mean = (0, 0, 0)
@@ -795,7 +812,7 @@ class SDE_VAE_Lightning(LightningModule):
             if self.log_wandb:
                 #latent_traj = torch.cat([latent_traj_expt, latent_traj_SDE], dim=-1)
                 latent_traj = latent_traj_expt if latent_traj_expt != None else latent_traj_SDE
-                plot_SDE_trajectories( X, Y, Y_hat, Y_cf, Y_hat_cf, latent_traj,  chart_type = "val" )
+                plot_trajectories( X, Y, Y_hat, Y_cf, Y_hat_cf, latent_traj,  chart_type = "val" )
 
         self.log('val_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_SDE_loss', weighted_SDE_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -859,7 +876,7 @@ class SDE_VAE_Lightning(LightningModule):
             if self.log_wandb:
                 #latent_traj = torch.cat([latent_traj_expt, latent_traj_SDE], dim=-1)
                 latent_traj = latent_traj_expt if latent_traj_expt != None else latent_traj_SDE
-                plot_SDE_trajectories( X, Y, Y_hat, Y_cf, Y_hat_cf, latent_traj,  chart_type = "test" )
+                plot_trajectories( X, Y, Y_hat, Y_cf, Y_hat_cf, latent_traj,  chart_type = "test" )
 
         self.log('test_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('test_SDE_loss', weighted_SDE_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
