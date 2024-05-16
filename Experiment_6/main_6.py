@@ -13,8 +13,8 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
 
-from CV_data_5 import CVDataModule
-from models_5 import SDE_VAE_Lightning
+from CV_data_6 import CVDataModule
+from models_6 import SDE_VAE_Lightning
 
 
 

@@ -1,6 +1,11 @@
 import os
 import argparse
+import numpy as np
+from collections import namedtuple
+from typing import Optional, Union
+import math
 
+import wandb
 
 import torch
 from torch import Tensor
@@ -9,18 +14,19 @@ from torch.nn  import functional as F
 from torch.autograd import Variable
 from torch import float32
 from torch.utils.data import Dataset, DataLoader, Subset
+from torch import distributions, nn, optim
 
 import lightning as L
 from lightning import LightningModule
 
 from torchdiffeq import odeint_adjoint as odeint
-import wandb
-
 import torchsde
 
 
-from utils_5 import _stable_division, GaussianNLLLoss, LinearScheduler, interpolate_colors, CV_params, print_model_details
-from plotting_5 import plot_trajectories
+
+
+from utils_6 import _stable_division, GaussianNLLLoss, LinearScheduler, interpolate_colors, CV_params, print_model_details
+from plotting_6 import plot_trajectories
 
 use_cuda = torch.cuda.is_available()
 
@@ -275,6 +281,188 @@ class CV_expert_ODE(nn.Module):
         return diff_res_aug
 
     
+
+
+class Hybrid_LatentSDE(torchsde.SDEIto):
+
+    def __init__(self, expert_dims, SDE_latents_dim, CV_params, mu=None, sigma=None, theta=1.0 ):
+        super(Hybrid_LatentSDE, self).__init__(noise_type="diagonal")
+        #self.sde_type="ito"
+
+        self.SDE_latents_dim = SDE_latents_dim
+        self.expert_dims = expert_dims
+        self.resid_dims = SDE_latents_dim - expert_dims
+        
+        if mu is None:
+            mu = np.zeros(SDE_latents_dim)
+        if sigma is None:
+            sigma = np.ones(SDE_latents_dim) * 0.5
+        
+        logvar = np.log(sigma ** 2 / (2. * theta))
+
+        # Prior drift.
+        self.register_buffer("theta", torch.tensor(theta).view(1, -1).expand(1, SDE_latents_dim).float())
+        self.register_buffer("mu", torch.tensor(mu).view(1, -1).float())
+        self.register_buffer("sigma", torch.tensor(sigma).view(1, -1).float())
+
+        #print('theta init', self.theta.shape)
+        #print('mu init ', self.mu.shape)
+        #print('sigma init', self.sigma.shape)
+
+
+        # p(y0).
+        self.register_buffer("py0_mean", torch.tensor(mu).view(1, -1).float())
+        self.register_buffer("py0_logvar", torch.tensor(logvar).view(1, -1).float())
+
+        # q(y0).
+        self.qy0_mean = nn.Parameter(torch.tensor(mu).view(1, -1).float(), requires_grad=True)
+        self.qy0_logvar = nn.Parameter(torch.tensor(logvar).view(1, -1).float(), requires_grad=True)
+
+        # Approximate posterior drift: Takes in 2 positional encodings and the state.
+        self.net = nn.Sequential(
+            nn.Linear(self.resid_dims, 200),
+            nn.Tanh(),
+            nn.Linear(200, 200),
+            nn.Tanh(),
+            nn.Linear(200, self.resid_dims)
+        )
+        # Initialization trick from Glow.
+        self.net[-1].weight.data.fill_(0.)
+        self.net[-1].bias.data.fill_(0.)
+        
+       
+
+        for key, value in CV_params.items():
+            setattr(self, key, nn.Parameter(torch.tensor(value, dtype=torch.float32), requires_grad=True))
+    
+    def sigmoid(self, x):
+        return 1 / (1 + torch.exp(-x))
+    
+    def scale_init_expert(self, expert_var):
+        init_pa = expert_var[:, 0] 
+        init_p_v = expert_var[:,1] 
+        p_a = (100.0 * init_pa - self.min_pa) / (self.max_pa - self.min_pa)
+        p_v = (10.0 * init_p_v - self.min_pa) / (self.max_pa - self.min_pa)
+        
+        return(p_a, p_v)
+    
+    def reverse_scale_init_expert(self, scaled_vars):
+        scaled_p_a = scaled_vars[:, :, 0]
+        scaled_p_v = scaled_vars[:, :, 1]
+        # Undo the normalization and scaling for p_a
+        normalised_pa = ((scaled_p_a * (self.max_pa - self.min_pa)) + self.min_pa) / 100.0
+
+        # Undo the normalization and scaling for p_v
+        normalised_pv = ((scaled_p_v * (self.max_pa - self.min_pa)) + self.min_pa) / 10.0
+        return torch.stack([normalised_pa, normalised_pv, scaled_vars[:, :, 2], scaled_vars[:, :, 3]], dim=-1)
+
+    def f(self, t, y):  # Approximate posterior drift.
+        if t.dim() == 0:
+            t = torch.full_like(y, fill_value=t)
+        # Positional encoding in transformers for time-inhomogeneous posterior.
+        
+        p_a, p_v = self.scale_init_expert(y[:,:2])
+        sde_latent_params = y[:, 2:] #the last two of the y are for the SDE
+        s_reflex_sde = sde_latent_params[:, 0]
+        sv_sde = sde_latent_params[:, 0]
+
+        #convert all to 'num samples x 1'
+        s_reflex_sde = s_reflex_sde.unsqueeze(1)
+        sv_sde = sv_sde.unsqueeze(1)
+        p_a = p_a.unsqueeze(1)
+        p_v = p_v.unsqueeze(1)
+        SDE_samples = p_v.shape[0]
+
+        #print('s_reflex_sde', s_reflex_sde.shape)
+        #print('sv_sde', sv_sde.shape)
+        #print('p_a', p_a.shape)
+        #print('p_v', p_v.shape)
+
+
+        i_ext = torch.zeros(SDE_samples, 1, device=y.device) 
+        f_hr = s_reflex_sde * (self.f_hr_max - self.f_hr_min) + self.f_hr_min
+        r_tpr = s_reflex_sde * (self.r_tpr_max - self.r_tpr_min) + self.r_tpr_min - self.r_tpr_mod
+        
+        # Calculate changes in volumes and pressures
+        dva_dt = -1. * (p_a - p_v) / r_tpr + sv_sde * f_hr
+        dvv_dt = -1. * dva_dt + i_ext
+
+
+        #print('f_hr', f_hr.shape)
+        #print('dva_dt', dva_dt.shape)
+        #print('r_tpr', r_tpr.shape)
+        #print('dvv_dt', dvv_dt.shape)
+
+        # Calculate derivative of state variables
+
+        dpa_dt = dva_dt / (self.ca * 100.)
+        dpv_dt = dvv_dt / (self.cv * 10.)
+        ds_dt = (1. / self.tau) * (1. - self.sigmoid(self.k_width * (p_a - self.p_aset)) - s_reflex_sde)
+        dsv_dt = i_ext * self.sv_mod
+    
+        #print('dpa_dt', dpa_dt.shape)
+        #print('dpv_dt', dpv_dt.shape)
+        #print('ds_dt', ds_dt.shape)
+        #print('dsv_dt', dsv_dt.shape)
+
+        #sde_latent_times = t[:, :1]  #the time is shared across all 
+        #SDE_latents = self.net(torch.cat((torch.sin(sde_latent_times), torch.cos(sde_latent_times), sde_latent_params), dim=-1))
+        SDE_latents = self.net(sde_latent_params) 
+        #print('SDE_drift_fun_output', SDE_latents.shape)
+        Dt_s_reflex_sde = SDE_latents[:, 0].unsqueeze(1)
+        Dt_sv_sde = SDE_latents[:, 1].unsqueeze(1)
+
+        #print('Dt_s_reflex_sde', Dt_s_reflex_sde.shape)
+        #print('Dt_sv_sde', Dt_sv_sde.shape)
+
+
+        ds_dt = ds_dt + Dt_s_reflex_sde
+        dsv_dt = dsv_dt + Dt_sv_sde
+
+        #print('ds_dt', ds_dt.shape)
+        #print('dsv_dt', dsv_dt.shape)
+
+
+        diff_results = torch.cat([dpa_dt, dpv_dt, ds_dt, dsv_dt], dim=-1)
+        #print('diff_results', diff_results.shape)
+
+        return diff_results 
+
+    def g(self, t, y):  # Shared diffusion.
+        expanded_sigma = self.sigma.expand(y.size(0), -1)
+        #print('sigma g', expanded_sigma.shape)
+        return expanded_sigma
+
+    def h(self, t, y):  # Prior drift.
+        #print('theta h', self.theta.shape)
+        #print('mu h', self.mu.shape)
+        #print('y in h', y.shape)
+        return self.theta * (self.mu - y)
+
+    def f_aug(self, t, y):  # Drift for augmented dynamics with logqp term.
+        y = y[:, :self.SDE_latents_dim]
+
+        #print('Y f_aug', y.shape) # num_samples x sde_dims 
+
+        f, g, h = self.f(t, y), self.g(t, y), self.h(t, y)
+        #print('doing stable division!')
+        #print('f', f.shape, 'g', g.shape, 'h', h.shape)
+        u = _stable_division(f - h, g)
+        #print('u', u.shape)
+        f_logqp = .5 * (u ** 2).sum(dim=1, keepdim=True)
+        #print('f_logqp', f_logqp.shape)
+        f_out = torch.cat([f, f_logqp], dim=1)
+        #print('f_aug out', f_out.shape)
+        return f_out
+
+    def g_aug(self, t, y):  # Diffusion for augmented dynamics with logqp term.
+        y = y[:, :self.SDE_latents_dim]
+        g = self.g(t, y)
+        #print('g', g.shape)
+        g_logqp = torch.zeros(y.size(0), 1).to(y.device)
+        g_out = torch.cat([g, g_logqp], dim=1)
+        #print('g out', g_out.shape)
+        return g_out
 
 
 

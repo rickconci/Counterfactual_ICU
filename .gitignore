@@ -4,3 +4,5 @@ Experiment_*/model_checkpoints/
 Experiment_*/wandb/
 Experiment_*/data/
 Experiment_*/model_logs/
+Experiment_*/results/
+Experiment_*/Hybrid_SDE_output.txt
