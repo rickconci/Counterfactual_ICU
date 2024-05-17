@@ -358,7 +358,7 @@ def main():
         #print('ts_vis',ts_vis.shape)
 
         ys_to_compare = ys.unsqueeze(1) #going from [times x dim] to [times x num_samples x dim] 
-        ys_to_compare = ys_to_compare[1:, :, :].repeat(1, args.SDE_samples, 1)
+        ys_to_compare = ys_to_compare[:, :, :].repeat(1, args.SDE_samples, 1)
 
         SDE_latents_dim = 4
 
@@ -399,6 +399,7 @@ def main():
     print('first_pa_pv', first_pa_pv)
     mu_latents = np.concatenate((first_pa_pv, np.array([0.2, 0.95])))    # shall i give the first values for this?
     sigma_latents = np.array([0.01, 0.01, 0.2, 0.2])
+    print('mu_latents', mu_latents)
     #print('mu_latents', mu_latents.shape , 'sigma_latents', sigma_latents.shape)
 
     model = LatentSDE(expert_dims=2, SDE_latents_dim = SDE_latents_dim, mu=mu_latents, sigma=sigma_latents,CV_params =CV_params).to(device)
@@ -461,7 +462,7 @@ def main():
         ##print('zs edited', zs.shape)
         
         
-        zs_to_compare = zs[1:, :, :2]
+        zs_to_compare = zs[:, :, :2]
         
         #print('example zs', zs_to_compare[:,0,0])
         #print('zs_to_compare', zs_to_compare.shape)
