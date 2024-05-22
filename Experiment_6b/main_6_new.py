@@ -72,7 +72,7 @@ def main(args):
 
     print('dataset_params',dataset_params)
 
-    data_path = '/Users/riccardoconci/Local_documents/ACS submissions/THESIS/Counterfactual_ICU/Experiment_6b/data'
+    data_path = '/Users/riccardoconci/Local_documents/ACS submissions/THESIS/Counterfactual_ICU/Experiment_6b/data_created'
 
     data = create_load_save_data(dataset_params, data_path)
     cv_data_module = CVDataModule_final(data,  batch_size=args.batch_size, num_workers=9)
