@@ -61,22 +61,34 @@ CV_params = {"r_tpr_mod": 0.,
             "T_sys": 4. / 15.,
             "cprsw_max": 103.8,
             "cprsw_min": 25.9,
-
-            #max min params 
-           'max_pa': torch.tensor(118.7861),
-           'min_pa': torch.tensor(94.5307),
-           'max_pv': torch.tensor(50.3243),
-           'min_pv': torch.tensor(30.7280),
-           'max_s': torch.tensor(0.1834),
-           'min_s': torch.tensor(0.1093),
-           'max_sv': torch.tensor(97.8777),
-           'min_sv': torch.tensor(92.0901),
             
             "pa_divisor": 100,
             "pv_divisor": 100,
             "s_divisor":1,
             "sv_divisor":100
 }
+
+
+CV_params_max_min_2STD = {'max_pa': torch.tensor(130.9138),
+                'min_pa': torch.tensor(82.4030),
+                'max_pv': torch.tensor(60.1224),
+                'min_pv': torch.tensor(20.9298),
+                'max_s': torch.tensor(0.2204),
+                'min_s': torch.tensor(0.0722),
+                'max_sv': torch.tensor(100.7716),
+                'min_sv': torch.tensor(89.1963),
+}
+
+CV_params_max_min_2_5STD = {'max_pa': torch.tensor(136.97),
+                'min_pa': torch.tensor(76.3392),
+                'max_pv': torch.tensor(65.0215),
+                'min_pv': torch.tensor(16.0307),
+                'max_s': torch.tensor(0.2390),
+                'min_s': torch.tensor(0.0537),
+                'max_sv': torch.tensor(102.2185),
+                'min_sv': torch.tensor(87.7494),
+}
+
 
 
 CV_params_prior_mu = {
