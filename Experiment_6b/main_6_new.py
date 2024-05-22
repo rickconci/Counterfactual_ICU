@@ -139,9 +139,9 @@ def main(args):
 
     if args.early_stopping:
         early_stopping = EarlyStopping(
-            min_delta=1.0,
+            min_delta=0.00,
             monitor='val_total_loss',        # Ensure this is the exact name used in your logging
-            patience=10,                    # num epochs with a val loss not improving before it stops 
+            patience=50,                    # num epochs with a val loss not improving before it stops 
             mode='min',                     # Minimize the monitored value
             verbose=True
         )
@@ -151,7 +151,7 @@ def main(args):
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
         logger=wandb_logger,
-        log_every_n_steps=5,
+        log_every_n_steps=7,
         callbacks=callbacks
         #deterministic=True,
         #check_val_every_n_epoch=1,  
@@ -171,9 +171,9 @@ if __name__ == '__main__':
     parser.add_argument('--HPC_work', action='store_true', help='HPC run or not')
     parser.add_argument('--seed', type=int, default=44, help='Random seed for initialization')
     parser.add_argument('--project_name', type=str, default='maybe_YAY_sdehybrid', help='Wandb project name')
-    parser.add_argument('--log_wandb', type=bool, default=False, help='Whether to log to Weights & Biases')
-    parser.add_argument('--early_stopping', type=bool, default=False, help='Enable early stopping')
-    parser.add_argument('--model_checkpoint', type=bool, default=False, help='Enable model checkpointing')
+    parser.add_argument('--log_wandb', type=bool, default=True, help='Whether to log to Weights & Biases')
+    parser.add_argument('--early_stopping', type=bool, default=True, help='Enable early stopping')
+    parser.add_argument('--model_checkpoint', type=bool, default=True, help='Enable model checkpointing')
     parser.add_argument('--plot_every', type=int, default=21, help='Plot every how many global steps? ')
 
     # Data specific args

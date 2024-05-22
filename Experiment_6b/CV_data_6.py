@@ -1,46 +1,21 @@
-import math
+
+
 import numpy as np
-from tqdm import tqdm_notebook as tqdm
 import os
-import pickle
 from pathlib import Path
-
-
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 import torch
-from torch import Tensor
-from torch import nn
-from torch.nn  import functional as F 
-from torch.autograd import Variable
-
-
-from torch.utils.data import DataLoader, random_split
-
-
+from torch.utils.data import Dataset, DataLoader, Subset
+import torchsde
 import lightning as L
 
-import torch
-from torch.utils.data import Dataset, DataLoader, Subset
-import os
-import argparse
-import numpy as np
-from scipy.integrate import odeint
+from utils_6 import CV_params, CV_params_prior_mu, CV_params_prior_sigma
 
 use_cuda = torch.cuda.is_available()
 
-import torch
-import torchsde
-
-import torch
-import torchsde
-import numpy as np
-import matplotlib.pyplot as plt
-
-
-from utils_6 import CV_params, CV_params_prior_mu, CV_params_prior_sigma
 
 class PhysiologicalSDE_batched(torchsde.SDEIto):
     def __init__(self, sigma, sigma_tx, params, confounder_type,non_confounded_effect):
@@ -115,6 +90,8 @@ class PhysiologicalSDE_batched(torchsde.SDEIto):
         #print('A_, i_ext', A_, i_ext)
         i_ext_tx_effect = A_.unsqueeze(1) * i_ext
         ##print('i_ext_tx_effect', i_ext_tx_effect.shape)
+
+        #print('time, i_ext, p_a pv, s, sv', t.item(), i_ext_tx_effect[0].item(), p_a[0].item(), p_v[0].item(), s[0].item(), sv[0].item())   
 
         #print('t, i_ext_effect', t,i_ext_tx_effect )
 
@@ -259,7 +236,7 @@ def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_
 
     #creating treated from those initial random states
     #print('creating treated')
-    #print('init_state_tensor', init_state_tensor.shape, 't_tensor', t_tensor.shape, )
+    print('init_state_tensor', init_state_tensor.shape, 't_tensor', t_tensor.shape, )
     sde = PhysiologicalSDE_batched(sigma = noise_std, sigma_tx=sigma_tx, confounder_type=confounder_type , non_confounded_effect = non_confounded_effect, params=params_treatment)
     Y_1 = torchsde.sdeint(sde, init_state_tensor, t_tensor, method='euler').squeeze(1)
 
@@ -309,37 +286,37 @@ def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_
     states_max = Y_fact_np.max(axis=(0, 1))
     #print('states_mean', states_mean, 'states_min', states_min, 'states_max', states_max)
 
+    
+    Y_fact_until_t = Y_fact[:, :t_treatment, :]
+    mu = Y_fact_until_t.mean([0,1])
+    std = Y_fact_until_t.std([0,1])
+    
     if normalize:
-        Y_fact_until_t = Y_fact[:, :t_treatment, :]
-        mu = Y_fact_until_t.mean([0,1])
-        std = Y_fact_until_t.std([0,1])
-
         Y_fact = (Y_fact - mu)/std
         Y_cf = (Y_cf - mu)/std
-
-        CV_params_prior_mu['pa'] = mu[0]*100
-        CV_params_prior_mu['pv'] = mu[1] *100
-        CV_params_prior_mu['s'] = mu[2]
-        CV_params_prior_mu['sv'] = mu[3] *100
-
-        CV_params_prior_sigma['pa'] = std[0]*100
-        CV_params_prior_sigma['pv'] = std[1]*100
-        CV_params_prior_sigma['s'] = std[2]
-        CV_params_prior_sigma['sv'] = std[3]*100
-
-        CV_params['max_pa'] = (mu[0] + 3 * std[0]) * 100
-        CV_params['min_pa'] = (mu[0] - 3 * std[0]) * 100
-        CV_params['max_pv'] = (mu[1] + 3 * std[1]) * 100
-        CV_params['min_pv'] = (mu[1] - 3 * std[1]) * 100
-        CV_params['max_s'] = (mu[2] + 3 * std[2]) 
-        CV_params['min_s'] = (mu[2] - 3 * std[2]) 
-        CV_params['max_sv'] = (mu[3] + 3 * std[3]) * 100
-        CV_params['min_sv'] = (mu[3] - 3 * std[3]) * 100
-
-        
         mu_X = X.mean([0,1])
         std_X = X.std([0,1])
         X = (X-mu_X)/std_X
+
+    CV_params_prior_mu['pa'] = mu[0]*100
+    CV_params_prior_mu['pv'] = mu[1] *100
+    CV_params_prior_mu['s'] = mu[2]
+    CV_params_prior_mu['sv'] = mu[3] *100
+
+    CV_params_prior_sigma['pa'] = std[0]*100
+    CV_params_prior_sigma['pv'] = std[1]*100
+    CV_params_prior_sigma['s'] = std[2]
+    CV_params_prior_sigma['sv'] = std[3]*100
+
+    CV_params['max_pa'] = (mu[0] + 2.5 * std[0]) * 100
+    CV_params['min_pa'] = (mu[0] - 2.5 * std[0]) * 100
+    CV_params['max_pv'] = (mu[1] + 2.5 * std[1]) * 100
+    CV_params['min_pv'] = (mu[1] - 2.5 * std[1]) * 100
+    CV_params['max_s'] = (mu[2] + 2.5 * std[2]) 
+    CV_params['min_s'] = (mu[2] - 2.5 * std[2]) 
+    CV_params['max_sv'] = (mu[3] + 2.5 * std[3]) * 100
+    CV_params['min_sv'] = (mu[3] - 2.5 * std[3]) * 100
+
     
     # Now split these factual and counterfactual trajectories by the 'before' and 'after treatment' so we have a baseline 
     pre_treat_mask = (t<=t_treatment)
@@ -372,7 +349,11 @@ def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_
 
 
 
+
 def create_load_save_data(dataset_params, data_path):
+    if not os.path.exists(data_path):
+        os.makedirs(data_path)
+        print(f"Created directory: {data_path}")
 
     non_confounded_effect_str = 'true' if dataset_params['non_confounded_effect'] else 'false'
     normalize = 'true' if dataset_params['normalize'] else 'false'
@@ -410,6 +391,8 @@ def create_load_save_data(dataset_params, data_path):
     return data
 
 
+
+
 class CVDataset_loaded(Dataset):
     def __init__(self, data):
         # Unpack the data
@@ -433,17 +416,19 @@ class CVDataset_loaded(Dataset):
 
 
 
+
 class CVDataModule_final(L.LightningDataModule):
-    def __init__(self, data, batch_size, num_workers):
+    def __init__(self, dataset_path, batch_size=32, num_workers =1):
         super().__init__()
-        self.data = data
+        self.dataset_path = dataset_path
         self.batch_size = batch_size
         self.dataset = None
         self.num_workers = num_workers
 
     def setup(self, stage=None):
         # Load the dataset
-        self.dataset = CVDataset_loaded(self.data)
+        data = torch.load(self.dataset_path)
+        self.dataset = CVDataset_loaded(data)
         
         train_idx = np.arange(len(self.dataset))[:int(0.5*len(self.dataset))]
         val_idx = np.arange(len(self.dataset))[int(0.5*len(self.dataset)):]
@@ -469,7 +454,7 @@ class CVDataModule_final(L.LightningDataModule):
         return DataLoader(
             self.val,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=self.num_workers,
             persistent_workers=True, 
             drop_last=False,
