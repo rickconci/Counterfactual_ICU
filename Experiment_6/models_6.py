@@ -522,8 +522,6 @@ class Neural_Expert_SDE_integrator(nn.Module):
 
         dim_change = dim_aug - z_SDE.shape[-1]
         print('augmented_init_state', aug_y0.shape)
-
-
         #options = {'dtype': torch.float32} 
 
         aug_ys = torchsde.sdeint(sde=self.sde_func,
@@ -670,12 +668,7 @@ class SDE_VAE(nn.Module):
                         activations=[nn.ReLU() for _ in range(output_fun_depth - 1)] + [nn.Tanh()], 
                         dropout_p=[dropout_p for _ in range(output_fun_depth)])
 
-        
-    def rescale_down_expert_ode(self,predictions):
-
-
-        pass
-
+    
 
     def forward_VAE_expert(self, x, Tx, time_in, time_out,  MAP):
         
@@ -794,7 +787,8 @@ class SDE_VAE(nn.Module):
         return z_expt, z_expt_mean, z_log_var_exp, latent_traj_expt, predicted_traj_exp, z_SDE, latent_traj_SDE, logqp_SDE, predicted_traj_SDE, predicted_traj_hybrid
         
 
-    
+
+
 
 
 

@@ -98,13 +98,18 @@ def _stable_division(a, b, epsilon=1e-7):
 
 class LatentSDE(torchsde.SDEIto):
 
-    def __init__(self, expert_dims, SDE_latents_dim, CV_params, mu=None, sigma=None, theta=1.0 ):
+    def __init__(self, expert_dims, SDE_latents_dim, CV_params, SDE_input_state, include_time, SDE_control, SDE_control_weighting,   mu=None, sigma=None, theta=1.0 ):
         super(LatentSDE, self).__init__(noise_type="diagonal")
         #self.sde_type="ito"
 
         self.SDE_latents_dim = SDE_latents_dim
         self.expert_dims = expert_dims
         self.resid_dims = SDE_latents_dim - expert_dims
+        
+        self.SDE_input_state = SDE_input_state
+        self.include_time = include_time
+        self.SDE_control = SDE_control
+        self.SDE_control_weighting = SDE_control_weighting
         
         if mu is None:
             mu = np.zeros(SDE_latents_dim)
@@ -121,66 +126,79 @@ class LatentSDE(torchsde.SDEIto):
         #print('sigma init', self.sigma.shape)
 
         # Approximate posterior drift: Takes in 2 positional encodings and the state.
+
+        net_input_dims = SDE_latents_dim if SDE_input_state == 'full' else self.resid_dims
+        net_input_dims = net_input_dims + 2 if include_time else net_input_dims 
         self.net = nn.Sequential(
-            nn.Linear(self.resid_dims, 200),
+            nn.Linear(net_input_dims, 200),
             nn.Tanh(),
             nn.Linear(200, 200),
             nn.Tanh(),
-            nn.Linear(200, self.resid_dims)
+            nn.Linear(200, 2),
+            nn.Tanh()
         )
         # Initialization trick from Glow.
-        self.net[-1].weight.data.fill_(0.)
-        self.net[-1].bias.data.fill_(0.)
+        self.net[-2].weight.data.fill_(0.)
+        self.net[-2].bias.data.fill_(0.)
         
        
 
         for key, value in CV_params.items():
-            setattr(self, key, nn.Parameter(torch.tensor(value, dtype=torch.float32), requires_grad=True))
+            setattr(self, key, nn.Parameter(torch.tensor(value, dtype=torch.float32), requires_grad=False))
     
     def sigmoid(self, x):
         return 1 / (1 + torch.exp(-x))
     
-    def scale_init_expert(self, expert_var):
-        init_pa = expert_var[:, 0] 
-        init_p_v = expert_var[:,1] 
-        p_a = (100.0 * init_pa - self.min_pa) / (self.max_pa - self.min_pa)
-        p_v = (10.0 * init_p_v - self.min_pa) / (self.max_pa - self.min_pa)
-        
-        return(p_a, p_v)
-    
-    def reverse_scale_init_expert(self, scaled_vars):
-        scaled_p_a = scaled_vars[:, :, 0]
-        scaled_p_v = scaled_vars[:, :, 1]
-        # Undo the normalization and scaling for p_a
-        normalised_pa = ((scaled_p_a * (self.max_pa - self.min_pa)) + self.min_pa) / 100.0
-
-        # Undo the normalization and scaling for p_v
-        normalised_pv = ((scaled_p_v * (self.max_pa - self.min_pa)) + self.min_pa) / 10.0
-        return torch.stack([normalised_pa, normalised_pv, scaled_vars[:, :, 2], scaled_vars[:, :, 3]], dim=-1)
 
     def f(self, t, y):  # Approximate posterior drift.
         if t.dim() == 0:
             t = torch.full_like(y, fill_value=t)
-        # Positional encoding in transformers for time-inhomogeneous posterior.
+
+        SDE_samples = y.shape[0]
+
+        if self.include_time:
+            if self.SDE_input_state == 'full':
+                # Positional encoding in transformers for time-inhomogeneous posterior
+                sde_latent_times = t[:, :1]  #the time is shared across all
+                input_state = y[:, ]
+                SDE_NN_input = torch.cat((torch.sin(sde_latent_times), torch.cos(sde_latent_times), input_state), dim=-1)
+            elif self.SDE_input_state == 'latents':
+                sde_latent_times = t[:, :1]  #the time is shared across all
+                input_state = y[:, 2:]
+                SDE_NN_input = torch.cat((torch.sin(sde_latent_times), torch.cos(sde_latent_times), input_state), dim=-1)
+        else:
+            if self.SDE_input_state == 'full':
+                SDE_NN_input =input_state = y[:, ]
+            elif self.SDE_input_state == 'latents':
+                SDE_NN_input = input_state = y[:, 2:]
+
+        SDE_NN_output_latents = self.net(SDE_NN_input) 
         
-        p_a, p_v = self.scale_init_expert(y[:,:2])
-        sde_latent_params = y[:, 2:] #the last two of the y are for the SDE
-        s_reflex_sde = sde_latent_params[:, 0]
-        sv_sde = sde_latent_params[:, 0]
+
+        #print('pa', y[:,0], 'pv',y[:,1])
+        p_a = y[:,0]*100
+        p_v = y[:,1]*10
+        s_reflex_sde = y[:, 2] 
+        sv_sde = y[:, 3] * 100
 
         #convert all to 'num samples x 1'
-        s_reflex_sde = s_reflex_sde.unsqueeze(1)
-        sv_sde = sv_sde.unsqueeze(1)
         p_a = p_a.unsqueeze(1)
         p_v = p_v.unsqueeze(1)
-        SDE_samples = p_v.shape[0]
+        s_reflex_sde = s_reflex_sde.unsqueeze(1)
+        sv_sde = sv_sde.unsqueeze(1)
+        #print('p_a pv, s, sv', p_a, p_v, s_reflex_sde, sv_sde)
 
-        #print('s_reflex_sde', s_reflex_sde.shape)
-        #print('sv_sde', sv_sde.shape)
-        #print('p_a', p_a.shape)
-        #print('p_v', p_v.shape)
+        if self.SDE_control == 'latent_params':
+            control_s_reflex_sde = SDE_NN_output_latents[:, 0].unsqueeze(1)
+            control_sv_sde = SDE_NN_output_latents[:, 1].unsqueeze(1)
+            print('control_s_reflex_sde, control_sv_sde', control_s_reflex_sde, control_sv_sde)
 
-
+            print('s_reflex_sde_not_controlled, sv_sde_not_controlled', s_reflex_sde, sv_sde)
+            s_reflex_sde = s_reflex_sde + self.SDE_control_weighting * control_s_reflex_sde
+            sv_sde = sv_sde + self.SDE_control_weighting * control_sv_sde
+            print('s_reflex_sde_controlled, sv_sde_controlled', s_reflex_sde, sv_sde)
+            
+        
         i_ext = torch.zeros(SDE_samples, 1, device=y.device) 
         f_hr = s_reflex_sde * (self.f_hr_max - self.f_hr_min) + self.f_hr_min
         r_tpr = s_reflex_sde * (self.r_tpr_max - self.r_tpr_min) + self.r_tpr_min - self.r_tpr_mod
@@ -188,44 +206,27 @@ class LatentSDE(torchsde.SDEIto):
         # Calculate changes in volumes and pressures
         dva_dt = -1. * (p_a - p_v) / r_tpr + sv_sde * f_hr
         dvv_dt = -1. * dva_dt + i_ext
-
-
-        #print('f_hr', f_hr.shape)
-        #print('dva_dt', dva_dt.shape)
-        #print('r_tpr', r_tpr.shape)
-        #print('dvv_dt', dvv_dt.shape)
+        #print('f_hr, dva_dt, r_tpr, dvv_dt', f_hr.shape, dva_dt.shape, r_tpr.shape, dvv_dt.shape)
+       
 
         # Calculate derivative of state variables
-
         dpa_dt = dva_dt / (self.ca * 100.)
         dpv_dt = dvv_dt / (self.cv * 10.)
         ds_dt = (1. / self.tau) * (1. - self.sigmoid(self.k_width * (p_a - self.p_aset)) - s_reflex_sde)
         dsv_dt = i_ext * self.sv_mod
-    
-        #print('dpa_dt', dpa_dt.shape)
-        #print('dpv_dt', dpv_dt.shape)
-        #print('ds_dt', ds_dt.shape)
-        #print('dsv_dt', dsv_dt.shape)
+        #print('dpa_dt, dpv_dt, ds_dt, dsv_dt', dpa_dt, dpv_dt, ds_dt, dsv_dt)
 
-        #sde_latent_times = t[:, :1]  #the time is shared across all 
-        #SDE_latents = self.net(torch.cat((torch.sin(sde_latent_times), torch.cos(sde_latent_times), sde_latent_params), dim=-1))
-        SDE_latents = self.net(sde_latent_params) 
-        #print('SDE_drift_fun_output', SDE_latents.shape)
-        Dt_s_reflex_sde = SDE_latents[:, 0].unsqueeze(1)
-        Dt_sv_sde = SDE_latents[:, 1].unsqueeze(1)
-
-        #print('Dt_s_reflex_sde', Dt_s_reflex_sde.shape)
-        #print('Dt_sv_sde', Dt_sv_sde.shape)
-
-
-        ds_dt = ds_dt + Dt_s_reflex_sde
-        dsv_dt = dsv_dt + Dt_sv_sde
-
-        #print('ds_dt', ds_dt.shape)
-        #print('dsv_dt', dsv_dt.shape)
+        if self.SDE_control == 'latent_dt_params':
+            Dt_control_s_reflex_sde = SDE_NN_output_latents[:, 0].unsqueeze(1)
+            Dt_control_sv_sde = SDE_NN_output_latents[:, 1].unsqueeze(1)
+            #print('Dt_s_reflex_sde, Dt_sv_sde', Dt_control_s_reflex_sde, Dt_control_sv_sde)
+            ds_dt = ds_dt + self.SDE_control_weighting * Dt_control_s_reflex_sde
+            dsv_dt = dsv_dt + self.SDE_control_weighting * Dt_control_sv_sde
+            #print('ds_dt, dsv_dt', ds_dt.shape, dsv_dt.shape)
 
 
         diff_results = torch.cat([dpa_dt, dpv_dt, ds_dt, dsv_dt], dim=-1)
+        #print('diff_results', diff_results)
         #print('diff_results', diff_results.shape)
 
         return diff_results 
@@ -248,15 +249,15 @@ class LatentSDE(torchsde.SDEIto):
 
         f, g, h = self.f(t, y), self.g(t, y), self.h(t, y)
         #print('doing stable division!')
-        print('f', f.shape, 'g', g.shape, 'h', h.shape)
-        print('f mean', f.mean(), 'g mean', g.mean(), 'h mean', h.mean())
-        print('f', f, 'g ', g, 'h ', h )
+        #print('f', f.shape, 'g', g.shape, 'h', h.shape)
+        #print('f mean', f.mean(), 'g mean', g.mean(), 'h mean', h.mean())
+        #print('f', f, 'g ', g, 'h ', h )
         u = _stable_division(f - h, g)
-        print('u', u.shape)
-        print('u mean', u)
+        #print('u', u.shape)
+        #print('u mean', u)
         f_logqp = .5 * (u ** 2).sum(dim=1, keepdim=True)
-        print('f_logqp', f_logqp.shape)
-        print('f_logqp mean', f_logqp)
+        #print('f_logqp', f_logqp.shape)
+        #print('f_logqp mean', f_logqp)
         f_out = torch.cat([f, f_logqp], dim=1)
         #print('f_aug out', f_out.shape)
         return f_out
@@ -296,8 +297,11 @@ class LatentSDE(torchsde.SDEIto):
         )
         ys, logqp_path = aug_ys[:, :, :self.SDE_latents_dim], aug_ys[-1, :, self.SDE_latents_dim:]
         
-        #print('ys post sde', ys.shape)
-        ys = self.reverse_scale_init_expert(ys)
+        #print('ys out', ys[:, 0, :])
+        #ys = self.reverse_scale_init_expert(ys)
+        print('ys out_normalised', ys[:, 0, :])
+
+
         #print('ys_out', ys.shape)
         #print('logqp_path_out', logqp_path.shape)
         logqp = (logqp0 + logqp_path) #.mean(dim=0)  # KL(t=0) + KL(path).
@@ -348,16 +352,17 @@ def main():
     if args.data != "cv_data":
         ts_, ts_ext_, ts_vis_, ts, ts_ext, ts_vis, ys, ys_ = make_data()
     else:
-        X, X_static, T, Y_fact, Y_cf, p, init_state, t_X, t_Y, expert_ODE_size = create_cv_data(N = 1000, gamma = 10, noise_std = 0, t_span = 25, t_treatment=10, seed = 123, output_dims=[0,1])
+        X, X_static, T, Y_fact, Y_cf, p, init_state, t_X, t_Y, expert_ODE_size = create_cv_data(N = 1, gamma = 10, noise_std = args.data_noise, t_span = 25, t_treatment=20, seed = 123, input_dims=[0,1,2,3], output_dims=[0], normalize=False)
         
         ys =  X[0,:, :]
-        ys_ = X[0,:].cpu().numpy()
+        ys_ = X[0,:, :].cpu().numpy()
+        print('ys_', ys_)
         ts_ = t_X[0, :].cpu().numpy()
         ts_vis = t_X[0, :]
         ts_ext = t_X[0, :]
         #print('ts_vis',ts_vis.shape)
 
-        ys_to_compare = ys.unsqueeze(1) #going from [times x dim] to [times x num_samples x dim] 
+        ys_to_compare = ys[:, :2].unsqueeze(1) #going from [times x dim] to [times x num_samples x dim] 
         ys_to_compare = ys_to_compare[:, :, :].repeat(1, args.SDE_samples, 1)
 
         SDE_latents_dim = 4
@@ -385,24 +390,22 @@ def main():
         mean_color = '#800026'
         num_samples = len(sample_colors)
 
-    eps = torch.randn(vis_num_samples, SDE_latents_dim).to(device)  # Fix seed for the random draws used in the plots.
-    bm = torchsde.BrownianInterval(
-        t0=ts_vis[0],
-        t1=ts_vis[-1],
-        size=(vis_num_samples, SDE_latents_dim),
-        device=device,
-        levy_area_approximation='space-time'
-    )  # We need space-time Levy area to use the SRK solver
-
-    # Model.
-    first_pa_pv = ys[0,:2]
-    print('first_pa_pv', first_pa_pv)
-    mu_latents = np.concatenate((first_pa_pv, np.array([0.2, 0.95])))    # shall i give the first values for this?
-    sigma_latents = np.array([0.01, 0.01, 0.2, 0.2])
+    #first_pa_pv = ys[0,:2]
+    #print('first_pa_pv', first_pa_pv)
+    #mu_latents = np.concatenate((first_pa_pv, np.array([0.2, 0.95])))    # shall i give the first values for this?
+    mu_latents = ys[0,:]
+    sigma_latents = np.array([0.001, 0.001, 0.01, 0.01])
     print('mu_latents', mu_latents)
     #print('mu_latents', mu_latents.shape , 'sigma_latents', sigma_latents.shape)
 
-    model = LatentSDE(expert_dims=2, SDE_latents_dim = SDE_latents_dim, mu=mu_latents, sigma=sigma_latents,CV_params =CV_params).to(device)
+    model = LatentSDE(expert_dims=2, 
+                      SDE_latents_dim = SDE_latents_dim,
+                      SDE_input_state = args.SDE_input_state, 
+                      include_time = args.include_time, 
+                      SDE_control  = args.SDE_control, 
+                      SDE_control_weighting = args.SDE_Control_weighting,
+                      mu=mu_latents, sigma=sigma_latents,
+                      CV_params =CV_params).to(device)
 
 
     optimizer = optim.Adam(model.parameters(), lr=1e-2)
@@ -413,42 +416,6 @@ def main():
     kl_metric = EMAMetric()
     loss_metric = EMAMetric()
 
-    if args.show_prior:
-        with torch.no_grad():
-            zs = model.sample_p(ts=ts_vis, SDE_samples=vis_num_samples, eps=eps, bm=bm).squeeze()
-            ts_vis_, zs_ = ts_vis.cpu().numpy(), zs.cpu().numpy()
-            zs_ = np.sort(zs_, axis=1)  # Sort along the sample dimension
-            #print('ts_vis_', ts_vis_.shape, 'zs_', zs_.shape,'ys_', ys_.shape,'ts_', ts_.shape  )
-
-            img_dir = os.path.join(args.train_dir, 'prior.png')
-            # Determine the number of observed dimensions in ys_
-            num_obs_dims = ys_.shape[-1]
-
-            # Setting up the plot
-            fig, axs = plt.subplots(nrows=4, ncols=1, figsize=(10, 20), sharex=True)  # Assuming zs_ has 4 dimensions
-
-            colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k']  # Extend this list if you have more than 7 observed dimensions
-
-            for i in range(4):  # Loop through each dimension of zs_
-                for alpha, percentile in zip(alphas, percentiles):
-                    idx = int((1 - percentile) / 2. * vis_num_samples)
-                    zs_bot_ = zs_[:, idx, i]
-                    zs_top_ = zs_[:, -idx, i]
-                    axs[i].fill_between(ts_vis_, zs_bot_, zs_top_, alpha=alpha, color=fill_color)
-
-                # Plot each dimension of ys_ using a different color
-                for j in range(num_obs_dims):
-                    axs[i].scatter(ts_, ys_[:, j], marker='x', zorder=3, color=colors[j % len(colors)], s=35, label=f'Dim {j+1}')
-
-                axs[i].set_ylim(ylims)  # Ensure ylims is appropriately defined
-                axs[i].set_ylabel(f'$Z_{{t,{i+1}}}$')
-                axs[i].legend(loc='upper right')
-
-            axs[-1].set_xlabel('$t$')
-            plt.tight_layout()
-            plt.savefig(img_dir, dpi=args.dpi)
-            plt.close()
-            logging.info(f'Saved prior figure at: {img_dir}')
 
     for global_step in tqdm.tqdm(range(args.train_iters)):
         # Plot and save.
@@ -456,13 +423,16 @@ def main():
         # Train.
         optimizer.zero_grad()
         zs, kl = model(ts=ts_ext, SDE_samples=args.SDE_samples)
-        print('zs', zs.shape)
-        print('kl', kl.shape)
+        #print('zs', zs.shape)
+        #print('kl', kl.shape)
         #zs = zs[1:-1, :, :]  # Drop first and last which are only used to penalize out-of-data region and spread uncertainty.
         ##print('zs edited', zs.shape)
         
         
         zs_to_compare = zs[:, :, :2]
+
+        print('zs_to_compare', zs_to_compare)
+        print('ys_to_compare', ys_to_compare)
         
         #print('example zs', zs_to_compare[:,0,0])
         #print('zs_to_compare', zs_to_compare.shape)
@@ -481,9 +451,9 @@ def main():
         likelihood = likelihood_constructor(loc=zs_to_compare, scale=args.scale)
         logpy = likelihood.log_prob(ys_to_compare)#.sum(dim=0).mean(dim=0)
         
-        print('logpy', logpy.shape)
+        #print('logpy', logpy.shape)
         logpy = logpy.sum((0,2)) #sum across times and dims, keeping a loss for each sde sample
-        print('logpy', logpy.shape)
+        #print('logpy', logpy.shape)
 
         
         loss = -logpy.mean() + kl.mean() * kl_scheduler.val
@@ -584,7 +554,7 @@ if __name__ == '__main__':
     parser.add_argument('--kl-anneal-iters', type=int, default=100, help='Number of iterations for linear KL schedule.')
     parser.add_argument('--train-iters', type=int, default=5000, help='Number of iterations for training.')
     parser.add_argument('--pause_iters', type=int, default=30, help='Number of iterations before pausing.')
-    parser.add_argument('--SDE_samples', type=int, default=3, help='num_samples for training.')
+    parser.add_argument('--SDE_samples', type=int, default=5, help='num_samples for training.')
     parser.add_argument('--likelihood', type=str, choices=['normal', 'laplace'], default='normal')
     parser.add_argument('--scale', type=float, default=0.05, help='Scale parameter of Normal and Laplace.')
 
@@ -596,9 +566,22 @@ if __name__ == '__main__':
     parser.add_argument('--rtol', type=float, default=1e-3)
     parser.add_argument('--atol', type=float, default=1e-3)
 
+
+
+
+    parser.add_argument('--SDE_input_state', type=str, default='latents', choices=('full', 'latents'),help='which states are given to NN as input.')
+    parser.add_argument('--include_time', type=str2bool, default=False, const=True, nargs="?", help='whether to include encoded time in the NN as input.')
+    parser.add_argument('--SDE_control', type=str, default='latent_params', choices=('latent_dt_params', 'latent_params'),help='whether SDE neural net provies control to latent params or their derivatives.')
+    parser.add_argument('--SDE_Control_weighting', type=float, default = 0.01)
+    parser.add_argument('--data_noise', type=float, default = 0.01)
+
+
+
+
+
     parser.add_argument('--sample_q', type=str2bool, default=False, const=True, nargs="?")
     parser.add_argument('--show-prior', type=str2bool, default=False, const=True, nargs="?")
-    parser.add_argument('--show-samples', type=str2bool, default=False, const=True, nargs="?")
+    parser.add_argument('--show-samples', type=str2bool, default=True, const=True, nargs="?")
     parser.add_argument('--show-percentiles', type=str2bool, default=False, const=True, nargs="?")
     parser.add_argument('--show-arrows', type=str2bool, default=True, const=True, nargs="?")
     parser.add_argument('--show-mean', type=str2bool, default=True, const=True, nargs="?")
@@ -617,5 +600,7 @@ if __name__ == '__main__':
     os.makedirs(ckpt_dir, exist_ok=True)
 
     sdeint_fn = torchsde.sdeint_adjoint if args.adjoint else torchsde.sdeint
+
+    print(args)
 
     main()
