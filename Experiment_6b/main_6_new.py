@@ -112,7 +112,7 @@ def main(args):
                            log_lik_output_scale = args.output_scale,
 
                            #admin
-                           train_dir = os.path.join(saving_dir, 'data'), 
+                           train_dir = os.path.join(saving_dir, 'figures'), 
                            KL_weighting_SDE = args.KL_weighting_SDE, 
                            learning_rate = args.learning_rate,
                            log_wandb = args.log_wandb,
@@ -161,14 +161,14 @@ def main(args):
     test_results = trainer.test(ckpt_path='best', dataloaders = cv_data_module.test_dataloader())
 
 if __name__ == '__main__':
-    #sys.stdout = open('Hybrid_SDE_output.txt', 'w')
+    sys.stdout = open('Hybrid_SDE_output.txt', 'w')
 
     parser = argparse.ArgumentParser(description="Train a model on CV dataset")
     # Logging specific args 
     parser.add_argument('--HPC_work', action='store_true', help='HPC run or not')
     parser.add_argument('--seed', type=int, default=44, help='Random seed for initialization')
     parser.add_argument('--project_name', type=str, default='maybe_YAY_sdehybrid', help='Wandb project name')
-    parser.add_argument('--log_wandb', type=bool, default=True, help='Whether to log to Weights & Biases')
+    parser.add_argument('--log_wandb', type=bool, default=False, help='Whether to log to Weights & Biases')
     parser.add_argument('--early_stopping', type=bool, default=True, help='Enable early stopping')
     parser.add_argument('--model_checkpoint', type=bool, default=True, help='Enable model checkpointing')
     parser.add_argument('--plot_every', type=int, default=20, help='Plot every how many global steps? ')
@@ -183,7 +183,7 @@ if __name__ == '__main__':
     # important args
     parser.add_argument('--expert_latent_dims', type=int, default=4, help='Encoder output used by expert model.. minimum 4 max ?10')
     parser.add_argument('--encoder_SDENN_dims', type=int, default=4, help='Encoder output used by SDENN')
-    parser.add_argument('--num_samples', type=int, default=5, help='Number of SDE samples  ')
+    parser.add_argument('--num_samples', type=int, default=3, help='Number of SDE samples  ')
     parser.add_argument('--prior_tx_sigma', type=float, default=0.0, help='prior_tx_sigma defines our assumed prior noise of the stochastic control ')
     parser.add_argument('--prior_tx_mu', type=float, default=0.0, help='prior_tx_mu defines our assumed prior Dt_iexternal of the stochastic control ')
     parser.add_argument('--theta', type=float, default=0.01, help='Theta defines how the impact of the mean reverting process correction on the SDE')
@@ -217,7 +217,7 @@ if __name__ == '__main__':
 
     # Training specific args
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for the optimizer')
-    parser.add_argument('--batch_size', type=int, default=64, help='Training batch size')
+    parser.add_argument('--batch_size', type=int, default=2, help='Training batch size')
     parser.add_argument('--max_epochs', type=int, default=300, help='Maximum number of epochs to train')
     parser.add_argument('--accelerator', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
     #parser.add_argument('--devices', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which number of devices to use')

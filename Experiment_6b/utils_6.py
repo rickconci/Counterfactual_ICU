@@ -80,10 +80,10 @@ CV_params = {"r_tpr_mod": 0.,
 
 
 CV_params_prior_mu = {
-    'pa': torch.tensor(106.6584),
-    'pv': torch.tensor(40.5261),
-    's': torch.tensor(0.1463),
-    'sv': torch.tensor(94.9839),
+    'pa': torch.tensor(106.0743),
+    'pv': torch.tensor(40.1797),
+    's': torch.tensor(0.1465),
+    'sv': torch.tensor(95.2293),
     "sv_mod": 0.001,
     "ca": 4.0,
     "cv": 111.0,
@@ -102,10 +102,10 @@ CV_params_prior_mu = {
 }
 
 CV_params_prior_sigma = {
-   'pa': torch.tensor(12.1277),
-   'pv': torch.tensor(9.7982),
-   's': torch.tensor(0.0371),
-   'sv': torch.tensor(2.8938)
+   'pa': torch.tensor(12.5639),
+   'pv': torch.tensor(9.2571),
+   's': torch.tensor(0.0367),
+   'sv': torch.tensor(2.4816)
 }
 
 

@@ -14,30 +14,7 @@ import matplotlib.pyplot as plt
 
 
 
-def plot_SDENN_output( SDE_output):
-        
-        # Convert the PyTorch tensor to NumPy
-        data_np = SDE_output.cpu().numpy()
-        
-        # Create a new figure
-        fig = go.Figure()
-        
-        # Number of samples (lines) and time steps
-        num_samples, num_time_steps = data_np.shape
-        
-        # Adding each sample as a separate trace in the plot
-        for i in range(num_samples):
-            fig.add_trace(go.Scatter(x=list(range(num_time_steps)), y=data_np[i],
-                                    mode='lines', name=f'Sample {i+1}'))
-        
-        # Update layout (optional, but useful for clarity)
-        fig.update_layout(title='SDE Model Output Over Time',
-                        xaxis_title='Time Step',
-                        yaxis_title='Output Value',
-                        legend_title='Samples')
-        
-        # Log the plot to wandb
-        #wandb.log({"SDE_Output_Over_Time": fig})
+
 
 
 

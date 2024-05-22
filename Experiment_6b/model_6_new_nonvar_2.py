@@ -23,7 +23,8 @@ from typing import Optional, Union
 import sys
 import pandas as pd
 import plotly.express as px
-
+import plotly.graph_objects as go
+import wandb
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -41,7 +42,7 @@ from lightning import LightningModule
 from CV_data_6 import create_cv_data
 
 from utils_6 import CV_params, GaussianNLLLoss, _stable_division, str2bool, ensure_scalar, LinearScheduler, MLPSimple, CV_params_prior_mu, CV_params_prior_sigma
-from plotting_6 import plot_trajectories_normal, plotting_config, plot_SDENN_output
+from plotting_6 import plot_trajectories_normal, plotting_config
 
 
 
@@ -77,8 +78,8 @@ class Encoder(nn.Module):
 
 
     def forward(self, x, t):
-        #print('Initial x shape:', x.shape)  # Expected: [batch_size, seq_length, input_dim]
-        #print('Initial t shape:', t.shape)  # Expected: [batch_size, seq_length, 1]
+        print('Initial x shape:', x.shape)  # Expected: [batch_size, seq_length, input_dim]
+        print('Initial t shape:', t.shape)  # Expected: [batch_size, seq_length, 1]
 
         if self.encode_with_time_dim: # this is how VDS does it 
             # Calculate the time differences
@@ -86,10 +87,10 @@ class Encoder(nn.Module):
             t_diff[:, 1:] = t[:, 1:] - t[:, :-1]  # Forward differences
             t_diff[:, 0] = 0.
             t_diff = t_diff.unsqueeze(-1) 
-            #print('Time differences shape:', t_diff.shape)  # Should match t's shape
+            print('Time differences shape:', t_diff.shape)  # Should match t's shape
 
             xt = torch.cat((x, t_diff), dim=-1)  # Concatenate along the feature dimension
-            #print('Concatenated xt shape:', xt.shape)  # Expected: [batch_size, seq_length, input_dim + 1]
+            print('Concatenated xt shape:', xt.shape)  # Expected: [batch_size, seq_length, input_dim + 1]
         
         else: # this is how Hyland does it 
             xt = x
@@ -103,15 +104,15 @@ class Encoder(nn.Module):
         # Reverse the sequence along the time dimension
         if self.reverse:
             xt = xt.flip(dims=[1])
-            #print('reversed xt shape:', xt.shape)  # Should match xt's shape
+            print('reversed xt shape:', xt.shape)  # Should match xt's shape
 
         _, h0 = self.rnn(xt)
-        #print('Output hidden state h0 shape:', h0.shape)  # Expected: [depth, batch_size, hidden_dim]
-        #print('output_last_dim', h0[-1].shape)
+        print('Output hidden state h0 shape:', h0.shape)  # Expected: [depth, batch_size, hidden_dim]
+        print('output_last_dim', h0[-1].shape)
         
         # Process the last hidden state to produce latent variables
         z0 = self.hid2lat(h0[-1])
-        #print('z0 from hid to lat', z0.shape)
+        print('z0 from hid to lat', z0.shape)
         if self.variational:
             
             z0_mean_expert = z0[:, :self.expert_latent_dims]
@@ -121,8 +122,8 @@ class Encoder(nn.Module):
             scaled_expert_latents = self.sigmoid_scale(z0_mean_expert,input_mean_obs_dim,  input_std_obs_dim)
             z0_means = torch.cat([scaled_expert_latents, z0_rest], dim=-1)
             
-            #print('z0_mean shape:', z0_mean_expert.shape)  # Expected: [batch_size, latent_dim]
-            #print('z0_log_var shape:', z0_log_var_expert.shape)  # Expected: [batch_size, latent_dim]
+            print('z0_mean shape:', z0_mean_expert.shape)  # Expected: [batch_size, latent_dim]
+            print('z0_log_var shape:', z0_log_var_expert.shape)  # Expected: [batch_size, latent_dim]
             
             return z0_means, z0_log_var_expert
         
@@ -130,15 +131,15 @@ class Encoder(nn.Module):
             z0_mean_expert = z0[:, :self.expert_latent_dims]
             z0_rest = z0[:, self.expert_latent_dims:]
 
-            #print('z0_mean_expert', z0_mean_expert[0,:4])
-            #print('z0_rest', z0_rest.shape)
+            print('z0_mean_expert', z0_mean_expert[0,:4])
+            print('z0_rest', z0_rest.shape)
 
             #scaled_expert_latents = self.sigmoid_scale(z0_mean_expert,input_mean_obs_dim,  input_std_obs_dim)
             scaled_expert_latents = z0_mean_expert
             z0_means = torch.cat([scaled_expert_latents, z0_rest], dim=-1)
 
-            #print('z0_mean shape:', z0_means.shape)  # Expected: [batch_size, latent_dim]
-            #print('z0_means scaled',z0_means[0,:4] )
+            print('z0_mean shape:', z0_means.shape)  # Expected: [batch_size, latent_dim]
+            print('z0_means scaled',z0_means[0,:4] )
             
             return z0_means
 
@@ -193,7 +194,8 @@ class Hybrid_VAE_SDE(LightningModule):
                                  reverse = encoder_reverse_time)
         
         self.encoder_output_dim = encoder_output_dim
-        
+        self.encoder_SDENN_dims = encoder_output_dim - expert_latent_dims
+        print('encoder_SDENN_dims', self.encoder_SDENN_dims)
         
         ### PRIOR PARAMS
         self.prior_tx_sigma = prior_tx_sigma
@@ -220,7 +222,7 @@ class Hybrid_VAE_SDE(LightningModule):
         
         for key, value in CV_params.items():
             #setattr(self, key, nn.Parameter(torch.tensor(value, dtype=torch.float32), requires_grad=False))
-            #print('f{key}: {value}')
+            print(f'{key}: {value}')
             setattr(self, key, torch.tensor(value, dtype=torch.float32))
 
         self.SDEnet_hidden_dim = SDEnet_hidden_dim
@@ -261,7 +263,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
     
     def sigmoid_scale(self, z0):
-        #print('unnormalising the data and scaling it back to its appropriate values ')
+        print('unnormalising the data and scaling it back to its appropriate values ')
         batch_size = z0.shape[0]
         
         # Splitting the input tensor into individual variables, one for each column
@@ -277,7 +279,7 @@ class Hybrid_VAE_SDE(LightningModule):
         sv_max = CV_params["max_sv"]
         sv_min = CV_params["min_sv"]
 
-        #print('CV_params', CV_params)
+        print('CV_params', CV_params)
         
         # Applying sigmoid and scaling to each dimension
         p_a = torch.sigmoid(p_a).unsqueeze(1) * (pa_max - pa_min) + pa_min
@@ -287,14 +289,14 @@ class Hybrid_VAE_SDE(LightningModule):
 
         # Concatenating along the second dimension (columns)
         scaled_out = torch.cat([p_a, p_v, s_reflex, sv], dim=1)
-        #print('scaled_out shape:', scaled_out.shape)
+        print('scaled_out shape:', scaled_out.shape)
 
         return scaled_out
     
     def normalise_expert_inputs(self, y):
-        #print('y to normalise', y.shape, y[0, :])
-        #print('CV_params_prior_mu', CV_params_prior_mu)
-        #print('CV_params_prior_sigma', CV_params_prior_sigma)
+        print('y to normalise', y.shape, y[0, :])
+        print('CV_params_prior_mu', CV_params_prior_mu)
+        print('CV_params_prior_sigma', CV_params_prior_sigma)
         pa = ((y[:, 0]- CV_params_prior_mu['pa'])/CV_params_prior_sigma['pa']).unsqueeze(1)
         pv = ((y[:, 1]- CV_params_prior_mu['pv'])/CV_params_prior_sigma['pv']).unsqueeze(1)
         s = ((y[:, 2]- CV_params_prior_mu['s'])/CV_params_prior_sigma['s']).unsqueeze(1)
@@ -308,8 +310,11 @@ class Hybrid_VAE_SDE(LightningModule):
     
     def apply_SDE_fun(self, t, y):
 
-        SDNN_expert_input_state = self.normalise_expert_inputs(y[:, 1:self.expert_latent_dims+1])
-        #print('SDNN_expert_input_state', SDNN_expert_input_state.shape, SDNN_expert_input_state[0, :])
+        #SDNN_expert_input_state = self.normalise_expert_inputs(y[:, 1:self.expert_latent_dims+1])
+        
+        SDNN_expert_input_state = y[:, 1:self.expert_latent_dims+1]
+
+        print('SDNN_expert_input_state', SDNN_expert_input_state.shape, SDNN_expert_input_state[0, :])
 
         if self.include_time:
             # Positional encoding in transformers for time-inhomogeneous posterior
@@ -332,31 +337,40 @@ class Hybrid_VAE_SDE(LightningModule):
             elif self.SDE_input_state == 'latents':
                 SDE_NN_input = torch.cat([SDNN_expert_input_state[:,2:], y[:, 5:]], dim=-1)
 
-        #print('SDE_NN_input shape', SDE_NN_input.shape)
-        #print('SDE_NN_input example', SDE_NN_input[0,:])
+        print('SDE_NN_input shape', SDE_NN_input.shape)
+        print('SDE_NN_input example', SDE_NN_input[0,:])
         SDE_NN_output_latents = self.SDEnet(SDE_NN_input) 
-        #print('SDE_NN_output_latents', SDE_NN_output_latents.shape)
+        print('SDE_NN_output_latents', SDE_NN_output_latents.shape)
         #print('SDE_NN_output_latents example', SDE_NN_output_latents[0, :])
-        
+        has_nonzero = SDE_NN_output_latents.ne(0.).any()
+        print('SDE_NN Has non-0 OUTPUT??', has_nonzero)
         return SDE_NN_output_latents
+    
+    def scale_unnormalised_experts(self, expert_dims):
+        pa = (100*expert_dims[:, 0]).unsqueeze(1)
+        pv = (100*expert_dims[:, 1]).unsqueeze(1)
+        s =  (1*expert_dims[:, 2]).unsqueeze(1)
+        sv = (100*expert_dims[:, 3]).unsqueeze(1)
+        return torch.cat([pa, pv, s, sv], dim=-1)
     
     def f(self, t, y, Tx, time_to_treatment):  # Approximate posterior drift.
 
-        i_ext = y[:,0].unsqueeze(1)
-        p_a = y[:,1].unsqueeze(1)
-        p_v = y[:,2].unsqueeze(1)
-        s_reflex = y[:, 3] .unsqueeze(1)
-        sv_sde = y[:, 4].unsqueeze(1)
+        i_ext = y[:,0].unsqueeze(1) 
+        p_a = y[:,1].unsqueeze(1) 
+        p_v = y[:,2].unsqueeze(1) 
+        s_reflex = y[:, 3] .unsqueeze(1) 
+        sv = y[:, 4].unsqueeze(1)
+            
 
-        #print('time, i_ext, p_a pv, s, sv', t.item(), i_ext[0].item(), p_a[0].item(), p_v[0].item(), s_reflex[0].item(), sv_sde[0].item())   
+        print('time, i_ext, p_a pv, s, sv', t.item(), i_ext[0].item(), p_a[0].item(), p_v[0].item(), s_reflex[0].item(), sv[0].item())   
         
-        #print('t, time_to_treatment', t.item(), time_to_treatment.shape)
+        print('t, time_to_treatment', t.item(), time_to_treatment.shape)
         if t.item() >= time_to_treatment:
-            #print('Treatment has started! Estimating effect', t.item(), time_to_treatment )
+            print('Treatment has started! Estimating effect', t.item(), time_to_treatment )
             #the neural network is trying to learn the ultimate treatment effect!! this means both fluid function AND the v_fun. V_fun determines the unknown tx_effect multiplied (beyond) the model, hence to be learned
             dt_i_ext_SDE = self.apply_SDE_fun(t, y) * self.SDE_control_weighting
-            #print('dt_i_ext_SDE NN', dt_i_ext_SDE.shape)
-            #print('dt_i_ext_SDE', dt_i_ext_SDE[:3, :])
+            print('dt_i_ext_SDE NN', dt_i_ext_SDE.shape)
+            print('dt_i_ext_SDE', dt_i_ext_SDE[:3, :])
 
         else:
             dt_i_ext_SDE = torch.zeros_like(y[:,0]).unsqueeze(1)
@@ -365,9 +379,12 @@ class Hybrid_VAE_SDE(LightningModule):
         #this is an important step to then create the counterfactuals when we set T as the opposite of what it's trained on (T_cf)
         #print('Tx', Tx)
         i_ext_SDE = Tx[:,None] * i_ext 
+
+        has_nonzero = i_ext_SDE.ne(0.).any()
+        print('i_ext_SDE Has non-0 OUTPUT??', has_nonzero)
         
         #print('i_ext', i_ext_SDE.shape)
-        #print('i_ext example', i_ext_SDE)
+        #print('i_ext example', i_ext_SDE[:5, :])
         
         #print('fixed params', self.f_hr_min.item(), self.f_hr_max.item(), self.r_tpr_max.item(), self.r_tpr_min.item(),self.r_tpr_mod.item() )
         #print('fixed params', self.ca.item(), self.cv.item(), self.tau.item(), self.k_width.item(),self.p_aset.item(),self.sv_mod.item())
@@ -376,7 +393,7 @@ class Hybrid_VAE_SDE(LightningModule):
         r_tpr = s_reflex * (self.r_tpr_max - self.r_tpr_min) + self.r_tpr_min - self.r_tpr_mod
         
         # Calculate changes in volumes and pressures
-        dva_dt = -1. * (p_a - p_v) / (r_tpr + 1e-7)  + sv_sde * f_hr
+        dva_dt = -1. * (p_a - p_v) / (r_tpr + 1e-7)  + sv * f_hr
         dvv_dt = -1. * dva_dt + i_ext_SDE
         #print('f_hr, dva_dt, r_tpr, dvv_dt', f_hr.shape, dva_dt.shape, r_tpr.shape, dvv_dt.shape)
         #print('f_hr, dva_dt, r_tpr, dvv_dt', f_hr[0], dva_dt[0], r_tpr[0], dvv_dt[0])
@@ -388,21 +405,21 @@ class Hybrid_VAE_SDE(LightningModule):
                                   #(1. - 1. / (1 + torch.exp(-self.params["k_width"] * (p_a - self.params["p_aset"]))) - s)
         #self.sigmoid(self.k_width * (p_a - self.p_aset)) - s_reflex)
         dsv_dt = i_ext_SDE * self.sv_mod
-        #print('dpa_dt, dpv_dt, ds_dt, dsv_dt', dpa_dt.shape, dpv_dt.shape, ds_dt.shape, dsv_dt.shape)
+        print('dpa_dt, dpv_dt, ds_dt, dsv_dt', dpa_dt.shape, dpv_dt.shape, ds_dt.shape, dsv_dt.shape)
 
         
         diff_results = torch.cat([dt_i_ext_SDE, dpa_dt, dpv_dt, ds_dt, dsv_dt], dim=-1)
-        #print('diff_results example', diff_results[0,:])
-        #print('diff_results', diff_results.shape)
+        print('diff_results example', diff_results[0,:])
+        print('diff_results', diff_results.shape)
 
         return diff_results 
 
     def h(self, t, y):  # Prior drift.
         mu = torch.tensor(self.prior_tx_mu).to(self.device)
         expanded_mu = mu.repeat(y.size(0), 1)
-        #print('theta h', self.theta.shape, self.theta[0,:])
-        #print('mu h', expanded_mu.shape, expanded_mu[0,:])
-        #print('y in h', y.shape, y[0,:])
+        print('theta h', self.theta.shape, self.theta[0,:])
+        print('mu h', expanded_mu.shape, expanded_mu[0,:])
+        print('y in h', y.shape, y[0,:])
 
         return self.theta * (expanded_mu - y)
 
@@ -413,49 +430,49 @@ class Hybrid_VAE_SDE(LightningModule):
         Tx = y[:, -2]
         time_to_treatment = y[0, -1]
         encoder_to_SDENN_latents = torch.zeros(y.shape[0], self.encoder_output_dim - self.expert_latent_dims).to(self.device)
-        #print('Y f_aug', y.shape) # num_samples x sde_dims 
+        print('Y f_aug', y.shape) # num_samples x sde_dims 
         
         f_res = self.f(t, dt_all_dims, Tx, time_to_treatment)
         #g_iext, h_iext  = self.g(t, i_ext), self.h(t, i_ext)
         
         #f_iext = f_res[:,0].unsqueeze(1)
-        ##print('f', f_expt.shape, 'g', g_res.shape, 'h', h_res.shape)
-        ##print('f mean', f_expt.mean(), 'g mean', g_res.mean(), 'h mean', h_res.mean())
-        ##print('f', f_expt[:3,:], 'g ', g_res[:3,:], 'h ', h_res[:3,:] )
+        #print('f', f_expt.shape, 'g', g_res.shape, 'h', h_res.shape)
+        #print('f mean', f_expt.mean(), 'g mean', g_res.mean(), 'h mean', h_res.mean())
+        #print('f', f_expt[:3,:], 'g ', g_res[:3,:], 'h ', h_res[:3,:] )
         
-        ##print('doing stable division!')
+        #print('doing stable division!')
         #u = _stable_division(f_iext - h_iext, g_iext)
-        ##print('u shape', u.shape)
+        #print('u shape', u.shape)
         
         #f_logqp = .5 * (u ** 2).sum(dim=1, keepdim=True)
         f_logqp = torch.zeros_like(y[:, 0]).unsqueeze(1).to(self.device)
-        #print('f_logqp', f_logqp.shape)
-        #print('f_logqp mean', f_logqp[:3,:])        
+        print('f_logqp', f_logqp.shape)
+        print('f_logqp mean', f_logqp[:3,:])        
 
         f_out = torch.cat([f_res, encoder_to_SDENN_latents, f_logqp, torch.zeros_like(f_logqp), torch.zeros_like(f_logqp)], dim=1)
         #f_out now has 7 +K dims + : 4 dims for dt, K dims of latents going straight to SDENN, 1 dim for SDENN output, 1 dim for logqp, 1 dim for T, 1 dim for time_to_T  
-        #print('f_aug out', f_out.shape)
+        print('f_aug out', f_out.shape, f_out[0])
         return f_out
     
     def g(self, t, y):  
         #sigma is different for each values here! 
         sigma = torch.tensor(self.prior_tx_sigma).to(self.device)
         expanded_sigma = sigma.repeat(y.size(0), 1)
-        #print('sigma g', expanded_sigma.shape, expanded_sigma[0] )
+        print('sigma g', expanded_sigma.shape, expanded_sigma[0] )
         return expanded_sigma
 
     def g_aug(self, t, y):  # Diffusion for augmented dynamics with logqp term.
-        y = y[:, :self.encoder_output_dim] 
+        
         i_ext = y[:, 0].unsqueeze(1)
         dt_expert_dims = torch.zeros(y.shape[0], self.expert_latent_dims).to(self.device)
         encoder_to_SDENN_latents = torch.zeros(y.shape[0], self.encoder_output_dim - self.expert_latent_dims).to(self.device)
         
         g_res = self.g(t, i_ext)
-        #print('g', g_res.shape, g_res[0])
+        print('g', g_res.shape, g_res[0])
         g_logqp = torch.zeros(y.size(0), 1).to(y.device)
 
         g_out = torch.cat([g_res, dt_expert_dims, encoder_to_SDENN_latents,  g_logqp, torch.zeros_like(g_logqp), torch.zeros_like(g_logqp)], dim=1)
-        #print('g out', g_out.shape, g_out[0])
+        print('g out', g_out.shape, g_out[0])
         return g_out
 
     def forward_latent(self, init_latents, ts, Tx, time_to_tx):
@@ -465,20 +482,20 @@ class Hybrid_VAE_SDE(LightningModule):
         time_to_tx = time_to_tx.unsqueeze(1).unsqueeze(2).expand(batch_size, self.num_samples, -1).to(init_latents)
         i_ext = torch.zeros(batch_size,self.num_samples, 1).to(init_latents)
         log_path = torch.zeros(batch_size,self.num_samples, 1).to(init_latents)
-        #print('ts',ts.shape)
-        #print('i_ext ', i_ext.shape)
-        #print('init_latents ', init_latents.shape)
-        #print('log_path', log_path.shape)
-        #print(f"Tx_expanded shape: {Tx_expanded.shape}")
-        #print(f"time_to_tx shape: {time_to_tx.to(init_latents).shape}")
+        print('ts',ts.shape)
+        print('i_ext ', i_ext.shape)
+        print('init_latents ', init_latents.shape)
+        print('log_path', log_path.shape)
+        print(f"Tx_expanded shape: {Tx_expanded.shape}")
+        print(f"time_to_tx shape: {time_to_tx.to(init_latents).shape}")
 
         
         aug_y0 = torch.cat([i_ext, init_latents,  log_path, Tx_expanded, time_to_tx], dim=-1) 
-        #print('aug_y0', aug_y0.shape, aug_y0[0, 0,:])
+        print('aug_y0', aug_y0.shape, aug_y0[0, 0,:])
         dim_aug = aug_y0.shape[-1]
         aug_y0 = aug_y0.reshape(-1,dim_aug) # this is because the SDEint can only accept [M x dim], so M becomes batch_size * num_samples
 
-        #print('aug_y0', aug_y0.shape) #this will be num_samples x dim = 512 x 4
+        print('aug_y0', aug_y0.shape) #this will be num_samples x dim = 512 x 4
         options = {'dtype': torch.float32}
         aug_ys = self.sdeint_fn(
             sde=self,
@@ -493,18 +510,22 @@ class Hybrid_VAE_SDE(LightningModule):
             names={'drift': 'f_aug', 'diffusion': 'g_aug'}
         )
         
-        aug_ys = aug_ys.reshape(-1, self.num_samples, len(ts),dim_aug) # reshape for # batch_size x num_samples x times x dim
+        print('len(ts)', len(ts))
+        print('dim_aug', dim_aug)
+        print('aug_ys pre_reshape',aug_ys.shape)
+        
+        aug_ys = aug_ys.view(len(ts), batch_size, self.num_samples, dim_aug).permute(1,2,0,3)
+        #reshape(self.num_samples,-1,  len(ts),dim_aug) # reshape for # batch_size x num_samples x times x dim
         
         i_ext_path = aug_ys[:, :, :, 0]
         latent_out = aug_ys[:, :, :, 1:self.expert_latent_dims+1]
         logqp_path = aug_ys[:,: , -1, -3]    #.mean(dim=0)  # KL(t=0) + KL(path).
        
-        #divisors = torch.tensor([CV_params['pa_divisor'], CV_params['pv_divisor'], CV_params['s_divisor'], CV_params['sv_divisor']], dtype=torch.float32).view(1, 1, 1, 4)
-        #latent_out = latent_out/divisors.to(self.device)
+        print('latent_out end of latent ', latent_out[0, 0, :, :])
         
-        #print('i_ext_path', i_ext_path.shape, i_ext_path[0,:,:])
-        #print('ys_extracted', latent_out.shape)
-        #print('logqp_path_extracted', logqp_path.shape)
+        print('i_ext_path', i_ext_path.shape, i_ext_path[:4,:2,:])
+        print('ys_extracted', latent_out.shape)
+        print('logqp_path_extracted', logqp_path.shape)
        
         return latent_out, logqp_path, i_ext_path
 
@@ -518,14 +539,14 @@ class Hybrid_VAE_SDE(LightningModule):
                 z1_mean, z1_logvar = self.enc_model(input_vals, time_in)
                 z1 = z1_mean.unsqueeze(1).repeat(1, self.num_samples, 1) # Add an extra dimension: shape becomes [batch, 1, latent]
                 logqp0 = 0
-                #print('encoder_output', z1.shape)
+                print('encoder_output', z1.shape)
 
             else:
                 z1 = self.enc_model(input_vals, time_in)
                 z1 = z1.unsqueeze(1).repeat(1, self.num_samples, 1) # Add an extra dimension: shape becomes [batch, 1, latent]
                 logqp0 = 0
                 z1_logvar = 0
-                #print('encoder_output', z1.shape)
+                print('encoder_output', z1.shape)
 
 
         else: #Here we do NOT use an encoder, as we run the models on the FULL trajectory by giving it WHEN the tx will occur 
@@ -559,49 +580,60 @@ class Hybrid_VAE_SDE(LightningModule):
         return selected_tensor
     
     def forward_dec(self, latent_out):
-        #print('latent_out', latent_out[0, 0, :, :])
+        print('latent_out', latent_out[0, 0, :, 1])
+        print('latent_out', latent_out[0, 1, :, 1])
+        print('latent_out', latent_out[0, 2, :, 1])
+        print('latent_out', latent_out[1, 0, :, 1])
+        print('latent_out', latent_out[1, 1, :, 1])
+        print('latent_out', latent_out[1, 2, :, 1])
         if self.normalised_data:
             latent_out[:,:,:,0] = (latent_out[:,:,:,0] - CV_params_prior_mu['pa'])/CV_params_prior_sigma['pa']
             latent_out[:,:,:,1] = (latent_out[:,:,:,1] - CV_params_prior_mu['pv'])/CV_params_prior_sigma['pv']
             latent_out[:,:,:,2] = (latent_out[:,:,:,2] - CV_params_prior_mu['s'])/CV_params_prior_sigma['s']
             latent_out[:,:,:,3] = (latent_out[:,:,:,3] - CV_params_prior_mu['sv'])/CV_params_prior_sigma['sv']
+        
+        else:
+            #now we just need to rescale down instead to renormalise 
+            divisors = torch.tensor([CV_params['pa_divisor'], CV_params['pv_divisor'], CV_params['s_divisor'], CV_params['sv_divisor']], dtype=torch.float32).view(1, 1, 1, 4)
+            latent_out = latent_out/divisors.to(self.device)
 
         output_traj = self.select_tensor_by_index_list_advanced(latent_out, self.decoder_output_dims)
-        #print('output_traj', output_traj.shape, output_traj[0, 0, :, :])
+        print('output_traj', output_traj.shape, output_traj[0, 0, :, :])
 
         return output_traj
 
     def compute_factual_loss(self, predicted_traj, true_traj, logqp):
         
         true_traj_expanded = true_traj.unsqueeze(1).repeat(1, self.num_samples, 1, 1) 
-        #print('true_traj_expanded', true_traj_expanded.shape, true_traj_expanded[0,0,:,:])
+        print('true_traj_expanded', true_traj_expanded.shape, true_traj_expanded[0,0,:,:])
         
-        #print('predicted_traj', predicted_traj.shape, predicted_traj[0,0,:,:])
+        print('predicted_traj', predicted_traj.shape, predicted_traj[0,0,:,:])
         output_scale = torch.full(predicted_traj.shape, self.log_lik_output_scale, device=self.device)
-        #print('output_scale', output_scale.shape)
+        print('output_scale', output_scale.shape)
 
         #calculating the gaussian log prob between the predicted and the true traj. We want this to be as big as possible, so we will minimise its negative.
-        #print('likelihood')
+        print('likelihood')
         likelihood = distributions.Normal(loc=predicted_traj, scale=output_scale)
-        #print('log prob')
+        print('log prob')
         logpy = likelihood.log_prob(true_traj_expanded)
-        #print('logpy', logpy.shape)
+        print('logpy', logpy.shape)
         logpy = logpy.sum((2,3)) #sum across times and dims, keeping a loss for each sde sample and batch size 
-        #print('logpy', logpy.shape, logpy.mean())
+        print('logpy', logpy.shape, logpy.mean())
 
-        #print('logqp.mean()', logqp.mean())
+        print('FACT LOSS', logqp.mean())
 
         # calculating final loss 
         loss = -logpy.mean() + self.KL_weighting_SDE* (logqp.mean() * self.kl_scheduler.val)
         loss = loss.squeeze() 
+        print("TOTAL LOSS ", loss)
 
         return loss, -logpy.mean(), logqp.mean()
 
     def compute_counterfactual_loss(self, true_fact, true_cf, pred_fact, pred_cf):
-        #print('true_fact:', true_fact.shape, true_fact[0,:,:] )
-        #print('true_cf:', true_cf.shape, true_cf[0,:,:])
-        #print('pred_fact:', pred_fact.shape, pred_fact.mean(1)[0,:,:])
-        #print('pred_cf:', pred_cf.shape, pred_cf.mean(1)[0,:,:])
+        print('true_fact:', true_fact.shape, true_fact[0,:,:] )
+        print('true_cf:', true_cf.shape, true_cf[0,:,:])
+        print('pred_fact:', pred_fact.shape, pred_fact.mean(1)[0,:,:])
+        print('pred_cf:', pred_cf.shape, pred_cf.mean(1)[0,:,:])
 
         # RECON LOSS
         # MSE loss between the Y and the MEAN of the SDE samples predictions, which includes expert and SDE in hybrid 
@@ -611,42 +643,47 @@ class Hybrid_VAE_SDE(LightningModule):
 
         # Individual Treatment Effect computed as the difference between Y_cf and Y
         ite = (true_cf- true_fact)
-        #print('ite:', ite.shape)
+        print('ite:', ite.shape)
 
         # Predicted Individual Treatment Effect computed as the difference between the mean predictions of Y_hat_cf and Y_hat
         ite_hat = (pred_cf.mean(1) - pred_fact.mean(1))
-        #print('ite_hat:', ite_hat.shape)
+        print('ite_hat:', ite_hat.shape)
 
         # MSE of the ITE
         mse_ite = torch.sqrt(self.MSE_loss(ite, ite_hat)).mean()
-        #print('mse_ite:', mse_ite)    
+        print('mse_ite:', mse_ite)    
 
 
         return mse_cf, mse_ite, std_preds_cf
         
 
     def training_step(self, batch, batch_idx):
-        #print("TRAINING")
+        print("TRAINING")
         X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
 
            
         #print('time_post', time_post.shape)
-        input_vals = X if self.use_encoder else init_states[:, :4] 
-        z1_enc, z_logvar, logqp0 =   self.forward_enc(input_vals, time_pre)
+        #input_vals = X if self.use_encoder else init_states[:, :4] 
+        #z1_enc, z_logvar, logqp0 =   self.forward_enc(input_vals, time_pre)
         #print('encoder expert outputs normalised',  z1_enc[0,0,:4])
         #z1_enc = self.sigmoid_scale(z1_enc[:, :, :4])
         #print('encoder expert outputs unnormalised', z1_enc[0,0,:4])
+        #z1_ML = z1_enc[:, :, 4:]
+        logqp0 = 0
 
-        #print('full_fact_traj', full_fact_traj.shape)
+        print('full_fact_traj', full_fact_traj.shape)
         z1_real = full_fact_traj[:, 15, :]
-        #print('z1_real', z1_real.shape, z1_real[0, :])
-        z1_real = self.sigmoid_scale(z1_real)
-        z1_real = z1_real.unsqueeze(1).repeat(1, self.num_samples, 1)     
-        z1_ML = z1_enc[:, :, 4:]
+        print('z1_real', z1_real.shape, z1_real[0, :])
+        if self.normalised_data: 
+            #need to unnormalise by applying a sigmoid then according to pre-computed max_min from CV_data (careful to make sure the data creation has updated these!)
+            z1_real = self.sigmoid_scale(z1_real)
+        else:
+            #need to scale only! YAY
+            z1_real = self.scale_unnormalised_experts(z1_real)
+        z1_ML = torch.zeros(z1_real.shape[0],self.encoder_SDENN_dims).to(self.device)
         z1_input = torch.cat([z1_real, z1_ML  ], dim =-1)
-        #print('z1_scaled_unnormalised', z1_real.shape, z1_real[0, 0, :])
-
-        z1 = z1_real
+        z1_input = z1_input.unsqueeze(1).repeat(1, self.num_samples, 1) 
+        print('z1_input', z1_input.shape, z1_input[0, 0, :])
 
 
         latent_traj, logqp_path, i_ext_path = self.forward_latent(init_latents = z1_input, 
@@ -656,7 +693,7 @@ class Hybrid_VAE_SDE(LightningModule):
         predicted_traj = self.forward_dec(latent_traj )
 
         loss, fact_loss, kl_loss = self.compute_factual_loss(predicted_traj = predicted_traj, 
-                                                             true_traj = Y[:, :, self.decoder_output_dims] if self.use_encoder else full_fact_traj[:,:,self.decoder_output_dims], 
+                                                             true_traj = Y if self.use_encoder else  self.select_tensor_by_index_list_advanced(full_fact_traj, self.decoder_output_dims), 
                                                              logqp=  logqp0 + logqp_path)
         
         
@@ -665,31 +702,38 @@ class Hybrid_VAE_SDE(LightningModule):
         self.log('train_kl_loss', kl_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.kl_scheduler.step()
 
-        #print("LOSS STEP")
+        print("LOSS STEP")
         return loss
 
 
     def validation_step(self, batch, batch_idx):
-        #print("VALIDATION")
+        print("VALIDATION")
         X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
         
+
         #print('time_post', time_post.shape)
         #input_vals = X if self.use_encoder else init_states[:, :4] 
         #z1_enc, z_logvar, logqp0 =   self.forward_enc(input_vals, time_pre)
         #print('encoder expert outputs normalised',  z1_enc[0,0,:4])
         #z1_enc = self.sigmoid_scale(z1_enc[:, :, :4])
         #print('encoder expert outputs unnormalised', z1_enc[0,0,:4])
+        #z1_ML = z1_enc[:, :, 4:]
+        logqp0 = 0
 
-        #print('full_fact_traj', full_fact_traj.shape)
+        print('full_fact_traj', full_fact_traj.shape)
         z1_real = full_fact_traj[:, 15, :]
-        #print('z1_real', z1_real.shape, z1_real[0, :])
-        z1_real = self.sigmoid_scale(z1_real)
-        z1_real = z1_real.unsqueeze(1).repeat(1, self.num_samples, 1)     
-        z1_ML = z1_enc[:, :, 4:]
+        print('z1_real', z1_real.shape, z1_real[0, :])
+        if self.normalised_data: 
+            #need to unnormalise by applying a sigmoid then according to pre-computed max_min from CV_data (careful to make sure the data creation has updated these!)
+            z1_real = self.sigmoid_scale(z1_real)
+        else:
+            #need to scale only! YAY
+            z1_real = self.scale_unnormalised_experts(z1_real)
+        z1_ML = torch.zeros(z1_real.shape[0],self.encoder_SDENN_dims).to(self.device)
         z1_input = torch.cat([z1_real, z1_ML  ], dim =-1)
-        #print('z1_scaled_unnormalised', z1_real.shape, z1_real[0, 0, :])
+        z1_input = z1_input.unsqueeze(1).repeat(1, self.num_samples, 1) 
+        print('z1_input', z1_input.shape, z1_input[0, 0, :])
 
-        z1 = z1_real
 
         latent_traj, logqp_path, i_ext_path = self.forward_latent(init_latents = z1_input, 
                                                       ts = time_post[0] if self.use_encoder else time_FULL[0], 
@@ -698,28 +742,27 @@ class Hybrid_VAE_SDE(LightningModule):
         predicted_traj = self.forward_dec(latent_traj )
         
         loss, fact_loss, kl_loss = self.compute_factual_loss(predicted_traj = predicted_traj, 
-                                                             true_traj = Y[:, :, self.decoder_output_dims] if self.use_encoder else full_fact_traj[:,:,self.decoder_output_dims], 
+                                                             true_traj = Y if self.use_encoder else  self.select_tensor_by_index_list_advanced(full_fact_traj, self.decoder_output_dims), 
                                                              logqp=  logqp0 + logqp_path)
         
         ### now the COUNTERFACTUAL
-        #print('NOW COUNTERFACTUAL')
+        print('NOW COUNTERFACTUAL')
         #z1_cf, logqp0_cf =   self.forward_enc(input_vals, time_pre)
         latent_traj_cf, logqp_path_cf, _ = self.forward_latent(init_latents = z1_input, 
                                                       ts = time_post[0] if self.use_encoder else time_FULL[0], 
                                                       Tx= (~T.bool()).long(), 
                                                       time_to_tx = torch.tensor([0]) if self.use_encoder else torch.tensor([time_pre.shape[1] - 1]))
         predicted_traj_cf = self.forward_dec(latent_traj_cf )
-        true_traj = Y if self.use_encoder else full_cf_traj
 
-        mse_cf, mse_ite, std_preds_cf = self.compute_counterfactual_loss(true_fact = Y if self.use_encoder else full_fact_traj,
-                                                                         true_cf= Y_cf[:,:,self.decoder_output_dims] if self.use_encoder else full_cf_traj[:,:,self.decoder_output_dims], 
+        mse_cf, mse_ite, std_preds_cf = self.compute_counterfactual_loss(true_fact = Y if self.use_encoder else self.select_tensor_by_index_list_advanced(full_fact_traj, self.decoder_output_dims),
+                                                                         true_cf = Y_cf if self.use_encoder else  self.select_tensor_by_index_list_advanced(full_cf_traj, self.decoder_output_dims), 
                                                                          pred_fact= predicted_traj,
                                                                          pred_cf= predicted_traj_cf)
 
         if batch_idx == 0:
             if self.use_encoder:
                 self.plot_trajectories_hyland( X, Y, Y_cf, predicted_traj.permute(0, 2, 1, 3), predicted_traj_cf.permute(0, 2, 1, 3), chart_type = "val" )
-                plot_SDENN_output(i_ext_path[0])
+                self.plot_SDENN_output(i_ext_path)
             else:
                 plot_trajectories_normal(ts = time_FULL[0] , 
                                         zs = predicted_traj[0], 
@@ -748,10 +791,10 @@ class Hybrid_VAE_SDE(LightningModule):
    
          
     def test_step(self, batch, batch_idx):
-        #print("TEST")
+        print("TEST")
         X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
         
-        #print('time_post', time_post.shape)
+        print('time_post', time_post.shape)
         input_vals = X if self.use_encoder else init_states[:, :4] 
         z1, z_logvar, logqp0 =   self.forward_enc(input_vals, time_pre)
         latent_traj, logqp_path, i_ext_path = self.forward_latent(init_latents = z1, 
@@ -765,7 +808,7 @@ class Hybrid_VAE_SDE(LightningModule):
                                                              logqp=  logqp0 + logqp_path)
         
         ### now the COUNTERFACTUAL
-        #print('NOW COUNTERFACTUAL')
+        print('NOW COUNTERFACTUAL')
         #z1_cf, logqp0_cf =   self.forward_enc(input_vals, time_pre)
         latent_traj_cf, logqp_path_cf, _ = self.forward_latent(init_latents = z1, 
                                                       ts = time_post[0] if self.use_encoder else time_FULL[0], 
@@ -782,7 +825,7 @@ class Hybrid_VAE_SDE(LightningModule):
         if batch_idx == 0:
             if self.use_encoder:
                 self.plot_trajectories_hyland( X, Y, Y_cf, predicted_traj.permute(0, 2, 1, 3), predicted_traj_cf.permute(0, 2, 1, 3), chart_type = "val" )
-                plot_SDENN_output(i_ext_path[0])
+                self.plot_SDENN_output(i_ext_path, self.global_step)
             else:
                 plot_trajectories_normal(ts = time_FULL[0] , 
                                         zs = predicted_traj[0], 
@@ -817,6 +860,11 @@ class Hybrid_VAE_SDE(LightningModule):
         return {"optimizer": optimizer, "lr_scheduler":scheduler}
 
     def plot_trajectories_hyland(self, X, Y, Y_cf, Y_hat, Y_hat_cf, chart_type = "val" ):
+        print('PLOTTING')
+        if not os.path.exists(self.train_dir):
+            os.makedirs(self.train_dir)
+            print(f'Created directory: {self.train_dir}')
+
         X_df_list = []
         for dim in range(X.shape[-1]):
             X_df = pd.DataFrame(X.cpu().numpy()[0,:,dim], columns = ["PaPv"])
@@ -851,6 +899,48 @@ class Hybrid_VAE_SDE(LightningModule):
             df = pd.concat([X_df, Y_fact_df, Y_cfact_df, Y_hat_fact_df, Y_hat_cfact_df])
             fig = px.line(df, x = "time",y = "PaPv",color="type", error_y ="std", title = f"{chart_type} longitudinal predictions - dimension {dim}") 
 
-            if type(self.logger).__name__ == "WandbLogger":
-                self.logger.experiment.log({f"{chart_type} chart {dim}":fig},step = self.logger.experiment.step)
+            plot_filename = os.path.join(self.train_dir, f'Predictions_global_step_{self.global_step}.png')
+            fig.write_image(plot_filename, engine="kaleido")
+            print(f'Saved figure at: {plot_filename}')
+
+            # Optionally log the plot to wandb if logging is enabled
+            if self.log_wandb:
+                wandb.log({"Predictions": fig})
         
+    def plot_SDENN_output(self, SDE_output):
+        print('PLOTTING')
+        # Ensure the 'train_dir' exists, which already includes the 'figures' subdirectory
+        if not os.path.exists(self.train_dir):
+            os.makedirs(self.train_dir)
+            print(f'Created directory: {self.train_dir}')
+
+        # Convert the PyTorch tensor to NumPy
+        data_np = SDE_output.cpu().numpy()
+        data_np = data_np.mean(1)  # Mean across the samples, keep separate for time and batch
+        print('data_np', data_np.shape)
+
+        # Create a new figure using Plotly
+        fig = go.Figure()
+        
+        # Number of samples (lines) and time steps
+        batch_dim, num_time_steps = data_np.shape
+        
+        # Adding each sample as a separate trace in the plot
+        for i in range(batch_dim):
+            fig.add_trace(go.Scatter(x=list(range(num_time_steps)), y=data_np[i],
+                                    mode='lines', name=f'Sample {i+1}'))
+        
+        # Update layout
+        fig.update_layout(title='SDE Model Output Over Time',
+                        xaxis_title='Time Step',
+                        yaxis_title='Output Value',
+                        legend_title='Samples')
+        
+        # Save the plot to the directory
+        plot_filename = os.path.join(self.train_dir, f'sde_output_global_step_{self.global_step}.png')
+        fig.write_image(plot_filename, engine="kaleido")
+        print(f'Saved figure at: {plot_filename}')
+
+        # Optionally log the plot to wandb if logging is enabled
+        if self.log_wandb:
+            wandb.log({"SDE_Output_Over_Time": fig})
