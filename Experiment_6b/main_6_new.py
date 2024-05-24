@@ -38,12 +38,9 @@ def set_seed(seed):
 def main(args):
     print('CUDA GPUs present?', torch.cuda.is_available())
     if args.HPC_work:
-        saving_dir = r'/home/rc667/rds/hpc-work/CF_ICU'
         torch.set_float32_matmul_precision('medium')  # Faster computations with less precision
-
-    else:
-        saving_dir = r'.'
-
+        
+    saving_dir = os.getcwd()
 
     set_seed(args.seed)
 
@@ -51,28 +48,30 @@ def main(args):
         wandb_logger = WandbLogger(project=args.project_name, 
                                    log_model=False, 
                                    save_dir = os.path.join(saving_dir, 'model_logs'))
+        wandb_logger.log_hyperparams(args)
     else:
         wandb_logger = None
 
     dataset_params = {
         'N': 1000,
-        'gamma': args.gamma,
+        'gamma': 0,
         'noise_std': 0.0,
-        'sigma_tx': 4,
-        'confounder_type': args.confounder_type,
+        'sigma_tx': 2,
+        'confounder_type': 'partial',
         'non_confounded_effect': False,
-        't_span': 26,
-        't_treatment': 15,
+        't_span': 60,
+        't_treatment': 45,
+        't_cutoff':40,
         'seed': 1,
         'pre_treatment_dims': [0, 1],
-        'post_treatment_dims': [1],
+        'post_treatment_dims': [0],
         'normalize': False
     }
 
 
     print('dataset_params',dataset_params)
 
-    data_path = '/Users/riccardoconci/Local_documents/ACS submissions/THESIS/Counterfactual_ICU/Experiment_6b/data_created'
+    data_path = os.path.join(saving_dir, 'data_created')
 
     data = create_load_save_data(dataset_params, data_path)
     cv_data_module = CVDataModule_final(data,  batch_size=args.batch_size, num_workers=9)
@@ -108,6 +107,7 @@ def main(args):
                            SDEnet_hidden_dim = args.SDEnet_hidden_dim, 
                            SDEnet_depth = args.SDEnet_depth,
                            SDEnet_out_dims = args.SDEnet_out_dims, 
+                           final_activation = args.final_activation,
 
                            #decoder params
                            decoder_output_dims = dataset_params['post_treatment_dims'],
@@ -127,11 +127,31 @@ def main(args):
 
     callbacks = []
 
+    filename_parts = [
+        f"sd={args.seed}",
+        f"gm={args.gamma}",
+        f"cnf={args.confounder_type}",
+        f"enc={args.use_encoder}",
+        f"encSTD25={args.use_2_5std_encoder_minmax}",
+        f"encSDEd={args.encoder_SDENN_dims}",
+        f"nrmSDE={args.normalise_for_SDENN}",
+        f"itm={args.include_time}",
+        f"txsig={args.prior_tx_sigma}",
+        f"revert={args.self_reverting_prior_control}",
+        f"tht={args.theta}",
+        f"txmu={args.prior_tx_mu}",
+        f"txcw={args.SDE_control_weighting}",
+        f"klw={args.KL_weighting_SDE}"
+    ]
+
+    # Include epoch and validation loss placeholders at the start
+    filename_checkpoint = "best-{epoch:02d}-{val_loss:.2f}-" + "-".join(filename_parts) + ".ckpt"
+
     if args.model_checkpoint:
         checkpoint_callback = ModelCheckpoint(
             monitor='val_total_loss',        # Ensure this is the exact name used in your logging
             dirpath= os.path.join(saving_dir, 'model_checkpoints'),  # Directory to save checkpoints
-            filename='best-checkpoint-{epoch:02d}-{val_loss:.2f}',
+            filename=filename_checkpoint,
             mode='min',                     # Minimize the monitored value
             save_last=True                  # Save the last model to resume training
         )
@@ -164,16 +184,16 @@ def main(args):
     test_results = trainer.test(ckpt_path='best', dataloaders = cv_data_module.test_dataloader())
 
 if __name__ == '__main__':
-    sys.stdout = open('Hybrid_SDE_output_sigma_PCT_Enc.txt', 'w')
+    #sys.stdout = open('Hybrid_SDE_output_sigma_PCT_Enc.txt', 'w')
 
     parser = argparse.ArgumentParser(description="Train a model on CV dataset")
     # Logging specific args 
-    parser.add_argument('--HPC_work', action='store_true', help='HPC run or not')
+    parser.add_argument('--HPC_work', type=bool, default=False, help='Where to save if HPC')
     parser.add_argument('--seed', type=int, default=44, help='Random seed for initialization')
     parser.add_argument('--project_name', type=str, default='maybe_YAY_sdehybrid', help='Wandb project name')
     parser.add_argument('--log_wandb', type=bool, default=True, help='Whether to log to Weights & Biases')
-    parser.add_argument('--early_stopping', type=bool, default=True, help='Enable early stopping')
-    parser.add_argument('--model_checkpoint', type=bool, default=True, help='Enable model checkpointing')
+    parser.add_argument('--early_stopping', type=bool, default=False, help='Enable early stopping')
+    parser.add_argument('--model_checkpoint', type=bool, default=False, help='Enable model checkpointing')
     parser.add_argument('--plot_every', type=int, default=21, help='Plot every how many global steps? ')
 
     # Data specific args
@@ -182,28 +202,29 @@ if __name__ == '__main__':
     parser.add_argument('--non_confounded_effect', type=bool, default=False, help='Whether to add non-confounded unsee effect on the treatment (increases the noise of the prediction)')
 
     #PRIMARY Bifurcation args
-    parser.add_argument('--gamma', type=float, default=0, help='Gamma defines how confounded the data is. the higher, the less overlap. the lower the more overlap')
+    parser.add_argument('--gamma', type=int, default=0, help='Gamma defines how confounded the data is. the higher, the less overlap. the lower the more overlap')
     parser.add_argument('--confounder_type', type=str, default='partial', choices=['visible', 'partial', 'invisible'], help='the type of confounding present')
 
-    parser.add_argument('--use_encoder', type=str, default='full', choices=['full', 'partial', 'none'], help='what to do with the encoder!')
-    
-    parser.add_argument('--normalise_for_SDENN', type=bool, default=True, help='Whether to normalise data when handing it to the SDE NN or just scale it )')
-    parser.add_argument('--prior_tx_sigma', type=float, default=1, help='prior_tx_sigma defines our assumed prior noise of the stochastic control ')
-    parser.add_argument('--self_reverting_prior_control', type=bool, default=True, help='Whether the control has a self reverting prior to it with a mu of 0)')
-    parser.add_argument('--theta', type=float, default=0.1, help='Theta defines how the impact of the mean reverting process correction on the SDE')
-    parser.add_argument('--prior_tx_mu', type=float, default=0.0, help='prior_tx_mu defines our assumed prior Dt_iexternal of the stochastic control ')
-    parser.add_argument('--SDE_control_weighting', type=float, default=1, help='how much to scale the output of the SDE NN')
-
+    parser.add_argument('--use_encoder', type=str, default='none', choices=['full', 'partial', 'none'], help='what to do with the encoder!')
     parser.add_argument('--use_2_5std_encoder_minmax', type=bool, default=False, help='pushes the outputs of the encoder into a narrower range. BUT will mean some are NOT reached appropriately. ')
-
-
-    #SECONDARY bifurcation argrs
     parser.add_argument('--encoder_SDENN_dims', type=int, default=4, help='Encoder output used by SDENN')
+
+    parser.add_argument('--final_activation', type=str, default='none', choices=['relu', 'none'], help='Which nonlinearity to add as a final layer to the NN!')
+    parser.add_argument('--normalise_for_SDENN', type=bool, default=True, help='Whether to normalise data when handing it to the SDE NN or just scale it )')
     parser.add_argument('--include_time', type=bool, default=True, help='Whether to include encoded time in the SDE NN inputs)')
+
+    parser.add_argument('--prior_tx_sigma', type=float, default=0.1, help='prior_tx_sigma defines our assumed prior noise of the stochastic control ')
+    parser.add_argument('--self_reverting_prior_control', type=bool, default=True, help='Whether the control has a self reverting prior to it with a functional prior')
+    parser.add_argument('--theta', type=float, default=0.01, help='Theta defines how the impact of the mean reverting process correction on the SDE')
+    parser.add_argument('--SDE_control_weighting', type=float, default=1, help='how much to scale the output of the SDE NN')
+    parser.add_argument('--KL_weighting_SDE', type=float, default=0.1, help='Defines the weighting to the KL loss for the SDE')
+
+
 
     #Default args _not be changed_
     parser.add_argument('--expert_latent_dims', type=int, default=4, help='Encoder output used by expert model.. minimum 4 max ?10')
-    parser.add_argument('--num_samples', type=int, default=2, help='Number of SDE samples- is affected if sigma >0 ')
+    parser.add_argument('--num_samples', type=int, default=5, help='Number of SDE samples- is affected if sigma >0 ')
+    parser.add_argument('--prior_tx_mu', type=float, default=0.0, help='prior_tx_mu defines our assumed prior Dt_iexternal of the stochastic control ')
 
     # Model specific args
     parser.add_argument('--start_dec_at_treatment', type=bool, default=True, help='Whether to encode the data until treatment and the decode or decode from the beginning!)')
@@ -219,7 +240,6 @@ if __name__ == '__main__':
     parser.add_argument('--SDEnet_depth', type=int, default=4, help='Num layeres for SDE NN  ')
     parser.add_argument('--SDEnet_out_dims', type=int, default=1, help='Num output dims for SDE NN  ')
     parser.add_argument("--output_scale",type=float,default = 0.01, help = "Standard Deviation when computing GaussianNegLL between Y_true and Y_hat")
-    parser.add_argument('--KL_weighting_SDE', type=float, default=0.1, help='Defines the weighting to the KL loss for the SDE')
 
     # Solver args
     parser.add_argument('--adjoint', type=bool, default=False, const=True, nargs="?")
@@ -232,7 +252,7 @@ if __name__ == '__main__':
     # Training specific args
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for the optimizer')
     parser.add_argument('--batch_size', type=int, default=64, help='Training batch size')
-    parser.add_argument('--max_epochs', type=int, default=2, help='Maximum number of epochs to train')
+    parser.add_argument('--max_epochs', type=int, default=300, help='Maximum number of epochs to train')
     parser.add_argument('--accelerator', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
     #parser.add_argument('--devices', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which number of devices to use')
 

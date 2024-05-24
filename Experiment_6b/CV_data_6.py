@@ -1,21 +1,19 @@
-
-
-import numpy as np
-import os
-from pathlib import Path
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+import os
+
 import torchsde
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Subset
 import lightning as L
 
-from utils_6 import CV_params, CV_params_prior_mu, CV_params_prior_sigma
+from utils_6 import CV_params_prior_mu, CV_params_prior_sigma, CV_params
 
-use_cuda = torch.cuda.is_available()
-
+import torch
+import torchsde
+import matplotlib.pyplot as plt
+import numpy as np
 
 class PhysiologicalSDE_batched(torchsde.SDEIto):
     def __init__(self, sigma, sigma_tx, params, confounder_type,non_confounded_effect):
@@ -42,27 +40,49 @@ class PhysiologicalSDE_batched(torchsde.SDEIto):
         return diext_dt.unsqueeze(1)
     
     def create_treatment_effect(self):
+        print('creating treatment effect')
         if self.confounder_type == 'visible':
             #confound on the initial NORMALISED PA - STATIC CONFOUNDER (not time dep)
             initp_transform  = 0.5+(self.params["confounding_pressure"]-0.75)/0.1
             ##print('initp_transform', initp_transform.shape)
-            A_ = self.v_fun(initp_transform)
+            A_ = self.v_fun(initp_transform, scale = 0.02)
         elif self.confounder_type == 'partial':
             #confound on the initial NORMALISED SV - STATIC CONFOUNDER (not time dep)
-            init_sv_transform  = 0.5+(self.params["confounding_sv"]-0.2)/0.1 
-            A_ = self.v_fun(init_sv_transform)
+            init_sv_transform  = 0.5+(self.params["confounding_sv"]-0.58)/0.1 
+            #print('init_sv_transform', init_sv_transform[0])
+            A_ = self.v_fun(init_sv_transform, scale = 0.3)
         elif self.confounder_type == 'invisible':
             A_ = self.v_fun(self.params["confounder_random_number"])
+        elif self.confounder_type == 'none':
+            A_ = torch.tensor([1])
+            
         self.treatment_effect = A_
         return A_
 
-    def v_fun(self, x):
+    def v_fun(self, x, scale):
         cos_term = torch.cos(5 * x - 0.2)
         square_term = (5 - x) ** 2
-        return 0.02 * (cos_term * square_term) ** 2
+        return scale * (cos_term * square_term) ** 2
 
     def f(self, t, y):
-        ##print('y', y.shape)
+        
+        if abs(t.item() - 40.0) < 0.001:
+            ##print(t)
+            print('saving params')
+            self.params["confounding_pressure"] = y[:, 0]
+            self.params["confounding_sv"] = y[:, 3]
+            self.params["cv"] = torch.rand_like(y[:, 0]) * 100 + 10 if self.non_confounded_effect else self.params["cv"] 
+            self.params["confounder_random_number"] = torch.rand_like(y[:, 0])
+            #print('confounding_pressure', y[:, 0])
+            print('confounding_sv', y[:, 3])
+            A_ = self.create_treatment_effect()
+        
+        elif t.item() <40.0:
+            A_ = torch.tensor([0])
+
+        elif t.item()>40.0:
+            A_ = self.create_treatment_effect()
+
         p_a = 100. * y[:, 0].unsqueeze(1)
         p_v = 100. * y[:, 1].unsqueeze(1)
         s = y[:, 2].unsqueeze(1)
@@ -70,30 +90,10 @@ class PhysiologicalSDE_batched(torchsde.SDEIto):
         i_ext = y[:, 4].unsqueeze(1)
         batch_size = y.shape[0]
 
-        ##print('pa', p_a.shape)
-        #print(t.item())
-
-
-        if t.item() == 0:
-            ##print(t)
-            #print('saving params')
-            self.params["confounding_pressure"] = y[:, 0]
-            self.params["confounding_sv"] = y[:, 3]
-            self.params["cv"] = torch.rand_like(y[:, 0]) * 100 + 10 if self.non_confounded_effect else self.params["cv"] 
-            self.params["confounder_random_number"] = torch.rand_like(y[:, 0])
-            ##print('self.params["init_pressure"]', self.params["init_pressure"].shape)
-            ##print('self.params["init_sv"]', self.params["init_sv"].shape)
-        
-            #defining our treatment effect A_ (which we cannot explain with our model), and has a functional dep on the original blood pressure and a form of v_fun
-        
-        A_ = self.create_treatment_effect()
-        #print('A_, i_ext', A_, i_ext)
+        print('A_ ', A_.shape)
         i_ext_tx_effect = A_.unsqueeze(1) * i_ext
-        ##print('i_ext_tx_effect', i_ext_tx_effect.shape)
-
-        #print('time, i_ext, p_a pv, s, sv', t.item(), i_ext_tx_effect[0].item(), p_a[0].item(), p_v[0].item(), s[0].item(), sv[0].item())   
-
-        #print('t, i_ext_effect', t,i_ext_tx_effect )
+        
+        print('time, i_ext pre, A_, i_ext_post, pv, sv', t.item(),i_ext[0].item(), A_[0], i_ext_tx_effect[0].item(), p_v[0].item(), sv[0].item())   
 
         f_hr = s * (self.params["f_hr_max"] - self.params["f_hr_min"]) + self.params["f_hr_min"]
         r_tpr = s * (self.params["r_tpr_max"] - self.params["r_tpr_min"]) + self.params["r_tpr_min"] - self.params["r_tpr_mod"]
@@ -115,9 +115,9 @@ class PhysiologicalSDE_batched(torchsde.SDEIto):
             diext_dt = torch.zeros_like(dpa_dt)
 
         ##print('dpa_dt, dpv_dt, ds_dt, dsv_dt, diext_dt',dpa_dt.shape, dpv_dt.shape, ds_dt.shape, dsv_dt.shape, diext_dt.shape )
-
         
         diff_res = torch.concat([dpa_dt, dpv_dt, ds_dt, dsv_dt, diext_dt], dim=-1)
+        #print('diff_results example', diff_res[0,:])
 
         ##print('diff_res', diff_res.shape)
         return diff_res
@@ -143,17 +143,17 @@ def init_random_state():
     max_ved = 167.0 - 10.0
     min_ved = 121.0 + 10.0
 
-    max_pa = 85.0
-    min_pa = 75.0
+    max_pa = 100.0
+    min_pa = 85.0
 
     max_pv = 70.0
     min_pv = 30.0
 
-    max_s = 0.25
-    min_s = 0.15
+    max_s = 0.05
+    min_s = 0.01
 
-    max_sv = 100
-    min_sv = 90
+    max_sv = 90
+    min_sv = 83
 
     init_ves = (np.random.rand() * (max_ves - min_ves) + min_ves) / 100.0
     # init_ves = 50.0 / 100.0
@@ -173,8 +173,7 @@ def init_random_state():
     return init_state
 
 
-
-def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_effect, t_span, t_treatment, seed, post_treatment_dims, pre_treatment_dims, normalize = False):
+def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_effect, t_span, t_treatment, t_cutoff, seed, post_treatment_dims, pre_treatment_dims, normalize = False):
 
     np.random.seed(seed)
 
@@ -238,24 +237,25 @@ def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_
     #print('creating treated')
     print('init_state_tensor', init_state_tensor.shape, 't_tensor', t_tensor.shape, )
     sde = PhysiologicalSDE_batched(sigma = noise_std, sigma_tx=sigma_tx, confounder_type=confounder_type , non_confounded_effect = non_confounded_effect, params=params_treatment)
-    Y_1 = torchsde.sdeint(sde, init_state_tensor, t_tensor, method='euler').squeeze(1)
+    Y_1 = torchsde.sdeint(sde, init_state_tensor, t_tensor, method='euler',dt=0.05).squeeze(1)
 
     #print('creating untreated')
     #created untreated from the same initial random satates
     sde = PhysiologicalSDE_batched(sigma = noise_std, sigma_tx=sigma_tx, confounder_type=confounder_type , non_confounded_effect = non_confounded_effect, params=params_notreatment)
-    Y_0 = torchsde.sdeint(sde, init_state_tensor, t_tensor, method='euler').squeeze(1)
-        
-    X = init_state_tensor
-    init_state = init_state_tensor
+    Y_0 = torchsde.sdeint(sde, init_state_tensor, t_tensor, method='euler', dt=0.05).squeeze(1)
+
+    print('Y0 Y1', Y_0.shape, Y_1.shape)
+    X = Y_0[t_cutoff, :, :]
+    init_state = Y_0[t_cutoff, :, :] #the confounder is not based on the 'initial' values but rather the ones just before treatment 
         
     #print('Assigning confounding factors')
     ##print('init_state', init_state.shape)
     if confounder_type == 'visible':
-        scaled_pa = scale_numbers(x=init_state[:, 0], original_min=0.75, original_max=0.85, target_min=0, target_max=1)
+        scaled_pa = scale_numbers(x=init_state[:, 0], original_min=0.85, original_max=1.0, target_min=0, target_max=1)
         p = torch.sigmoid(gamma*scaled_pa) # use the arterial pressure as visible confounder
     
     elif confounder_type == 'partial':# use the stroke volume as a partially visible confounder
-        scaled_sv = scale_numbers(x=init_state[:, 3], original_min=0.9, original_max=1, target_min=0, target_max=1)
+        scaled_sv = scale_numbers(x=init_state[:, 3], original_min=0.83, original_max=0.9, target_min=0, target_max=1)
         p  = torch.sigmoid(gamma*scaled_sv) 
 
     elif confounder_type == 'invisible':
@@ -271,7 +271,7 @@ def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_
     Y_1 = Y_1[:, :, :4].permute(1, 0, 2)
     T_expanded = T[:, None, None]
     #print('Y0, Y1, T_expanded', Y_0.shape, Y_1.shape, T_expanded.shape)
-
+    print('Y0 Y1 permuted', Y_0.shape, Y_1.shape)
     # the 'factual' trajectories are the UNtreated outcome (Y0) for the not Treated (1-T) and the Treated outcome (Y1) for the factually Treated (T)
     Y_fact = Y_0 * (1-T_expanded)+ Y_1 *T_expanded
 
@@ -279,7 +279,10 @@ def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_
     # we would never actually have access to the counterfactual other than in this situation where we are simulating it 
     Y_cf = Y_0 * T_expanded + Y_1 * (1-T_expanded)
 
-    
+    print('Y_fact Y_cf', Y_fact.shape, Y_cf.shape)
+    Y_fact = Y_fact[:, t_cutoff:, :]
+    Y_cf = Y_cf[:, t_cutoff:, :]
+
     Y_fact_np = Y_fact.detach().cpu().numpy()
     states_mean = Y_fact_np.mean(axis=(0, 1))
     states_min = Y_fact_np.min(axis=(0, 1))
@@ -287,7 +290,7 @@ def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_
     #print('states_mean', states_mean, 'states_min', states_min, 'states_max', states_max)
 
     
-    Y_fact_until_t = Y_fact[:, :t_treatment, :]
+    Y_fact_until_t = Y_fact[:, t_cutoff:t_treatment, :]
     mu = Y_fact_until_t.mean([0,1])
     std = Y_fact_until_t.std([0,1])
     
@@ -319,29 +322,46 @@ def create_cv_data(N,gamma,noise_std, sigma_tx, confounder_type, non_confounded_
 
     
     # Now split these factual and counterfactual trajectories by the 'before' and 'after treatment' so we have a baseline 
-    pre_treat_mask = (t<=t_treatment)
-    post_treat_mask = (t>t_treatment)
     
+    pre_treat_mask = (t<=t_treatment)[t_cutoff:]
+    post_treat_mask = (t>t_treatment)[t_cutoff:]
+
+    print('pre_treat_mask', pre_treat_mask.shape)
+    print('post_treat_mask', post_treat_mask.shape)
+
     # We define X as the Factual trajectory BEFORE treatment, and X_ as the COUNTERfactual traj BEFORE treatment 
     X_static = X
     X = Y_fact[:,pre_treat_mask][:,:,pre_treatment_dims]
     X_ = Y_cf[:,pre_treat_mask][:,:,pre_treatment_dims]
+
+    print('X', X.shape)
 
     # We redfine Y_fact as the Factual trajectory AFTER treatment, and Y_cf as the COUNTERfactual traj AFTER treatment 
     # We are selecting the DIASTOLIC BP (output dim = 1) as the one to maintain.. this is because the fluid is only really affecting this within the time values
     full_fact_traj = Y_fact
     full_CF_traj = Y_cf
 
-    Y_fact = Y_fact[:,post_treat_mask][:,:,post_treatment_dims] 
+    print('full_fact_traj', full_fact_traj.shape)
+    print('full_CF_traj', full_CF_traj.shape)
+
+
+    Y_fact = Y_fact[:,post_treat_mask][:,:,post_treatment_dims]
     Y_cf = Y_cf[:,post_treat_mask][:,:,post_treatment_dims]
 
+    print('Y_fact', Y_fact.shape)
+    print('Y_cf',Y_cf.shape)
+
     # we split the time vector also as before and after treatment 
-    t_x = t[pre_treat_mask]
-    t_y = t[post_treat_mask]
+    t_new = np.arange(t_span - t_cutoff)
+    t_x = t_new[pre_treat_mask]
+    t_y = t_new[post_treat_mask]
+
+    print('t_x', t_x.shape)
+    print('t_y', t_y.shape)
     # and get it to match the dimensions, so it's not a vector t, but a matrix of dimensions N by before_tx and N by after_tx
     t_X = torch.Tensor(np.tile(t_x[None,:],(X.shape[0],1)))
     t_Y = torch.Tensor(np.tile(t_y[None,:],(Y_fact.shape[0],1))) - t_x[-1]
-    t_FULL = t_tensor.unsqueeze(0).repeat(X.shape[0], 1)
+    t_FULL = torch.tensor(t_new).unsqueeze(0).repeat(X.shape[0], 1)
     expert_ODE_size = X.shape[1] - 1 #need to remove the i_ext which is only for creating data not models
 
 
@@ -379,6 +399,7 @@ def create_load_save_data(dataset_params, data_path):
                                                                                                                                       non_confounded_effect = dataset_params['non_confounded_effect'], 
                                                                                                                                       t_span = dataset_params['t_span'], 
                                                                                                                                       t_treatment = dataset_params['t_treatment'], 
+                                                                                                                                      t_cutoff = dataset_params['t_cutoff'],
                                                                                                                                       seed = dataset_params['seed'], 
                                                                                                                                       post_treatment_dims = dataset_params['post_treatment_dims'], 
                                                                                                                                       pre_treatment_dims = dataset_params['pre_treatment_dims'], 
@@ -418,17 +439,16 @@ class CVDataset_loaded(Dataset):
 
 
 class CVDataModule_final(L.LightningDataModule):
-    def __init__(self, dataset_path, batch_size=32, num_workers =1):
+    def __init__(self, data, batch_size=32, num_workers =1):
         super().__init__()
-        self.dataset_path = dataset_path
+        self.data = data
         self.batch_size = batch_size
         self.dataset = None
         self.num_workers = num_workers
 
     def setup(self, stage=None):
         # Load the dataset
-        data = torch.load(self.dataset_path)
-        self.dataset = CVDataset_loaded(data)
+        self.dataset = CVDataset_loaded(self.data)
         
         train_idx = np.arange(len(self.dataset))[:int(0.5*len(self.dataset))]
         val_idx = np.arange(len(self.dataset))[int(0.5*len(self.dataset)):]

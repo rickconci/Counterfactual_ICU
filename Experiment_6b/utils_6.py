@@ -5,13 +5,19 @@ import numpy as np
 
 
 class MLPSimple(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim, depth, activations=None, dropout_p=None):
+    def __init__(self, input_dim, output_dim, hidden_dim, depth, activations=None, dropout_p=None, final_activation=None):
         super().__init__()
         print(f"Initializing MLPSimple: input_dim={input_dim}, output_dim={output_dim}, hidden_dim={hidden_dim}, depth={depth}")
         self.input_layer = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
-        self.output_dim = output_dim
-        
-        self.output_layer = nn.Sequential(nn.Linear(hidden_dim, output_dim))
+
+        # Define the output layer with an optional final activation
+        if final_activation is not None:
+            self.output_layer = nn.Sequential(
+                nn.Linear(hidden_dim, output_dim),
+                final_activation
+            )
+        else:
+            self.output_layer = nn.Sequential(nn.Linear(hidden_dim, output_dim))
         
         if activations is None:
             activations = [nn.ReLU() for _ in range(depth)]
@@ -27,17 +33,12 @@ class MLPSimple(nn.Module):
         ])
 
     def forward(self, x):
-        #print(f"Forward pass started with input shape: {x.shape}")
         x = self.input_layer(x)
-        #print(f"Post input layer shape: {x.shape}")
         
-        for i, mod in enumerate(self.layers):
-            x_old_shape = x.shape
-            x = mod(x)
-            #print(f"Layer {i+1}: input shape: {x_old_shape}, output shape: {x.shape}")
+        for layer in self.layers:
+            x = layer(x)
         
         x = self.output_layer(x)
-        #print(f"Post output layer shape: {x.shape}")
         return x
     
 
@@ -92,10 +93,10 @@ CV_params_max_min_2_5STD = {'max_pa': torch.tensor(136.97),
 
 
 CV_params_prior_mu = {
-    'pa': torch.tensor(106.0743),
-    'pv': torch.tensor(40.1797),
-    's': torch.tensor(0.1465),
-    'sv': torch.tensor(95.2293),
+    'pa': torch.tensor(89.2),
+    'pv': torch.tensor(50.3),
+    's': torch.tensor(0.037),
+    'sv': torch.tensor(88.6),
     "sv_mod": 0.001,
     "ca": 4.0,
     "cv": 111.0,
@@ -114,10 +115,10 @@ CV_params_prior_mu = {
 }
 
 CV_params_prior_sigma = {
-   'pa': torch.tensor(12.5639),
-   'pv': torch.tensor(9.2571),
-   's': torch.tensor(0.0367),
-   'sv': torch.tensor(2.4816)
+   'pa': torch.tensor(4.9),
+   'pv': torch.tensor(10.2),
+   's': torch.tensor(0.024),
+   'sv': torch.tensor(1.8)
 }
 
 
