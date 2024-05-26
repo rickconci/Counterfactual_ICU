@@ -119,9 +119,9 @@ def sigmoid_scale( z0, use_2_5std_encoder_minmax):
         return scaled_out
 
 class MLPSimple(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim, depth, activations=None, dropout_p=None, final_activation=None):
+    def __init__(self, input_dim, output_dim, hidden_dim, depth, activations=None, dropout_p=None, final_activation=None, use_batch_norm=False):
         super().__init__()
-        print(f"Initializing MLPSimple: input_dim={input_dim}, output_dim={output_dim}, hidden_dim={hidden_dim}, depth={depth}")
+        print(f"Initializing MLPSimple: input_dim={input_dim}, output_dim={output_dim}, hidden_dim={hidden_dim}, depth={depth}, use_batch_norm={use_batch_norm}")
         self.input_layer = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
 
         # Define the output layer with an optional final activation
@@ -133,28 +133,32 @@ class MLPSimple(nn.Module):
         else:
             self.output_layer = nn.Sequential(nn.Linear(hidden_dim, output_dim))
         
+        # Default activation function to ReLU if not specified
         if activations is None:
             activations = [nn.ReLU() for _ in range(depth)]
         
+        # Default dropout to 0 if not specified
         if dropout_p is None:
             dropout_p = [0. for _ in range(depth)]
         
         assert len(activations) == depth, "Mismatch between depth and number of provided activations."
         
-        self.layers = nn.ModuleList([
-            nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Dropout(dropout_p[i]), activations[i])
-            for i in range(depth)
-        ])
+        # Building layers with optional batch normalization
+        self.layers = nn.ModuleList()
+        for i in range(depth):
+            layer_components = [nn.Linear(hidden_dim, hidden_dim)]
+            if use_batch_norm:
+                layer_components.append(nn.BatchNorm1d(hidden_dim))
+            layer_components.append(nn.Dropout(dropout_p[i]))
+            layer_components.append(activations[i])
+            self.layers.append(nn.Sequential(*layer_components))
 
     def forward(self, x):
         x = self.input_layer(x)
-        
         for layer in self.layers:
             x = layer(x)
-        
         x = self.output_layer(x)
         return x
-    
 
 CV_params = {"r_tpr_mod": 0.,
             "f_hr_max": 3.0,

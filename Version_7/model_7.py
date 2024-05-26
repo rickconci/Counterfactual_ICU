@@ -62,7 +62,7 @@ class Hybrid_VAE_SDE(LightningModule):
                  SDE_input_state, include_time, 
                  theta, SDE_control_weighting, 
                 #SDE model params
-                num_samples, SDEnet_hidden_dim, SDEnet_depth, SDEnet_out_dims, final_activation,
+                num_samples, SDEnet_hidden_dim, SDEnet_depth, SDEnet_out_dims, final_activation, use_batch_norm,
                 #decoder params
                 decoder_output_dims, log_lik_output_scale, normalised_data, 
                 #loss
@@ -156,7 +156,8 @@ class Hybrid_VAE_SDE(LightningModule):
                                 hidden_dim = SDEnet_hidden_dim, 
                                 depth = SDEnet_depth, 
                                 activations = [nn.Tanh() for _ in range(SDEnet_depth)], 
-                                final_activation=final_activation_real)
+                                final_activation=final_activation_real, 
+                                use_batch_norm=use_batch_norm)
 
         # Initialization trick from Glow.
         #self.SDEnet[-2].weight.data.fill_(0.)
