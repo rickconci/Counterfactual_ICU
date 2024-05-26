@@ -2,20 +2,20 @@
 
 ACS MPhil thesis project
 
-- **Experiment_1** : Standard ODE with variational RNN with pytorch lightning. RNN takes in the whole trajectory, passess to ODE which creates latents, which are then passed to output function to match the trajectory.
+- **Version_1** : Standard ODE with variational RNN with pytorch lightning. RNN takes in the whole trajectory, passess to ODE which creates latents, which are then passed to output function to match the trajectory.
 
-- **Experiment_2** : neural ODE, with variational RNN (silenced by the KL_param), that takes in the non-treatment baseline trajectory, passes to an ODE which is itself modified by the controlled treatment_fun as it creates the latents forward in time, and then pointwise output function to recreate the post-treatment trajectory. Plotly on wandb. Uses pytorch lightning.
+- **Version_2** : neural ODE, with variational RNN (silenced by the KL_param), that takes in the non-treatment baseline trajectory, passes to an ODE which is itself modified by the controlled treatment_fun as it creates the latents forward in time, and then pointwise output function to recreate the post-treatment trajectory. Plotly on wandb. Uses pytorch lightning.
 
-- **Experiment_3**: Stochastic Differential equation, with a non-variational RNN, that takes in non-tx baseline traj, passes to SDE w treatment_fun exerting control. Multiple samples of the latents are created which are then brought back to observed by pointwise output_fun MLP. 3 separate plots with plotly, and uses Lightning instead of Pytorch-Lightning. Experiment_3 has it's OWN environment yaml to use.
+- **Version_3**: Stochastic Differential equation, with a non-variational RNN, that takes in non-tx baseline traj, passes to SDE w treatment_fun exerting control. Multiple samples of the latents are created which are then brought back to observed by pointwise output_fun MLP. 3 separate plots with plotly, and uses Lightning instead of Pytorch-Lightning. Experiment_3 has it's OWN environment yaml to use.
 
-- **Experiment_4**:
+- **Version_4**:
   - Generalising latent to be either expert only, hybrid SDE or SDE only
 
-- **Experiment_5**:
+- **Version_5**:
   - Fixing SDE bugs especially RNN encoder... still not quite right but runs much better
   - adjusted expert ODE with sigmoid rescaling - although better should be for truncated gaussian prior with linear rescaling!!
 
-- **Experiment_6**:
+- **Version_6**:
   - adjusting hybrid SDE!! so that when there is a control acting on the latents (hidden or not) the SDEs can identify it
     - OPTIONS:
       - Tx: we know the time & dose , YES  functional dependence YES the functional form:
@@ -34,6 +34,17 @@ ACS MPhil thesis project
 
   - control of observed data to be irregular based on hawkes process
   - clarify CV dataset creation to have various clinically relevant trajectories i.e. normal then infection then treatment then another treatment etc
+
+
+- **Version 6b**:
+  - considerable improvements on version 6. Version 6 doesn't in fact even have the model or dataset because it's converted to 6b. 
+
+
+- **Version_7**
+  - continuation of 6b. the decoder HybridSDE takes in all the params as input y rather than the 'fixed' CV params from the dictionary. Therefore can it can either have an encoder that feeds these in, or it is fed in the correct inputs.
+
+
+
 
 **Experiment ideas**
 

@@ -1,8 +1,8 @@
-Experiment_*/__pycache__/
-Experiment_*/lightning_logs/
-Experiment_*/model_checkpoints/
-Experiment_*/wandb/
-Experiment_*/data/
-Experiment_*/model_logs/
-Experiment_*/results/
-Experiment_*/Hybrid_SDE_output.txt
+Version_*/__pycache__/
+Version_*/lightning_logs/
+Version_*/model_checkpoints/
+Version_*/wandb/
+Version_*/data/
+Version_*/model_logs/
+Version_*/results/
+Version_*/Hybrid_SDE_output.txt
