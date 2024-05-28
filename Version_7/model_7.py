@@ -1,18 +1,4 @@
-# Copyright 2020 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-"""Latent SDE fit to a single time series with uncertainty quantification."""
 import argparse
 import logging
 import math
@@ -76,6 +62,7 @@ class Hybrid_VAE_SDE(LightningModule):
         self.sde_type = "ito"  # required
         self.sdeint_fn = torchsde.sdeint_adjoint if adjoint else torchsde.sdeint
 
+
         ### ADMIN
         self.train_dir = train_dir
         self.learning_rate = learning_rate
@@ -111,16 +98,14 @@ class Hybrid_VAE_SDE(LightningModule):
         self.prior_tx_sigma = prior_tx_sigma
         self.prior_tx_mu = prior_tx_mu
 
-        mu_values = torch.tensor(list(CV_params_prior_mu.values())).float()
-        mu_values = mu_values[:expert_latent_dims].view(1, -1)
-        self.register_buffer('mu', mu_values)
 
-        sigma_values = torch.tensor(list(CV_params_prior_sigma.values())).float()
-        sigma_values = sigma_values[:expert_latent_dims].view(1, -1)
-        self.register_buffer('sigma', sigma_values)
+        #sigma_values = torch.tensor(list(CV_params_prior_sigma.values())).float()
+        #sigma_values = sigma_values[:expert_latent_dims].view(1, -1)
+        #self.register_buffer('sigma', sigma_values.clone())
+        self.sigma = torch.tensor(self.prior_tx_sigma, dtype=torch.float32).to(self.device).unsqueeze(0)
 
 
-        self.register_buffer("theta", torch.tensor(theta).view(1, -1).expand(1, expert_latent_dims).float())
+        self.theta = torch.tensor(theta, dtype=torch.float).clone().view(1, -1).repeat(1, expert_latent_dims)
 
         ### LATENT MODEL  
 
@@ -132,7 +117,7 @@ class Hybrid_VAE_SDE(LightningModule):
         
         self.divisors = torch.tensor([CV_params_divisors[key] for key in ['pa', 'pv', 's', 'sv', 
             'r_tpr_mod', 'f_hr_max', 'f_hr_min', 
-            'r_tpr_max', 'r_tpr_min', 'sv_mod', 
+            'r_tpr_max', 'r_tpr_min', 
             'ca', 'cv', 'k_width', 'p_aset', 'tau']], dtype=torch.float32)
         
        
@@ -272,15 +257,14 @@ class Hybrid_VAE_SDE(LightningModule):
         f_hr_min = y[:, 7].unsqueeze(1)
         r_tpr_max = y[:, 8].unsqueeze(1)
         r_tpr_min= y[:, 9].unsqueeze(1)
-        sv_mod = y[:, 10].unsqueeze(1)
-        ca = y[:, 11].unsqueeze(1)
-        cv = y[:, 12].unsqueeze(1)
-        k_width = y[:, 13].unsqueeze(1)
-        p_aset = y[:, 14].unsqueeze(1)
-        tau = y[:, 15].unsqueeze(1)
+        ca = y[:, 10].unsqueeze(1)
+        cv = y[:, 11].unsqueeze(1)
+        k_width = y[:, 12].unsqueeze(1)
+        p_aset = y[:, 13].unsqueeze(1)
+        tau = y[:, 14].unsqueeze(1)
 
         #print('fixed params 1', f_hr_min[0].item(), f_hr_max[0].item(), r_tpr_max[0].item(), r_tpr_min[0].item(), r_tpr_mod[0].item())
-        #print('fixed params 2', ca[0].item(), cv[0].item(), tau[0].item(), k_width[0].item(), p_aset[0].item(), sv_mod[0].item())
+        #print('fixed params 2', ca[0].item(), cv[0].item(), tau[0].item(), k_width[0].item(), p_aset[0].item(), )
             
 
         #print('TIME, i_ext, p_a pv, s, sv', t.item(), i_ext[0].item(), p_a[0].item(), p_v[0].item(), s_reflex[0].item(), sv[0].item())   
@@ -310,7 +294,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
     
         f_hr = s_reflex * (f_hr_max - f_hr_min) + f_hr_min 
-        r_tpr = s_reflex * (r_tpr_mod*r_tpr_max - r_tpr_mod*r_tpr_min) + r_tpr_mod*r_tpr_min 
+        r_tpr = s_reflex * (r_tpr_max - r_tpr_min) + r_tpr_min + r_tpr_mod
         
         # Calculate changes in volumes and pressures
         dva_dt = -1. * (p_a - p_v) / (r_tpr + 1e-7)  + sv * f_hr
@@ -329,7 +313,7 @@ class Hybrid_VAE_SDE(LightningModule):
                                   #(1. - 1. / (1 + torch.exp(-k_width * (p_a - p_aset))) - s)
         #self.sigmoid(k_width * (p_a - p_aset)) - s_reflex)
         
-        dsv_dt = i_ext_SDE #* sv_mod
+        dsv_dt = i_ext_SDE 
         ##print('dsv_dt post iext', dsv_dt[:4, 0])
 
         ##print('dpa_dt, dpv_dt, ds_dt, dsv_dt', dpa_dt.shape, dpv_dt.shape, ds_dt.shape, dsv_dt.shape)
@@ -338,13 +322,12 @@ class Hybrid_VAE_SDE(LightningModule):
         dt_f_hr_min = torch.zeros([batch_size, 1])
         dt_r_tpr_max = torch.zeros([batch_size, 1])
         dt_r_tpr_min = torch.zeros([batch_size, 1])
-        dt_sv_mod = torch.zeros([batch_size, 1])
         dt_ca = torch.zeros([batch_size, 1])
         dt_cv = torch.zeros([batch_size, 1])
         dt_k_width = torch.zeros([batch_size, 1])
         dt_p_aset = torch.zeros([batch_size, 1])
         dt_tau = torch.zeros([batch_size, 1])
-        underlying_params = torch.cat([dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min, dt_r_tpr_max, dt_r_tpr_min, dt_sv_mod, dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau ], dim=-1).to(self.device)
+        underlying_params = torch.cat([dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min, dt_r_tpr_max, dt_r_tpr_min, dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau ], dim=-1).to(self.device)
         diff_results = torch.cat([dt_i_ext_SDE, dpa_dt, dpv_dt, ds_dt, dsv_dt, ], dim=-1)
         final_f_out = torch.cat([diff_results, underlying_params], dim=-1)
         
@@ -363,14 +346,14 @@ class Hybrid_VAE_SDE(LightningModule):
         return diext_dt.unsqueeze(1)
 
     def h(self, t, y):  # Prior drift.
-        mu = self.prior_diext_dt(t)
-        expanded_mu = mu.expand(y.size(0), 1)
+        self.mu = self.prior_diext_dt(t)
+        expanded_mu = self.mu.repeat(y.size(0), 1)
         ##print('theta h', self.theta.shape, self.theta[0,:])
         ##print('mu h', expanded_mu[0,:])
         ##print('y in h', y.shape, y[0,:])
         ##print('mu -y ', expanded_mu[0,:] - y[0,:])
 
-        return self.theta * (expanded_mu - y)
+        return self.theta.to(self.device) * (expanded_mu - y)
 
     def f_aug(self, t, y):  # Drift for augmented dynamics with logqp term.
         i_ext = y[:, 0].unsqueeze(1)
@@ -407,8 +390,7 @@ class Hybrid_VAE_SDE(LightningModule):
     
     def g(self, t, y):  
         #sigma is different for each values here! 
-        sigma = torch.tensor(self.prior_tx_sigma, dtype=torch.float32).to(self.device).unsqueeze(0)
-        expanded_sigma = sigma.expand(y.size(0), 1)
+        expanded_sigma = self.sigma.repeat(y.size(0), 1).to(self.device)
         #print('sigma g', expanded_sigma.shape, expanded_sigma[0] )
         return expanded_sigma
 
@@ -431,8 +413,8 @@ class Hybrid_VAE_SDE(LightningModule):
     def forward_latent(self, init_latents, ts, Tx, time_to_tx):
         #inputs of shape [batch x num_samples x dim ]
         batch_size = init_latents.shape[0]
-        Tx_expanded = Tx.unsqueeze(1).unsqueeze(2).expand(-1, self.num_samples, -1).to(init_latents)
-        time_to_tx = time_to_tx.unsqueeze(1).unsqueeze(2).expand(batch_size, self.num_samples, -1).to(init_latents)
+        Tx_expanded = Tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
+        time_to_tx = time_to_tx.unsqueeze(1).unsqueeze(2).repeat(batch_size, self.num_samples, 1).to(init_latents)
         i_ext = torch.zeros(batch_size,self.num_samples, 1).to(init_latents)
         log_path = torch.zeros(batch_size,self.num_samples, 1).to(init_latents)
         #print('ts',ts.shape)
@@ -486,13 +468,13 @@ class Hybrid_VAE_SDE(LightningModule):
             #print('latent_out', latent_out[0, 1, :, 0])
             #print('latent_out', latent_out[1, 0, :, 0])
             #print('latent_out', latent_out[1, 1, :, 0])
-        
+            #print('latent device', latent_out.device)
             if self.normalised_data:
                 latent_out = self.normalise_expert_data(latent_out)
             
             else:
-                #now we just need to rescale down instead to renormalise 
-                latent_out = latent_out/self.divisors.view(1, 1, 1, self.expert_latent_dims).to(self.device)
+                divisors = self.divisors.view(1, 1, 1, self.expert_latent_dims).to(latent_out.device)
+                latent_out = latent_out / divisors
 
             output_traj = select_tensor_by_index_list_advanced(latent_out, self.decoder_output_dims)
             #print('output_traj', output_traj.shape, output_traj[0, 0, :, :])
@@ -824,6 +806,23 @@ class Hybrid_VAE_SDE(LightningModule):
         
         scheduler = {"monitor": "train_total_loss", "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, mode = "min", factor = 0.5, patience = 50)}
         return {"optimizer": optimizer, "lr_scheduler":scheduler}
+    
+    def on_save_checkpoint(self, checkpoint):
+        print('SAVING CHECKPOINT')
+        # Manually add mu, sigma, theta to the checkpoint dictionary
+        checkpoint['mu'] = self.mu
+        checkpoint['sigma'] = self.sigma
+        checkpoint['theta'] = self.theta
+
+    def on_load_checkpoint(self, checkpoint):
+        print('LOADING CHECKPOINT')
+        # Load mu, sigma, theta from the checkpoint dictionary if they exist
+        if 'mu' in checkpoint:
+            self.mu = checkpoint['mu']
+        if 'sigma' in checkpoint:
+            self.sigma = checkpoint['sigma']
+        if 'theta' in checkpoint:
+            self.theta = checkpoint['theta']
 
 
     def plot_mse_evolution(self, chart_type):

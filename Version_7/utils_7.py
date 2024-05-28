@@ -19,7 +19,7 @@ def select_tensor_by_index_list_advanced(tensor, index_list):
     indices = torch.tensor(index_list, dtype=torch.long).to(device)
     
     # Select along the last dimension using torch.index_select
-    selected_tensor = torch.index_select(tensor, -1, indices)
+    selected_tensor = torch.index_select(tensor, -1, indices).to(tensor)
     
     return selected_tensor
     
@@ -51,7 +51,7 @@ def normalize_latent_output(latent_out):
         keys = [
             'pa', 'pv', 's', 'sv', 
             'r_tpr_mod', 'f_hr_max', 'f_hr_min', 
-            'r_tpr_max', 'r_tpr_min', 'sv_mod', 
+            'r_tpr_max', 'r_tpr_min', 
             'ca', 'cv', 'k_width', 'p_aset', 'tau'
         ]
         for i, key in enumerate(keys):
@@ -70,7 +70,7 @@ def normalise_expert_data( y):
         keys = [
             'pa', 'pv', 's', 'sv', 
             'r_tpr_mod', 'f_hr_max', 'f_hr_min', 
-            'r_tpr_max', 'r_tpr_min', 'sv_mod', 
+            'r_tpr_max', 'r_tpr_min', 
             'ca', 'cv', 'k_width', 'p_aset', 'tau'
         ]
         normalized_tensors = []
@@ -165,7 +165,6 @@ CV_params = {"r_tpr_mod": 0.,
             "f_hr_min": 2.0 / 3.0,
             "r_tpr_max": 2.134,
             "r_tpr_min": 0.5335,
-            "sv_mod": 0.001,
             "ca": 4.0,
             "cv": 111.0,
 
@@ -185,7 +184,6 @@ CV_params_divisors = {
     "f_hr_min": 1,
     "r_tpr_max": 10,
     "r_tpr_min": 1,
-    "sv_mod": 1,
     "ca": 10,
     "cv": 100,
     "k_width": 1,
@@ -222,12 +220,11 @@ CV_params_prior_mu = {
     'pv': torch.tensor(50.3),
     's': torch.tensor(0.037),
     'sv': torch.tensor(88.6),
-    'r_tpr_mod': torch.tensor(1.0),
+    'r_tpr_mod': torch.tensor(0.0),
     "f_hr_max": torch.tensor(3.0),
     "f_hr_min": torch.tensor(2.0 / 3.0),
     "r_tpr_max": torch.tensor(2.134),
     "r_tpr_min": torch.tensor(0.5335),
-    "sv_mod": torch.tensor(0.001),
     "ca": torch.tensor(4.0),
     "cv": torch.tensor(111.0),
     "k_width": torch.tensor(0.1838),
@@ -245,7 +242,6 @@ CV_params_prior_sigma = {
     "f_hr_min": torch.tensor((2.0 / 3.0) / 20),
     "r_tpr_max": torch.tensor(2.134 / 20),
     "r_tpr_min": torch.tensor(0.5335 / 20),
-    "sv_mod": torch.tensor(0.001 / 20),
     "ca": torch.tensor(4.0 / 20),
     "cv": torch.tensor(111.0 / 20),
     "k_width": torch.tensor(0.1838 / 20),

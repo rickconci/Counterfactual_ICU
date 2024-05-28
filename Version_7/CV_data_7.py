@@ -113,7 +113,7 @@ class PhysiologicalSDE_batched(torchsde.SDEIto):
         #print('time, i_ext pre, A_, i_ext_post, pv, sv', t.item(),i_ext[0].item(), A_[0], i_ext_tx_effect[0].item(), p_v[0].item(), sv[0].item())   
 
         f_hr = s * (self.params["f_hr_max"] - self.params["f_hr_min"]) + self.params["f_hr_min"]
-        r_tpr = s * (self.params["r_tpr_max"]*self.params["r_tpr_mod"] - self.params["r_tpr_min"]*self.params["r_tpr_mod"]) + self.params["r_tpr_min"]*self.params["r_tpr_mod"]
+        r_tpr = s * (self.params["r_tpr_max"] - self.params["r_tpr_min"]) + self.params["r_tpr_min"] + self.params["r_tpr_mod"]
 
         dva_dt = -1. * (p_a - p_v) / r_tpr + sv * f_hr
         dvv_dt = -1. * dva_dt + i_ext_tx_effect
@@ -202,7 +202,6 @@ def create_cv_data(include_all_inputs, N,gamma,noise_std, sigma_tx, r_tpr_mod, c
             "f_hr_min": 2.0 / 3.0,
             "r_tpr_max": 2.134,
             "r_tpr_min": 0.5335,
-            "sv_mod": 0.001,  ## this is also added on from the original model to simulate effect of fluid directly on the stroke volume
             "ca": 4.0,
             "cv": 111.0,
 
@@ -213,20 +212,6 @@ def create_cv_data(include_all_inputs, N,gamma,noise_std, sigma_tx, r_tpr_mod, c
             "t_treatment" : t_treatment,
             }
     
-    output_params = {"r_tpr_mod": r_tpr_mod, #the mod is in case we want to simulate decreasing the total peripheral resistance i.e. shock
-            "f_hr_max": 3.0,
-            "f_hr_min": 2.0 / 3.0,
-            "r_tpr_max": 2.134,
-            "r_tpr_min": 0.5335,
-            "sv_mod": 0.001,  ## this is also added on from the original model to simulate effect of fluid directly on the stroke volume
-            "ca": 4.0,
-            "cv": 111.0,
-
-            # dS/dt parameters
-            "k_width": 0.1838,
-            "p_aset": 70,
-            "tau": 20
-            }
     
     params_treatment = params.copy()
     params_treatment["treatment"]=True
@@ -484,30 +469,37 @@ class CVDataset_loaded(Dataset):
 
 
 
-class CVDataModule_final(L.LightningDataModule):
-    def __init__(self, train_val_data, OOD_test_data,  batch_size=32, num_workers =1):
+class CVDataModule_IID(L.LightningDataModule):
+    def __init__(self, train_val_data,  batch_size=32, num_workers =1):
         super().__init__()
         self.train_val_data = train_val_data
-        self.OOD_test_data = OOD_test_data
         self.batch_size = batch_size
         self.dataset = None
         self.num_workers = num_workers
         self.encoder_input_dim = train_val_data['X'].shape[-1]
         self.expert_latent_dim = train_val_data['full_fact_traj'].shape[-1]
 
-    def setup(self, stage=None):
+    def setup(self):
         # Load the dataset
         self.dataset_train_val = CVDataset_loaded(self.train_val_data)
-        self.dataset_OOD_test_data = CVDataset_loaded(self.OOD_test_data)
-        
         dataset_size = len(self.dataset_train_val)
-        train_size = int(0.8 * dataset_size)  
-        train_idx = np.arange(train_size)  
-        val_idx = np.arange(train_size, dataset_size) 
+
+        train_ratio = 0.7
+        val_ratio = 0.15
+        test_ratio = 0.15
+        # Calculate the number of examples for each set
+        train_size = int(train_ratio * dataset_size)
+        val_size = int(val_ratio * dataset_size)
+
+        # Indices for training, validation, and testing
+        train_idx = np.arange(0, train_size)
+        val_idx = np.arange(train_size, train_size + val_size)
+        test_idx = np.arange(train_size + val_size, dataset_size)
 
         # Create subsets
         self.train = Subset(self.dataset_train_val, train_idx)
         self.val = Subset(self.dataset_train_val, val_idx)
+        self.in_dist_test = Subset(self.dataset_train_val, test_idx)
 
 
     def train_dataloader(self):
@@ -534,12 +526,39 @@ class CVDataModule_final(L.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(
-            self.dataset_OOD_test_data,
+            self.in_dist_test,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            drop_last=False,
+            drop_last=True,
             pin_memory=True
             )
     
+
+
+class CVDataModule_OOD(L.LightningDataModule):
+    def __init__(self, OOD_test_data,  batch_size=32, num_workers =1):
+        super().__init__()
+        self.OOD_test_data = OOD_test_data
+        self.batch_size = batch_size
+        self.dataset = None
+        self.num_workers = num_workers
+        self.encoder_input_dim = OOD_test_data['X'].shape[-1]
+        self.expert_latent_dim = OOD_test_data['full_fact_traj'].shape[-1]
+
+    def setup(self):
+        self.OOD_test_dataset = CVDataset_loaded(self.OOD_test_data)
+
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.OOD_test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            drop_last=True,
+            pin_memory=True
+            )
+    
+
 

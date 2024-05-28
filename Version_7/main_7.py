@@ -5,6 +5,8 @@ import random
 import argparse
 import wandb
 import sys
+import tempfile
+
 
 import lightning as L
 from lightning.pytorch import Trainer, seed_everything
@@ -14,7 +16,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
 
 #from CV_data_6_new import create_load_save_data, CVDataModule_final
-from CV_data_7 import create_load_save_data, CVDataModule_final
+from CV_data_7 import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
 
 from model_7 import Hybrid_VAE_SDE
 from utils_7 import process_input
@@ -41,6 +43,12 @@ def main(args):
         torch.set_float32_matmul_precision('medium')  # Faster computations with less precision
         
     saving_dir = os.getcwd()
+    os.environ['TMPDIR'] = os.path.join(os.getcwd(), 'Tempdir')
+    os.makedirs(os.environ['TMPDIR'], exist_ok=True)
+    print("Temporary directory set to:", tempfile.gettempdir())
+    os.environ['WANDB_DIR'] = os.path.join(os.getcwd(), 'Wandbdir')
+    os.makedirs(os.environ['WANDB_DIR'], exist_ok=True)
+    print("Setting WANDB_DIR to:", os.environ['WANDB_DIR'])
 
     set_seed(args.seed)
 
@@ -70,26 +78,38 @@ def main(args):
         'N': 1000
     }
 
+    filename_parts = [
+        f"sd={args.seed}",
+        f"gm={args.gamma}",
+        f"cnf={args.confounder_type}",
+        f"enc={args.use_encoder}",
+        f"txsig={args.prior_tx_sigma}",
+        f"revert={args.self_reverting_prior_control}",
+        f"klw={args.KL_weighting_SDE}",
+        f"SDEhd={args.SDEnet_hidden_dim}"
+    ]
+    unique_dir_name = "_".join(filename_parts)
 
     print('dataset_params',dataset_params)
     data_path = os.path.join(saving_dir, 'data_created')
 
-    dataset_params['r_tpr_mod'] = 1.0
+    dataset_params['r_tpr_mod'] = 0.0
     train_val_data = create_load_save_data(dataset_params, data_path)
-    dataset_params['r_tpr_mod'] = 0.8 
+    dataset_params['r_tpr_mod'] = -0.5 
     test_data = create_load_save_data(dataset_params, data_path)
     
-    cv_data_module = CVDataModule_final(train_val_data = train_val_data, OOD_test_data = test_data, batch_size=args.batch_size, num_workers = 4)
-    
+    cv_data_module_IID = CVDataModule_IID(train_val_data = train_val_data, batch_size=args.batch_size, num_workers = 4)
+    cv_data_module_OOD = CVDataModule_OOD(OOD_test_data = test_data, batch_size=128, num_workers = 4)
+
 
     model = Hybrid_VAE_SDE(use_encoder = args.use_encoder,
                            start_dec_at_treatment = args.start_dec_at_treatment, 
                            variational_sampling = args.variational_sampling,
 
                            #Encoder
-                           encoder_input_dim =  cv_data_module.encoder_input_dim, 
+                           encoder_input_dim =  cv_data_module_IID.encoder_input_dim, 
                            encoder_hidden_dim = args.encoder_hidden_dim,
-                           expert_latent_dims  = cv_data_module.expert_latent_dim ,
+                           expert_latent_dims  = cv_data_module_IID.expert_latent_dim ,
                            encoder_SDENN_dims = 0 if args.use_encoder == 'none' else args.encoder_SDENN_dims,
 
                            use_2_5std_encoder_minmax = args.use_2_5std_encoder_minmax,
@@ -122,7 +142,7 @@ def main(args):
                            log_lik_output_scale = args.output_scale,
 
                            #admin
-                           train_dir = os.path.join(saving_dir, 'figures'), 
+                           train_dir = os.path.join(saving_dir, 'figures', unique_dir_name), 
                            KL_weighting_SDE = args.KL_weighting_SDE, 
                            learning_rate = args.learning_rate,
                            log_wandb = args.log_wandb,
@@ -135,34 +155,15 @@ def main(args):
 
     callbacks = []
 
-    filename_parts = [
-        f"sd={args.seed}",
-        f"gm={args.gamma}",
-        f"cnf={args.confounder_type}",
-        f"enc={args.use_encoder}",
-        f"encSTD25={args.use_2_5std_encoder_minmax}",
-        f"encSDEd={args.encoder_SDENN_dims}",
-        f"nrmSDE={args.normalise_for_SDENN}",
-        f"itm={args.include_time}",
-        f"txsig={args.prior_tx_sigma}",
-        f"revert={args.self_reverting_prior_control}",
-        f"tht={args.theta}",
-        f"txmu={args.prior_tx_mu}",
-        f"txcw={args.SDE_control_weighting}",
-        f"klw={args.KL_weighting_SDE}"
-    ]
-
-    # Include epoch and validation loss placeholders at the start
-    filename_checkpoint = "best-{epoch:02d}-{val_loss:.2f}-" + "-".join(filename_parts) + ".ckpt"
 
     if args.model_checkpoint:
         checkpoint_callback = ModelCheckpoint(
             monitor='val_total_loss',        # Ensure this is the exact name used in your logging
-            dirpath= os.path.join(saving_dir, 'model_checkpoints'),  # Directory to save checkpoints
-            filename=filename_checkpoint,
+            dirpath= os.path.join(saving_dir, 'model_checkpoints', unique_dir_name),  # Directory to save checkpoints
+            filename=f'best-{{epoch:02d}}-{{val_loss:.2f}}-{unique_dir_name}',
             save_top_k=1,
             mode='min',                     # Minimize the monitored value
-            save_last=False,                # Save the last model to resume training
+            save_last=True,                # Save the last model to resume training
             verbose = True
         )
         callbacks.append(checkpoint_callback)
@@ -189,10 +190,11 @@ def main(args):
         #check_val_every_n_epoch=1,  
         #profiler="simple"   #this helps to identify bottlenecks 
     )
-    trainer.fit(model, cv_data_module)
+    trainer.fit(model, cv_data_module_IID)
     
-    #trainer.test(ckpt_path='best', dataloaders = cv_data_module.test_dataloader())
-    #test_results = trainer.test(ckpt_path='best', dataloaders = cv_data_module.test_dataloader())
+    #test_results_IID = trainer.test(ckpt_path='last', dataloaders = cv_data_module_IID.test_dataloader())
+    #test_results_OOD = trainer.test(ckpt_path='last', dataloaders = cv_data_module_OOD.test_dataloader())
+
 
 if __name__ == '__main__':
     #sys.stdout = open('Hybrid_SDE_output', 'w')
