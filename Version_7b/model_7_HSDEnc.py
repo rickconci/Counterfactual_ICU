@@ -3,10 +3,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import plotly.subplots as sp
 import numpy as np
 
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import torch
 from torch import distributions, nn, optim
@@ -51,8 +51,8 @@ class Hybrid_VAE_SDE_Encoder(LightningModule):
         mu_dict = CV_params_prior_mu.copy()
         sigma_dict = CV_params_prior_sigma.copy()
         keys_order = ['pa', 'pv', 's', 'sv', 'r_tpr_mod', 'f_hr_max', 'f_hr_min','r_tpr_max', 'r_tpr_min', 'ca', 'cv', 'k_width', 'p_aset', 'tau']
-        mu_tensor = torch.tensor([mu_dict[key].item() for key in keys_order]).float().view(1, -1)
-        sigma_tensor = torch.tensor([sigma_dict[key] for key in keys_order]).float().view(1, -1)
+        mu_tensor = torch.tensor([mu_dict[key].item() for key in keys_order]).float()
+        sigma_tensor = torch.tensor([sigma_dict[key] for key in keys_order]).float()
         logvar_tensor = 2 * torch.log(sigma_tensor)
         
         self.qy0_mean = nn.Parameter(mu_tensor, requires_grad=True)
@@ -129,28 +129,31 @@ class Hybrid_VAE_SDE_Encoder(LightningModule):
             true_input = input_vals
 
         if MAP == False:
-            eps = torch.randn(batch_size, self.qy0_mean.shape[1]).to(self.device)
+            eps = torch.randn(batch_size, self.qy0_mean.shape[0]).to(self.device)
             y0 = self.qy0_mean.to(self.device) + eps * self.qy0_std.to(self.device)
         else:
-            y0 = self.qy0_mean.to(self.device).repeat(batch_size, 1)
+            y0 = self.qy0_mean.unsqueeze(0).repeat(batch_size, 1).to(self.device)
         print('y0 sampled', y0.shape, y0[0, :])
 
         z1 = torch.cat((true_input[:, :2], y0[:, 2:]), dim=1)
         print('z1 variational', z1.shape)
 
+        print('self.qy0_mean', self.qy0_mean.shape)
+        
         mean_q = self.qy0_mean.to(self.device)
         std_q = torch.clamp(self.qy0_std.to(self.device), min=1e-6)
         mean_p = self.py0_mean.to(self.device)
         std_p = torch.clamp(self.py0_std.to(self.device), min=1e-6)
-        qy0 = distributions.Normal(loc=mean_q, scale=std_q)
-        py0 = distributions.Normal(loc=mean_p, scale=std_p)
-        logqp0 = distributions.kl_divergence(qy0, py0).sum(dim=1)
-
+        kl_div = torch.log(std_p / std_q) + (std_q ** 2 + (mean_q - mean_p) ** 2) / (2 * std_p ** 2) - 0.5
+        logqp0 = kl_div.sum()
+        
+        print('mean_q, std_q,mean_p , std_p',mean_q.shape, std_q.shape,mean_p.shape, std_p.shape )
+        print('logqp0', logqp0.item())
+       
         z1 = z1.unsqueeze(1).repeat(1, self.num_samples, 1)
-        print('qy0,py0, logqp0 ',qy0, py0, logqp0 )
         print('z1 variational', z1.shape)
 
-        return  z1, logqp0, qy0, py0
+        return  z1, logqp0
 
 
     
@@ -390,7 +393,9 @@ class Hybrid_VAE_SDE_Encoder(LightningModule):
         
         loss = -logpy.mean() + self.KL_weighting_SDE* (logqp.mean() * self.kl_scheduler.val) + L1_loss
         loss = loss.squeeze() 
-        #print("TOTAL LOSS ", loss)
+        print("TOTAL LOSS ", loss)
+        print('loss device', loss.device)
+
 
         return loss, -logpy.mean(), logqp.mean(), L1_loss
 
@@ -402,7 +407,7 @@ class Hybrid_VAE_SDE_Encoder(LightningModule):
         z0 = self.sigmoid_scale(X[:, 0, :2]) if self.normalised_data else scale_unnormalised_experts(X[:, 0, :])
         print('z0',z0.shape, z0[0, :])
         print(torch.isnan(z0).any(), torch.isinf(z0).any())
-        z1_input, logqp0, qy0, py0 =   self.forward_enc(z0[:, :2], time_pre)
+        z1_input, logqp0 =   self.forward_enc(z0[:, :2], time_pre)
         print('z1_input', z1_input.shape, z1_input[0, 0, :])
 
         latent_traj, logqp_path, path_control = self.forward_latent(init_latents = z1_input, 
@@ -433,7 +438,7 @@ class Hybrid_VAE_SDE_Encoder(LightningModule):
         print('z0',z0.shape, z0[0, :])
         print(torch.isnan(z0).any(), torch.isinf(z0).any())
 
-        z1_input, logqp0, qy0, py0 =   self.forward_enc(z0[:, :2], time_pre, MAP=True)
+        z1_input, logqp0  =   self.forward_enc(z0[:, :2], time_pre, MAP=True)
         print('z1_input', z1_input.shape, z1_input[0, 0, :])
 
         latent_traj, logqp_path, path_control = self.forward_latent(init_latents = z1_input, 
@@ -445,9 +450,9 @@ class Hybrid_VAE_SDE_Encoder(LightningModule):
                                                              logqp=  logqp0 + logqp_path)
 
         if self.global_step % self.plot_every == 0:
-           self.visualize_distributions(qy0, py0)
+           self.visualize_distributions()
            self.plot_trajectories(predicted_traj, X[:, :, :4])
-
+           pass
 
         self.log('val_total_loss', loss,   on_epoch=True, prog_bar=True, logger=True)
         self.log('val_fact_loss', fact_loss, on_epoch=True, prog_bar=True, logger=True)
@@ -464,7 +469,7 @@ class Hybrid_VAE_SDE_Encoder(LightningModule):
        
         z0 = self.sigmoid_scale(X[:, 0, :2]) if self.normalised_data else scale_unnormalised_experts(X[:, 0, :])
         print('z0',z0.shape, z0[0, :])
-        z1_input, logqp0, qy0, py0 =   self.forward_enc(z0[:, :2], time_pre, MAP=True)
+        z1_input, logqp0  =   self.forward_enc(z0[:, :2], time_pre, MAP=True)
         print('z1_input', z1_input.shape, z1_input[0, 0, :])
 
         latent_traj, logqp_path, path_control = self.forward_latent(init_latents = z1_input, 
@@ -475,8 +480,10 @@ class Hybrid_VAE_SDE_Encoder(LightningModule):
                                                              true_traj = X[:, :, :2], 
                                                              logqp=  logqp0 + logqp_path)
         if batch_idx == 0:
-            self.visualize_distributions(qy0, py0)
+            self.visualize_distributions()
             self.plot_trajectories(predicted_traj, X[:, :, :4])
+            pass
+
 
         self.log('test_total_loss', loss,   on_epoch=True, prog_bar=True, logger=True)
         self.log('test_fact_loss', fact_loss, on_epoch=True, prog_bar=True, logger=True)
@@ -515,100 +522,121 @@ class Hybrid_VAE_SDE_Encoder(LightningModule):
         if 'py0_logvar' in checkpoint:
             self.py0_logvar = checkpoint['py0_logvar']
 
-    def visualize_distributions(self, qy0, py0, num_samples=1000):
+    def visualize_distributions(self, num_samples=10000):
+        print('train_dir', self.train_dir)
         if not os.path.exists(self.train_dir):
             os.makedirs(self.train_dir)
-        # Generate samples from both distributions
+        
         with torch.no_grad():
-            qy0_samples = qy0.sample((num_samples,))
-            py0_samples = py0.sample((num_samples,))
+            # Access mean and std for qy0 and py0, convert to numpy
+            mean_q = self.qy0_mean.cpu().detach().numpy()
+            std_q = torch.clamp(self.qy0_std, min=1e-6).cpu().detach().numpy()
+            mean_p = self.py0_mean.cpu().detach().numpy()
+            std_p = torch.clamp(self.py0_std, min=1e-6).cpu().detach().numpy()
+        
+        # Generate samples from normal distributions using mean and std in numpy
+        qy0_samples = np.random.normal(mean_q, std_q, size=(num_samples, mean_q.shape[0]))
+        py0_samples = np.random.normal(mean_p, std_p, size=(num_samples, mean_p.shape[0]))
+        
+        # Assume dimensions from the shape of samples
+        num_dims = qy0_samples.shape[1]
+        dim_titles_ordered = ['pa', 'pv', 's', 'sv', 'r_tpr_mod', 'f_hr_max', 'f_hr_min','r_tpr_max', 'r_tpr_min', 'ca', 'cv', 'k_width', 'p_aset', 'tau']
+
+
+        # Create subplots for each dimension
+        fig = sp.make_subplots(rows=num_dims, cols=1, subplot_titles=[f'Distribution of {dim_titles_ordered[i]}' for i in range(num_dims)])
+        
+        for i in range(num_dims):
+            # Create histograms for qy0 and py0 samples for each dimension
+            qy0_hist = np.histogram(qy0_samples[:, i], bins=50, density=True)
+            py0_hist = np.histogram(py0_samples[:, i], bins=50, density=True)
             
-            # Convert to numpy for plotting
-            qy0_samples = qy0_samples.cpu().detach().numpy()
-            py0_samples = py0_samples.cpu().detach().numpy()
-
-            # Assume dimensions from the shape of samples
-            num_dims = qy0_samples.shape[1]
-
-            # Plotting using matplotlib and seaborn
-            fig, axes = plt.subplots(nrows=num_dims, figsize=(10, num_dims * 5))
-            if num_dims == 1:
-                axes = [axes]  # Make it iterable
+            qy0_hist_x = (qy0_hist[1][1:] + qy0_hist[1][:-1]) / 2  # Bin centers
+            py0_hist_x = (py0_hist[1][1:] + py0_hist[1][:-1]) / 2  # Bin centers
             
-            for i, ax in enumerate(axes):
-                sns.histplot(qy0_samples[:, i], kde=True, stat="density", color="blue", label="qy0 (Posterior)", ax=ax)
-                sns.histplot(py0_samples[:, i], kde=True, stat="density", color="red", alpha=0.6, label="py0 (Prior)", ax=ax)
-                ax.set_title(f'Distribution of Dimension {i+1}')
-                ax.legend()
+            # Add histogram bars to the figure
+            fig.add_trace(go.Bar(x=qy0_hist_x, y=qy0_hist[0], marker_color='rgba(255, 182, 193, 0.4)', opacity=0.75, name='qy0 (Posterior)', showlegend=(i == 0)), row=i+1, col=1)
+            fig.add_trace(go.Bar(x=py0_hist_x, y=py0_hist[0], marker_color='rgba(255, 105, 180, 0.4)', opacity=0.75, name='py0 (Prior)', showlegend=(i == 0)), row=i+1, col=1)
+            
+            # Add line plots to represent the distribution
+            fig.add_trace(go.Scatter(x=qy0_hist_x, y=qy0_hist[0], mode='lines', line=dict(color='rgba(255, 182, 193, 1)'), name='qy0 (Posterior)', showlegend=False), row=i+1, col=1)
+            fig.add_trace(go.Scatter(x=py0_hist_x, y=py0_hist[0], mode='lines', line=dict(color='rgba(0, 255, 255, 1)'), name='py0 (Prior)', showlegend=False), row=i+1, col=1)
 
-            plt.tight_layout()
+        # Update layout for better spacing
+        fig.update_layout(height=300*num_dims, width=800, title_text="Distribution Comparison", showlegend=True)
+        
+        # Save the plot as an HTML file
+        plot_path = os.path.join(self.train_dir, f'distribution_comparison_{self.global_step}.png')
+        fig.write_image(plot_path, engine="kaleido")
 
-            # Save the plot
-            plot_path = os.path.join(self.train_dir, 'distribution_comparison.png')
-            plt.savefig(plot_path)
-            plt.close(fig)
+        # Log to wandb if required
+        if self.log_wandb:
+            wandb.log({"Distribution Comparison", fig})
+        fig.data = []
 
-            # Log to wandb if required
-            if self.log_wandb:
-                wandb.log({"Distribution Comparison": wandb.Image(plot_path)})
 
     def plot_trajectories(self, predicted_traj, true_traj, k=3):
-        if not os.path.exists(self.train_dir):
-            os.makedirs(self.train_dir)
-        with torch.no_grad():
-            idx = np.random.choice(predicted_traj.shape[0], k, replace=False)
-            num_dims = true_traj.shape[2]
+        idx = np.random.choice(predicted_traj.shape[0], k, replace=False)
+        num_dims = true_traj.shape[2]
 
-            fig = make_subplots(rows=k, cols=1, subplot_titles=[f'Batch {i+1}' for i in range(k)])
+        fig = make_subplots(rows=k, cols=1, subplot_titles=[f'Batch {i+1}' for i in range(k)])
 
-            for i, b in enumerate(idx):
-                for d in range(num_dims):
-                    pred_samples = predicted_traj[b, :, :, d].detach().cpu().numpy()
-                    true_values = true_traj[b, :, d].detach().cpu().numpy()
-                    lower_bound = np.min(pred_samples, axis=0)
-                    upper_bound = np.max(pred_samples, axis=0)
-                    times = np.arange(pred_samples.shape[1])
+        for i, b in enumerate(idx):
+            for d in range(num_dims):
+                pred_samples = predicted_traj[b, :, :, d].detach().cpu().numpy()
+                true_values = true_traj[b, :, d].detach().cpu().numpy()
+                times = np.arange(pred_samples.shape[1])
+                mean_pred = np.mean(pred_samples, axis=0)
 
-                    # Concatenate for plotly area plot (shaded region for prediction bounds)
+                # Add individual predicted trajectories with lighter opacity
+                for sample in pred_samples:
                     fig.add_trace(
                         go.Scatter(
-                            x=np.concatenate([times, times[::-1]]),
-                            y=np.concatenate([upper_bound, lower_bound[::-1]]),
-                            fill='toself',
-                            fillcolor=f'rgba(0,100,80,{0.2 if d == 0 else 0.1})',  # vary opacity by dimension
-                            line=dict(color='rgba(255,255,255,0)'),
+                            x=times, y=sample, mode='lines',
+                            line=dict(color=f'rgba(255, 182, 193, 0.1)', width=1),
                             showlegend=False,
                             legendgroup=f'Batch {b}',
-                            name=f'Bounds Dim {d+1}'
+                            name=f'Predicted Trajectory Dim {d+1}'
                         ),
                         row=i+1, col=1
                     )
 
-                    # True trajectory
-                    fig.add_trace(
-                        go.Scatter(
-                            x=times, y=true_values, mode='lines+markers',
-                            line=dict(color='blue', width=2),
-                            marker=dict(size=4, color='red'),
-                            name=f'True Trajectory Dim {d+1}',
-                            legendgroup=f'Batch {b}',
-                        ),
-                        row=i+1, col=1
-                    )
+                # Add mean predicted trajectory with darker opacity
+                fig.add_trace(
+                    go.Scatter(
+                        x=times, y=mean_pred, mode='lines',
+                        line=dict(color=f'rgba(255, 105, 180, 1)', width=2),
+                        name=f'Mean Predicted Trajectory Dim {d+1}',
+                        legendgroup=f'Batch {b}',
+                    ),
+                    row=i+1, col=1
+                )
 
-            fig.update_layout(
-                height=300*k,  # Adjust height based on the number of batches
-                title=f'Trajectories Comparison Across Batches',
-                showlegend=True
-            )
-            plot_filename = os.path.join(self.train_dir, f'Predictions_global_step_{self.global_step}.png')
-            fig.write_image(plot_filename, engine="kaleido")
-            #print(f'Saved figure at: {plot_filename}')
+                # Add true trajectory
+                fig.add_trace(
+                    go.Scatter(
+                        x=times, y=true_values, mode='lines+markers',
+                        line=dict(color=f'rgba(0, 255, 255, 1)', width=2),
+                        marker=dict(size=4, color='blue'),
+                        name=f'True Trajectory Dim {d+1}',
+                        legendgroup=f'Batch {b}',
+                    ),
+                    row=i+1, col=1
+                )
 
-            # Optionally log the plot to wandb if logging is enabled
-            if self.log_wandb:
-                wandb.log({"Predictions and factual": fig})
+        fig.update_layout(
+            height=300*k,  # Adjust height based on the number of batches
+            title='Trajectories Comparison Across Batches',
+            showlegend=False
+        )
+        plot_filename = os.path.join(self.train_dir, f'Predictions_global_step_{self.global_step}.png')
+        fig.write_image(plot_filename, engine="kaleido")
+        print(f'Saved figure at: {plot_filename}')
 
+        # Optionally log the plot to wandb if logging is enabled
+        if self.log_wandb:
+            wandb.log({"Predictions and factual": fig})
+        fig.data = []
 
 
 

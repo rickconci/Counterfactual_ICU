@@ -178,7 +178,7 @@ if __name__ == '__main__':
     parser.add_argument('--normalise', type=bool, default=False, help='Whether to normalise the data. Recommended ONLY if using an Encoder')
     parser.add_argument('--noise_std', type=float, default=0.0, help='Noise defines how noisy the data is ')
     parser.add_argument('--non_confounded_effect', type=bool, default=False, help='Whether to add non-confounded unsee effect on the treatment (increases the noise of the prediction)')
-    parser.add_argument('--gamma', type=int, default=0, help='Gamma defines how confounded the data is. the higher, the less overlap. the lower the more overlap')
+    parser.add_argument('--gamma', type=int, default=10, help='Gamma defines how confounded the data is. the higher, the less overlap. the lower the more overlap')
     parser.add_argument('--confounder_type', type=str, default='partial', choices=['visible', 'partial', 'invisible'], help='the type of confounding present')
 
     #PRIMARY Bifurcation args
@@ -187,7 +187,7 @@ if __name__ == '__main__':
     parser.add_argument('--apply_path_SDE', type=bool, default=False, help='Whether to apply the path-based SDE formulation')
     
     parser.add_argument('--prior_path_sigma', type=float, default=0.00, help='Standard deviation of the prior path process')
-    parser.add_argument('--num_samples', type=int, default=20, help='Number of samples for the SDE process')
+    parser.add_argument('--num_samples', type=int, default=1, help='Number of samples for the SDE process')
     parser.add_argument('--self_reverting_prior_control', type=bool, default=False, help='Whether the control has a self-reverting prior')
     parser.add_argument('--theta', type=float, default=0.01, help='Theta for the mean-reverting process')
     parser.add_argument('--SDE_control_weighting', type=float, default=1.0, help='Weighting factor for the SDE control term')
@@ -208,7 +208,7 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for the optimizer')
     parser.add_argument('--batch_size', type=int, default=128, help='Training batch size')
     parser.add_argument('--max_epochs', type=int, default=200, help='Maximum number of epochs to train')
-    parser.add_argument('--accelerator', type=str, default='cpu', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
+    parser.add_argument('--accelerator', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
 
     
     args = parser.parse_args()

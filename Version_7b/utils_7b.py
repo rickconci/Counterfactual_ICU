@@ -15,11 +15,12 @@ import numpy as np
 
 
 def select_tensor_by_index_list_advanced(tensor, index_list):
-    # Convert index list to a tensor of type long
-    indices = torch.tensor(index_list, dtype=torch.long)
+    # Convert index list to a tensor of type long and move it to the same device as the input tensor
+    device = tensor.device
+    indices = torch.tensor(index_list, dtype=torch.long, device=device)
     
     # Select along the last dimension using torch.index_select
-    selected_tensor = torch.index_select(tensor, -1, indices).to(tensor)
+    selected_tensor = torch.index_select(tensor, -1, indices)
     
     return selected_tensor
     
