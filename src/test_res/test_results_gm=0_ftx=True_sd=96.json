@@ -1,0 +1,20 @@
+Test Results IID: [
+  {
+    "test_total_loss": -51.56535720825195,
+    "test_fact_loss": -51.56535720825195,
+    "val_kl_loss": 0.0,
+    "test_mse_cf": 0.0003745101566892117,
+    "test_PEHE": 0.0007563001709058881,
+    "test_std_preds_cf": 6.215377652551979e-05
+  }
+]
+Test Results OOD: [
+  {
+    "test_total_loss": -28.762136459350586,
+    "test_fact_loss": -28.762136459350586,
+    "val_kl_loss": 0.0,
+    "test_mse_cf": 0.00809053611010313,
+    "test_PEHE": 0.015185018070042133,
+    "test_std_preds_cf": 0.0001086180200218223
+  }
+]

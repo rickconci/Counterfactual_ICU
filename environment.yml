@@ -1,0 +1,21 @@
+name: counterfactual_icu_env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pytorch>=2.0.0
+  - pytorch-lightning>=2.0.0
+  - numpy>=1.20
+  - wandb>=0.15
+  - torchsde>=0.2.5
+  - matplotlib>=3.0.0
+  - pandas>=1.0.0
+  - plotly>=5.0.0
+  - tqdm>=4.60.0
+  - lightning>=2.0.0
+  - libgfortran5>=9.3.0
+  - pip
+  - pip:
+      - kaleido>=0.2.1

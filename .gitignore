@@ -6,3 +6,16 @@ Version_*/data/
 Version_*/model_logs/
 Version_*/results/
 Version_*/Hybrid_SDE_output.txt
+ACS_thesis.pdf
+Examiners_Feedback.pdf
+Evaluations/
+Plots/
+Tempdir/
+Wandbdir/
+Hybrid_SDE_output_beta.txt
+to_do.md
+__pycache__/
+lightning_logs/
+wandb/
+model_checkpoints/
+data_created/
