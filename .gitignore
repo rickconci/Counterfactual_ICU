@@ -6,9 +6,8 @@ Version_*/data/
 Version_*/model_logs/
 Version_*/results/
 Version_*/Hybrid_SDE_output.txt
-ACS_thesis.pdf
 Examiners_Feedback.pdf
-Evaluations/
+Evaluations
 Plots/
 Tempdir/
 Wandbdir/
