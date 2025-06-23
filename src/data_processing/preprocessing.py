@@ -10,7 +10,7 @@ import numpy as np
 
 
 
-def find_relevant_patients(measurements, MAP_id = 220052, load_path_events = "chartevents.csv", load_path_stays = "icustays.csv",  save_path = "treated_patients_all_values.parquet"):
+def find_relevant_patients(measurements, MAP_id = 220052, load_path_events = "../../data/chartevents.csv", load_path_stays = "../../data/icustays.csv",  save_path = "../../data/treated_patients_all_values.parquet"):
     """
     Finds all potentially relevant patients by filtering on those that have had a blood pressure event and
     that have stayed in the ICU for over 24h.
@@ -24,7 +24,7 @@ def find_relevant_patients(measurements, MAP_id = 220052, load_path_events = "ch
             dataset containing all occurrences of the treatment to be used to filter patients
     """
     if not os.path.exists(save_path):
-        long_stays = (pl.scan_csv(load_path_stays).limit(100000)
+        long_stays = (pl.scan_csv(load_path_stays)
                       .filter(pl.col("los") > 1)
                       .collect())
         long_stays_id = long_stays["stay_id"].unique().to_list()
@@ -59,10 +59,10 @@ def read_large_csv_with_polars(load_path, ids_df, measurements, id_column='stay_
     """
 
     valid_ids = ids_df[id_column].unique().to_list()
-    ids_df.write_parquet("temp.parquet")
+    ids_df.write_parquet("../../data/temp.parquet")
     # Polars handles large files much better
     result = (
-        pl.scan_csv(load_path).limit(100000)
+        pl.scan_csv(load_path)
         .filter(pl.col(id_column).is_in(valid_ids))
         .filter(pl.col(item_column).is_in(measurements))
         .collect()
@@ -82,13 +82,13 @@ def find_min_max_heartrates(all_patients_path, save_path, metadata_path, hr_ID =
                        .filter(pl.col(item_column) == hr_ID)
                        .collect())
     patients = all_patients_hr[patient_id].unique().to_list()
-    metadata = pl.scan_csv(metadata_path).collect()
+    patient_metadata = pl.scan_csv(metadata_path).collect()
     hr_params = pd.DataFrame({"stay_id":[], "min_hr":[], "max_hr":[]})
     for patient in patients:
         patient_data = all_patients_hr.filter(pl.col(patient_id) == patient)
         patient_min = patient_data[value_column].min()
-        patient_metadata = patient_metadata.filter(pl.col(patient_id == patient))
-        patient_age = patient_metadata["anchor_age"].item()
+        patient_metadata = patient_metadata.filter(pl.col(patient_id) == patient)
+        patient_age = 0 if len(patient_metadata["anchor_age"]) == 0 else patient_metadata["anchor_age"].item()
         patient_max = 220 - patient_age
         hr_params_patients = pd.DataFrame({"stay_id":[patient], "min_hr":[patient_min], "max_hr":[patient_max]})
         hr_params = pd.concat((hr_params, hr_params_patients))
@@ -101,7 +101,7 @@ def main():
     # CVP: 220074
     # CO-related params: 220088, 224842, 228369, 229897
     patients = find_relevant_patients(measurements=[220045, 220052, 220074, 220088, 224842, 228369, 229897], MAP_id=220052)
-    hr_params = find_min_max_heartrates("treated_patients_all_values.parquet", metadata_path="patients.csv", save_path="hr_params.csv")
+    hr_params = find_min_max_heartrates("../../data/treated_patients_all_values.parquet", metadata_path="../../data/patients.csv", save_path="../../data/hr_params.csv")
 
 
 if __name__ == "__main__":
