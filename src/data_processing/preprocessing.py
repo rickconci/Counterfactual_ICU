@@ -120,286 +120,6 @@ def find_relevant_inputevents(all_patients_chartevents, save_path, events, input
 
     return all_patients_inputevents
 
-def detect_t0(results_df, crystalloids_list, vasopressors_list, SV_list=None):
-    """
-    Detect t0 points and split trajectories for training.
-
-    A t0 is defined as any point where:
-    - The total rate of crystalloids changes
-    - A vasopressor is administered
-
-    Parameters:
-    - results_df: DataFrame from process_mimic_data with columns:
-        - stay_id: Patient stay identifier
-        - min_hr, max_hr: Heart rate bounds
-        - measurements: JSON string of jagged array
-        - measurement_times: JSON string of jagged array
-    - crystalloids_list: List of crystalloid item IDs
-    - vasopressors_list: List of vasopressor item IDs
-    - SV_list: List of SV measurement item IDs (optional, can be None)
-
-    Returns:
-    - training_data: List of dictionaries with trajectory information
-
-    Note: Only vital sign measurements (HR, MAP, CVP, r_tpr) are required to have data.
-    Crystalloid, vasopressor, and SV measurements are included when available but not required.
-    """
-    import json
-
-    training_data = []
-    total_skipped = 0
-
-    # Calculate row indices
-    total_crystalloid_row = 4 + len(crystalloids_list)
-    vasopressor_start_row = 5 + len(crystalloids_list)
-    vasopressor_end_row = vasopressor_start_row + len(vasopressors_list)
-
-    # SV measurements start after vasopressors
-    sv_start_row = vasopressor_end_row
-
-    # Only vital signs are required (rows 0-3: HR, MAP, CVP, r_tpr)
-    required_rows = set(range(4))
-
-    for idx, row in results_df.iterrows():
-        stay_id = row['stay_id']
-        measurements = json.loads(row['measurements'])
-        times = json.loads(row['measurement_times'])
-
-        # Get all unique times across all measurements
-        all_times = set()
-        for time_row in times:
-            all_times.update(time_row)
-        all_times = sorted(list(all_times))
-
-        if not all_times:
-            continue
-
-        # Find all t0 points
-        t0_events = []
-
-        # Check crystalloid rate changes
-        crystalloid_rates = measurements[total_crystalloid_row]
-        crystalloid_times = times[total_crystalloid_row]
-
-        if len(crystalloid_rates) > 0:
-            # First crystalloid administration is a t0
-            t0_events.append({
-                'time': crystalloid_times[0],
-                'type': 'crystalloid_change',
-                'details': f'First crystalloid (rate: {crystalloid_rates[0]})'
-            })
-
-            # Check for rate changes
-            for i in range(1, len(crystalloid_rates)):
-                if crystalloid_rates[i] != crystalloid_rates[i - 1]:
-                    t0_events.append({
-                        'time': crystalloid_times[i],
-                        'type': 'crystalloid_change',
-                        'details': f'Rate change: {crystalloid_rates[i - 1]} → {crystalloid_rates[i]}'
-                    })
-
-        # Check vasopressor administrations
-        for vaso_idx in range(vasopressor_start_row, vasopressor_end_row):
-            if vaso_idx < len(measurements):
-                vaso_rates = measurements[vaso_idx]
-                vaso_times = times[vaso_idx]
-
-                # Each time a vasopressor is started (rate > 0) is a t0
-                for i in range(len(vaso_rates)):
-                    if vaso_rates[i] > 0:
-                        # Check if this is a new administration (not just a rate change)
-                        is_new_admin = (i == 0) or (vaso_rates[i - 1] == 0)
-                        if is_new_admin:
-                            t0_events.append({
-                                'time': vaso_times[i],
-                                'type': 'vasopressor_start',
-                                'details': f'Vasopressor {vaso_idx - vasopressor_start_row} started (rate: {vaso_rates[i]})'
-                            })
-
-        # Sort t0 events by time
-        t0_events.sort(key=lambda x: x['time'])
-
-        # Remove duplicate times (keep first event type at each time)
-        unique_t0_events = []
-        seen_times = set()
-        for event in t0_events:
-            if event['time'] not in seen_times:
-                unique_t0_events.append(event)
-                seen_times.add(event['time'])
-        t0_events = unique_t0_events
-
-        # Create trajectories
-        if len(t0_events) == 0:
-            continue
-
-        # Track statistics for this stay
-        trajectories_created = 0
-        trajectories_skipped_incomplete = 0
-
-        # For each t0, create a training pair
-        for t0_idx in range(len(t0_events)):
-            t0 = t0_events[t0_idx]
-            t0_time = t0['time']
-
-            # Get next t0 time (or end of trajectory)
-            if t0_idx + 1 < len(t0_events):
-                next_t0_time = t0_events[t0_idx + 1]['time']
-            else:
-                next_t0_time = max(all_times)
-
-            # Skip if t0 is at the very end
-            if t0_time >= max(all_times):
-                continue
-
-            # Split measurements and times
-            X_measurements = []
-            X_times = []
-            Y_measurements = []
-            Y_times = []
-
-            for row_idx in range(len(measurements)):
-                row_measurements = measurements[row_idx]
-                row_times = times[row_idx]
-
-                X_vals = []
-                X_t = []
-                Y_vals = []
-                Y_t = []
-
-                for i in range(len(row_measurements)):
-                    if row_times[i] <= t0_time:
-                        X_vals.append(row_measurements[i])
-                        X_t.append(row_times[i])
-                    if t0_time < row_times[i] <= next_t0_time:
-                        Y_vals.append(row_measurements[i])
-                        Y_t.append(row_times[i])
-
-                X_measurements.append(X_vals)
-                X_times.append(X_t)
-                Y_measurements.append(Y_vals)
-                Y_times.append(Y_t)
-
-            # Only check if vital sign measurements (rows 0-3) have data in both X and Y
-            X_vitals_complete = all(len(X_measurements[i]) > 0 for i in required_rows if i < len(X_measurements))
-            Y_vitals_complete = all(len(Y_measurements[i]) > 0 for i in required_rows if i < len(Y_measurements))
-
-            if X_vitals_complete and Y_vitals_complete:
-                trajectories_created += 1
-                training_data.append({
-                    'stay_id': stay_id,
-                    'trajectory_idx': t0_idx,
-                    'X_measurements': X_measurements,
-                    'X_times': X_times,
-                    'Y_measurements': Y_measurements,
-                    'Y_times': Y_times,
-                    't0_time': t0_time,
-                    't0_type': t0['type'],
-                    't0_details': t0['details'],
-                    'min_hr': row['min_hr'],
-                    'max_hr': row['max_hr']
-                })
-            else:
-                trajectories_skipped_incomplete += 1
-
-                # Debug: show which vital signs are missing
-                if trajectories_skipped_incomplete <= 5:  # Only show first 5 examples
-                    X_missing_vitals = [i for i in required_rows if
-                                        i < len(X_measurements) and len(X_measurements[i]) == 0]
-                    Y_missing_vitals = [i for i in required_rows if
-                                        i < len(Y_measurements) and len(Y_measurements[i]) == 0]
-
-                    print(f"\nSkipped trajectory (stay {stay_id}, t0 #{t0_idx}):")
-                    if X_missing_vitals:
-                        print(f"  X missing vital signs rows: {X_missing_vitals} (0=HR, 1=MAP, 2=CVP, 3=r_tpr)")
-                    if Y_missing_vitals:
-                        print(f"  Y missing vital signs rows: {Y_missing_vitals} (0=HR, 1=MAP, 2=CVP, 3=r_tpr)")
-
-        # Update total skipped count
-        total_skipped += trajectories_skipped_incomplete
-
-    print(f"\n=== T0 Detection Summary ===")
-    print(f"Total stays processed: {len(results_df)}")
-    print(f"Total training trajectories created: {len(training_data)}")
-    print(f"Total trajectories skipped (incomplete vital signs): {total_skipped}")
-
-    if total_skipped > 0:
-        completion_rate = len(training_data) / (len(training_data) + total_skipped) * 100
-        print(f"Completion rate: {completion_rate:.1f}%")
-
-    # Count by t0 type
-    t0_types = {}
-    for data in training_data:
-        t0_type = data['t0_type']
-        t0_types[t0_type] = t0_types.get(t0_type, 0) + 1
-
-    print("\nTrajectories by t0 type:")
-    for t0_type, count in t0_types.items():
-        print(f"  {t0_type}: {count}")
-
-    # Analyze data availability in accepted trajectories
-    has_crystalloid_data = 0
-    has_vasopressor_data = 0
-    has_sv_data = 0
-
-    for data in training_data:
-        # Check crystalloid data
-        for i in range(4, total_crystalloid_row + 1):
-            if i < len(data['X_measurements']) and (
-                    len(data['X_measurements'][i]) > 0 or len(data['Y_measurements'][i]) > 0):
-                has_crystalloid_data += 1
-                break
-
-        # Check vasopressor data
-        for i in range(vasopressor_start_row, vasopressor_end_row):
-            if i < len(data['X_measurements']) and (
-                    len(data['X_measurements'][i]) > 0 or len(data['Y_measurements'][i]) > 0):
-                has_vasopressor_data += 1
-                break
-
-        # Check SV data
-        if sv_start_row < len(data['X_measurements']):
-            for i in range(sv_start_row, len(data['X_measurements'])):
-                if len(data['X_measurements'][i]) > 0 or len(data['Y_measurements'][i]) > 0:
-                    has_sv_data += 1
-                    break
-
-    print(f"\nData availability in accepted trajectories:")
-    print(
-        f"  With crystalloid data: {has_crystalloid_data}/{len(training_data)} ({has_crystalloid_data / len(training_data) * 100:.1f}%)")
-    print(
-        f"  With vasopressor data: {has_vasopressor_data}/{len(training_data)} ({has_vasopressor_data / len(training_data) * 100:.1f}%)")
-    print(f"  With SV data: {has_sv_data}/{len(training_data)} ({has_sv_data / len(training_data) * 100:.1f}%)")
-
-    # Example trajectory
-    if len(training_data) > 0:
-        example = training_data[0]
-        print(f"\nExample trajectory (stay_id: {example['stay_id']}, trajectory {example['trajectory_idx']}):")
-        print(f"  t0 time: {example['t0_time']:.1f} seconds")
-        print(f"  t0 type: {example['t0_type']}")
-        print(f"  t0 details: {example['t0_details']}")
-
-        # Count non-empty measurement rows
-        row_names = ['HR', 'MAP', 'CVP', 'r_tpr']
-        for i in range(len(crystalloids_list)):
-            row_names.append(f'Crystalloid_{i}')
-        row_names.append('Total_Crystalloid')
-        for i in range(len(vasopressors_list)):
-            row_names.append(f'Vasopressor_{i}')
-        row_names.append('SV (if present)')
-
-        print("\n  X period data availability:")
-        for i, row_name in enumerate(row_names[:min(len(row_names), len(example['X_measurements']))]):
-            if len(example['X_measurements'][i]) > 0:
-                print(f"    {row_name}: {len(example['X_measurements'][i])} measurements")
-
-        print("\n  Y period data availability:")
-        for i, row_name in enumerate(row_names[:min(len(row_names), len(example['Y_measurements']))]):
-            if len(example['Y_measurements'][i]) > 0:
-                print(f"    {row_name}: {len(example['Y_measurements'][i])} measurements")
-
-    training_data.to_csv("../../data/training_data.csv")
-    return training_data
-
 
 def create_medication_rate_matrix(
         inputevents_df,  # Polars DataFrame
@@ -426,7 +146,6 @@ def create_medication_rate_matrix(
 
     # Step 0: Load ICU stays data
     print("Loading ICU stays data...")
-    # TODO there is a limit
     icustays_df = pl.read_csv(icustays_path)
 
     # Parse datetime columns if needed
@@ -435,7 +154,7 @@ def create_medication_rate_matrix(
             pl.col('intime').str.to_datetime()
         )
 
-    # Calculate max intervals from maximum LOS
+    # Calculate max intervals from maximum LOS (length of stay)
     max_los_days = icustays_df['los'].max()
     print(f"Maximum ICU length of stay: {max_los_days:.2f} days")
 
@@ -446,7 +165,7 @@ def create_medication_rate_matrix(
 
     print(f"Creating {n_intervals} intervals of {interval_minutes} minutes each")
 
-    # Get all unique stay_ids from icustays
+    # Get all unique stay_ids from inputevents
     all_stay_ids = inputevents_df['stay_id'].unique().to_list()
     print(f"Total patients in ICU stays: {len(all_stay_ids)}")
 
@@ -524,7 +243,7 @@ def create_medication_rate_matrix(
 
     # Lists to collect rate changes for statistics
     all_vasopressor_changes = []
-    all_crystalloid_sum_changes = []
+    all_crystalloid_rate_sum_changes = []
 
     # Counter for t0 rows
     t0_rows_created = 0
@@ -583,7 +302,7 @@ def create_medication_rate_matrix(
             sum_row = {
                 'stay_id': stay_id,
                 'itemid': -1,
-                'medication_type': 'crystalloid_sum',
+                'medication_type': 'crystalloid_rate_sum',
                 'medication_name': 'TOTAL_CRYSTALLOIDS'
             }
 
@@ -605,7 +324,7 @@ def create_medication_rate_matrix(
                 if sum_array[i - 1] > 0 or sum_array[i] > 0:  # Only count if there's activity
                     change = sum_array[i] - sum_array[i - 1]
                     if change != 0:
-                        all_crystalloid_sum_changes.append(change)
+                        all_crystalloid_rate_sum_changes.append(change)
 
             # Collect vasopressor rate changes for statistics
             for vaso_itemid, vaso_array in vasopressor_arrays.items():
@@ -657,7 +376,7 @@ def create_medication_rate_matrix(
     print("Converting to DataFrame...")
     result_df = pl.DataFrame(result_data)
 
-    # Sort final result - make sure t0 rows appear after crystalloid_sum
+    # Sort final result - make sure t0 rows appear after crystalloid_rate_sum
     result_df = result_df.sort(['stay_id', 'medication_type', 'itemid'])
 
     # Verify t0 rows are present
@@ -732,8 +451,8 @@ def create_medication_rate_matrix(
         print("\nNo vasopressor rate changes found.")
 
     # Total crystalloid rate changes
-    if all_crystalloid_sum_changes:
-        cryst_changes = np.array(all_crystalloid_sum_changes)
+    if all_crystalloid_rate_sum_changes:
+        cryst_changes = np.array(all_crystalloid_rate_sum_changes)
         print("\nTotal crystalloid rate changes (non-zero):")
         print(f"  Total changes: {len(cryst_changes)}")
         print(f"  Increases: {np.sum(cryst_changes > 0)} ({np.sum(cryst_changes > 0) / len(cryst_changes) * 100:.1f}%)")
@@ -753,6 +472,8 @@ def create_medication_rate_matrix(
         print(f"\n  Changes > 20 mL/hr: {large_changes} ({large_changes / len(cryst_changes) * 100:.1f}%)")
     else:
         print("\nNo crystalloid rate changes found.")
+
+    result_df.write_parquet("../../data/meds_matrix.parquet")
 
     return result_df
 
