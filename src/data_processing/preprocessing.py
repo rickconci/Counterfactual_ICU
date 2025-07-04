@@ -14,6 +14,7 @@ import concurrent.futures
 from functools import partial
 from pathlib import Path
 from datetime import datetime, timedelta
+from scipy.interpolate import interp1d
 
 def find_relevant_patients(measurements, MAP_id = 220052, load_path_events = "../../data/chartevents.csv", load_path_stays = "../../data/icustays.csv",  save_path = "../../data/treated_patients_chartevents.parquet"):
     """
@@ -2025,6 +2026,748 @@ def debug_time_aggregation(
             print(f"  Count: {row['count']}, Mean: {row['mean']:.2f}, Min: {row['min']}, Max: {row['max']}")
 
 
+def extract_initial_conditions_for_patient(
+        stay_id,
+        chartevents_path,  # Path to raw chartevents parquet
+        inputevents_path,  # Path to raw inputevents parquet
+        physio_params,
+        medication_info,  # List of medication metadata
+        co_itemids,
+        trajectory_boundaries,
+        interval_minutes,
+        icu_admission_time,
+        max_co_age_minutes=10,
+        co_guess=4.0,
+        cache_dir='../../data/initial_conditions'
+):
+    """
+    Extract initial condition tensors for each trajectory of a patient.
+
+    Initial conditions include both physiological values AND medication rates at t0.
+    Uses linear interpolation from RAW data for maximum accuracy.
+
+    Parameters:
+    - stay_id: Patient ID
+    - chartevents_path: Path to raw chart events parquet
+    - inputevents_path: Path to raw input events parquet
+    - physio_params: List of physiological parameters
+    - medication_info: List of medication metadata (itemid, type, name)
+    - co_itemids: List of CO item IDs
+    - trajectory_boundaries: List of (start_idx, end_idx) tuples
+    - interval_minutes: Minutes per time interval
+    - icu_admission_time: ICU admission datetime
+    - max_co_age_minutes: Maximum age of CO measurement to use for R_TPR (default 10)
+    - co_guess: Default CO value if no recent measurement (default 4.0)
+    - cache_dir: Directory to save initial condition tensors
+
+    Returns:
+    - List of dictionaries with trajectory initial condition info
+    """
+    # Part 1: Process physiological data
+    # Get all relevant itemids for physio measurements
+    all_physio_itemids = []
+    for param in physio_params:
+        if param['itemid'] is not None:
+            all_physio_itemids.append(param['itemid'])
+    all_physio_itemids.extend(co_itemids)
+
+    # Read raw patient chart data
+    chart_df_patient = pl.scan_parquet(chartevents_path).filter(
+        (pl.col('stay_id') == stay_id) &
+        (pl.col('itemid').is_in(all_physio_itemids)) &
+        (pl.col('value').is_not_null())
+    ).collect()
+
+    # Parse charttime if needed
+    if chart_df_patient.height > 0:
+        if chart_df_patient.schema.get('charttime') != pl.Datetime:
+            chart_df_patient = chart_df_patient.with_columns(
+                pl.col('charttime').str.to_datetime()
+            )
+
+        # Cast value to float
+        chart_df_patient = chart_df_patient.with_columns(
+            pl.col('value').cast(pl.Float64, strict=False)
+        ).filter(pl.col('value').is_not_null())
+
+        # Calculate minutes from admission
+        chart_df_patient = chart_df_patient.with_columns(
+            ((pl.col('charttime') - icu_admission_time).dt.total_seconds() / 60).alias('minutes_from_admission')
+        ).filter(pl.col('minutes_from_admission') >= 0)
+
+    # Part 2: Process medication data
+    # Get all medication itemids
+    all_med_itemids = [med['itemid'] for med in medication_info]
+
+    # Read raw patient medication data
+    med_df_patient = pl.scan_parquet(inputevents_path).filter(
+        (pl.col('stay_id') == stay_id) &
+        (pl.col('itemid').is_in(all_med_itemids)) &
+        (pl.col('rate').is_not_null())
+    ).collect()
+
+    # Parse datetime columns if needed
+    if med_df_patient.height > 0:
+        if med_df_patient.schema.get('starttime') != pl.Datetime:
+            med_df_patient = med_df_patient.with_columns([
+                pl.col('starttime').str.to_datetime(),
+                pl.col('endtime').str.to_datetime()
+            ])
+
+        # Calculate minutes from admission
+        med_df_patient = med_df_patient.with_columns([
+            ((pl.col('starttime') - icu_admission_time).dt.total_seconds() / 60).alias('start_minutes'),
+            ((pl.col('endtime') - icu_admission_time).dt.total_seconds() / 60).alias('end_minutes')
+        ]).filter(pl.col('start_minutes') >= 0)  # Only post-admission
+
+    # Initialize storage for interpolators
+    physio_interpolators = {}
+    physio_raw_data = {}
+    med_interpolators = {}
+    med_raw_data = {}
+
+    # Find indices for special parameters
+    map_idx = None
+    cvp_idx = None
+    r_tpr_idx = None
+
+    for idx, param in enumerate(physio_params):
+        if param['param_type'] == 'MAP':
+            map_idx = idx
+        elif param['param_type'] == 'CVP':
+            cvp_idx = idx
+        elif param['param_type'] == 'R_TPR':
+            r_tpr_idx = idx
+
+    # Build interpolators for physiological parameters
+    for idx, param_info in enumerate(physio_params):
+        if param_info['param_type'] == 'R_TPR':
+            continue  # Skip R_TPR as it's calculated
+
+        itemid = param_info['itemid']
+        param_events = chart_df_patient.filter(pl.col('itemid') == itemid).sort('minutes_from_admission')
+
+        if param_events.height > 0:
+            times = param_events['minutes_from_admission'].to_numpy()
+            values = param_events['value'].to_numpy()
+
+            physio_raw_data[idx] = {
+                'times': times,
+                'values': values,
+                'charttimes': param_events['charttime'].to_list()
+            }
+
+            if len(times) >= 2:
+                # Remove duplicates by averaging
+                unique_times, unique_indices = np.unique(times, return_inverse=True)
+                unique_values = np.zeros(len(unique_times))
+
+                for i, t in enumerate(unique_times):
+                    mask = unique_indices == i
+                    unique_values[i] = np.mean(values[mask])
+
+                physio_interpolators[idx] = interp1d(
+                    unique_times, unique_values,
+                    kind='linear',
+                    bounds_error=False,
+                    fill_value=(unique_values[0], unique_values[-1])
+                )
+            elif len(times) == 1:
+                physio_interpolators[idx] = lambda x, v=values[0]: v
+
+    # Build interpolators for CO (needed for R_TPR)
+    co_data = {'times': [], 'values': []}
+
+    for co_itemid in co_itemids:
+        co_events = chart_df_patient.filter(pl.col('itemid') == co_itemid).sort('minutes_from_admission')
+
+        if co_events.height > 0:
+            co_data['times'].extend(co_events['minutes_from_admission'].to_list())
+            co_data['values'].extend(co_events['value'].to_list())
+
+    co_interpolator = None
+    co_times = np.array([])
+
+    if co_data['times']:
+        sorted_indices = np.argsort(co_data['times'])
+        co_times = np.array(co_data['times'])[sorted_indices]
+        co_values = np.array(co_data['values'])[sorted_indices]
+
+        if len(co_times) >= 2:
+            unique_times, unique_indices = np.unique(co_times, return_inverse=True)
+            unique_values = np.zeros(len(unique_times))
+
+            for i, t in enumerate(unique_times):
+                mask = unique_indices == i
+                unique_values[i] = np.mean(co_values[mask])
+
+            co_interpolator = interp1d(
+                unique_times, unique_values,
+                kind='linear',
+                bounds_error=False,
+                fill_value=(unique_values[0], unique_values[-1])
+            )
+        elif len(co_times) == 1:
+            co_interpolator = lambda x, v=co_values[0]: v
+
+    # Build interpolators for medications
+    # For medications, we need step-wise interpolation since rates are constant during infusion
+    for idx, med_info in enumerate(medication_info):
+        itemid = med_info['itemid']
+        med_events = med_df_patient.filter(pl.col('itemid') == itemid).sort('start_minutes')
+
+        if med_events.height > 0:
+            # Create time-rate pairs for step function
+            time_points = []
+            rate_values = []
+
+            for row in med_events.iter_rows(named=True):
+                start_min = row['start_minutes']
+                end_min = row['end_minutes']
+                rate = row['rate']
+
+                # Add start and end points
+                time_points.extend([start_min, end_min])
+                rate_values.extend([rate, rate])
+
+            # Add zero rate before first infusion and after last
+            if time_points:
+                # Add zero at time 0 if first infusion doesn't start at 0
+                if time_points[0] > 0:
+                    time_points.insert(0, 0)
+                    rate_values.insert(0, 0)
+
+                # Sort by time
+                sorted_indices = np.argsort(time_points)
+                sorted_times = np.array(time_points)[sorted_indices]
+                sorted_rates = np.array(rate_values)[sorted_indices]
+
+                # Create step interpolator (using 'previous' to maintain rate until next change)
+                med_interpolators[idx] = interp1d(
+                    sorted_times, sorted_rates,
+                    kind='previous',
+                    bounds_error=False,
+                    fill_value=(0, 0)  # Zero rate outside infusion periods
+                )
+
+                med_raw_data[idx] = {
+                    'times': sorted_times,
+                    'rates': sorted_rates,
+                    'events': med_events.to_dicts()
+                }
+
+    # Extract initial conditions for each trajectory
+    initial_conditions = []
+
+    for traj_num, (start_idx, end_idx) in enumerate(trajectory_boundaries):
+        # t0 is at end_idx - 1 (last point of trajectory)
+        t0_idx = end_idx - 1
+        t0_minutes = t0_idx * interval_minutes
+
+        # Initialize initial condition vector
+        n_physio = len(physio_params)
+        n_meds = len(medication_info) + 1  # +1 for crystalloid sum
+        n_total = n_physio + n_meds
+        ic_values = np.zeros(n_total, dtype=np.float32)
+        ic_mask = np.zeros(n_total, dtype=np.float32)
+
+        # Store debug info
+        debug_info = {
+            't0_minutes': t0_minutes,
+            't0_datetime': icu_admission_time + timedelta(minutes=int(t0_minutes))
+        }
+
+        # Part 1: Interpolate physiological values
+        for idx in range(n_physio):
+            if idx == r_tpr_idx:
+                continue  # Handle R_TPR separately
+
+            if idx in physio_interpolators:
+                ic_values[idx] = float(physio_interpolators[idx](t0_minutes))
+                ic_mask[idx] = 1.0
+
+                # Add interpolation details for debugging
+                if idx in physio_raw_data:
+                    times = physio_raw_data[idx]['times']
+                    before_mask = times <= t0_minutes
+                    after_mask = times >= t0_minutes
+
+                    if np.any(before_mask):
+                        nearest_before_idx = np.where(before_mask)[0][-1]
+                        debug_info[f'physio_{idx}_before'] = {
+                            'time': times[nearest_before_idx],
+                            'value': physio_raw_data[idx]['values'][nearest_before_idx]
+                        }
+
+                    if np.any(after_mask):
+                        nearest_after_idx = np.where(after_mask)[0][0]
+                        debug_info[f'physio_{idx}_after'] = {
+                            'time': times[nearest_after_idx],
+                            'value': physio_raw_data[idx]['values'][nearest_after_idx]
+                        }
+            else:
+                ic_values[idx] = 0.0
+                ic_mask[idx] = 0.0
+
+        # Calculate R_TPR
+        if r_tpr_idx is not None and map_idx is not None and cvp_idx is not None:
+            if ic_mask[map_idx] == 1 and ic_mask[cvp_idx] == 1:
+                map_value = ic_values[map_idx]
+                cvp_value = ic_values[cvp_idx]
+
+                co_value = co_guess
+                co_used = 'guess'
+                co_age = None
+
+                if co_interpolator is not None and len(co_times) > 0:
+                    recent_co_mask = co_times <= t0_minutes
+
+                    if np.any(recent_co_mask):
+                        most_recent_co_idx = np.where(recent_co_mask)[0][-1]
+                        most_recent_co_time = co_times[most_recent_co_idx]
+                        co_age_minutes = t0_minutes - most_recent_co_time
+
+                        if co_age_minutes <= max_co_age_minutes:
+                            co_value = float(co_interpolator(t0_minutes))
+                            co_used = 'interpolated'
+                            co_age = co_age_minutes
+
+                if co_value > 0:
+                    ic_values[r_tpr_idx] = (map_value - cvp_value) / co_value
+                    ic_mask[r_tpr_idx] = 1.0
+
+                    debug_info['r_tpr_calculation'] = {
+                        'map': map_value,
+                        'cvp': cvp_value,
+                        'co': co_value,
+                        'co_source': co_used,
+                        'co_age_minutes': co_age,
+                        'r_tpr': ic_values[r_tpr_idx]
+                    }
+                else:
+                    ic_values[r_tpr_idx] = 0.0
+                    ic_mask[r_tpr_idx] = 0.0
+            else:
+                ic_values[r_tpr_idx] = 0.0
+                ic_mask[r_tpr_idx] = 0.0
+
+        # Part 2: Interpolate medication rates
+        crystalloid_rates = []
+
+        for idx, med_info in enumerate(medication_info):
+            med_idx = n_physio + idx
+
+            if idx in med_interpolators:
+                rate = float(med_interpolators[idx](t0_minutes))
+                ic_values[med_idx] = rate
+                ic_mask[med_idx] = 1.0
+
+                # Track crystalloid rates for sum
+                if med_info['medication_type'] == 'crystalloid':
+                    crystalloid_rates.append(rate)
+
+                # Add medication state to debug info
+                if idx in med_raw_data:
+                    times = med_raw_data[idx]['times']
+                    rates = med_raw_data[idx]['rates']
+
+                    # Find active rate at t0
+                    active_idx = np.searchsorted(times, t0_minutes, side='right') - 1
+                    if 0 <= active_idx < len(rates):
+                        debug_info[f'med_{med_info["medication_name"]}_rate'] = rates[active_idx]
+                    else:
+                        debug_info[f'med_{med_info["medication_name"]}_rate'] = 0
+            else:
+                ic_values[med_idx] = 0.0
+                ic_mask[med_idx] = 1.0  # Medication not given is still valid info
+
+        # Calculate crystalloid sum
+        crystalloid_sum_idx = n_physio + len(medication_info)
+        ic_values[crystalloid_sum_idx] = sum(crystalloid_rates)
+        ic_mask[crystalloid_sum_idx] = 1.0
+
+        # Convert to tensor and save
+        ic_tensor = torch.from_numpy(ic_values).float()
+        ic_mask_tensor = torch.from_numpy(ic_mask).float()
+
+        # Save initial condition tensor
+        ic_file_path = Path(cache_dir) / f"ic_tensor_{int(stay_id)}_traj_{traj_num:03d}.pt"
+        torch.save((ic_tensor, ic_mask_tensor), ic_file_path)
+
+        initial_conditions.append({
+            'stay_id': stay_id,
+            'trajectory_num': traj_num,
+            't0_time_minutes': t0_minutes,
+            't0_time_hours': t0_minutes / 60.0,
+            'file_path': str(ic_file_path),
+            'has_complete_physio': bool(np.all(ic_mask[:n_physio] > 0)),
+            'has_complete_data': bool(np.all(ic_mask > 0)),
+            'n_physio': n_physio,
+            'n_meds': n_meds,
+            'debug_info': debug_info
+        })
+
+    return initial_conditions
+
+
+def save_initial_conditions_debug_csv(
+        stay_id,
+        initial_conditions_info,
+        physio_params,
+        medication_info,
+        output_dir
+):
+    """
+    Save initial conditions for a patient to CSV for debugging.
+    Includes both physiological and medication values.
+    """
+    if not initial_conditions_info:
+        print(f"No initial conditions found for patient {stay_id}")
+        return
+
+    # Create output directory
+    debug_dir = Path(output_dir) / f"patient_{stay_id}_initial_conditions"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect data for all trajectories
+    ic_data = []
+    interpolation_details = []
+
+    for ic_info in initial_conditions_info:
+        # Load the tensor
+        ic_tensor, ic_mask_tensor = torch.load(ic_info['file_path'])
+
+        n_physio = ic_info['n_physio']
+        n_meds = ic_info['n_meds']
+
+        row_data = {
+            'trajectory_num': ic_info['trajectory_num'],
+            't0_time_hours': ic_info['t0_time_hours'],
+            't0_time_minutes': ic_info['t0_time_minutes'],
+            't0_datetime': ic_info['debug_info']['t0_datetime']
+        }
+
+        # Add physiological values and masks
+        for idx, param in enumerate(physio_params):
+            param_name = param['param_name']
+            row_data[f'{param_name}_value'] = float(ic_tensor[idx])
+            row_data[f'{param_name}_mask'] = float(ic_mask_tensor[idx])
+
+        # Add medication values and masks
+        for idx, med in enumerate(medication_info):
+            med_name = med['medication_name']
+            row_data[f'{med_name}_value'] = float(ic_tensor[n_physio + idx])
+            row_data[f'{med_name}_mask'] = float(ic_mask_tensor[n_physio + idx])
+
+        # Add crystalloid sum
+        row_data['crystalloid_sum_value'] = float(ic_tensor[n_physio + len(medication_info)])
+        row_data['crystalloid_sum_mask'] = float(ic_mask_tensor[n_physio + len(medication_info)])
+
+        row_data['has_complete_physio'] = ic_info['has_complete_physio']
+        row_data['has_complete_data'] = ic_info['has_complete_data']
+        ic_data.append(row_data)
+
+        # Collect interpolation details
+        debug = ic_info['debug_info']
+        interp_row = {
+            'trajectory_num': ic_info['trajectory_num'],
+            't0_time_minutes': debug['t0_minutes']
+        }
+
+        # Add physiological interpolation details
+        for idx, param in enumerate(physio_params):
+            if param['param_type'] == 'R_TPR':
+                continue
+
+            param_name = param['param_name']
+            before_key = f'physio_{idx}_before'
+            after_key = f'physio_{idx}_after'
+
+            if before_key in debug:
+                before = debug[before_key]
+                interp_row[f'{param_name}_before_time'] = before['time']
+                interp_row[f'{param_name}_before_value'] = before['value']
+                interp_row[f'{param_name}_before_age_min'] = debug['t0_minutes'] - before['time']
+
+            if after_key in debug:
+                after = debug[after_key]
+                interp_row[f'{param_name}_after_time'] = after['time']
+                interp_row[f'{param_name}_after_value'] = after['value']
+                interp_row[f'{param_name}_after_age_min'] = after['time'] - debug['t0_minutes']
+
+        # Add R_TPR calculation details
+        if 'r_tpr_calculation' in debug:
+            r_tpr = debug['r_tpr_calculation']
+            interp_row['R_TPR_MAP'] = r_tpr['map']
+            interp_row['R_TPR_CVP'] = r_tpr['cvp']
+            interp_row['R_TPR_CO'] = r_tpr['co']
+            interp_row['R_TPR_CO_source'] = r_tpr['co_source']
+            interp_row['R_TPR_CO_age_min'] = r_tpr['co_age_minutes']
+            interp_row['R_TPR_calculated'] = r_tpr['r_tpr']
+
+        # Add medication rates from debug info
+        for med in medication_info:
+            med_key = f'med_{med["medication_name"]}_rate'
+            if med_key in debug:
+                interp_row[f'{med["medication_name"]}_rate_at_t0'] = debug[med_key]
+
+        interpolation_details.append(interp_row)
+
+    # Create DataFrames and save
+    ic_df = pd.DataFrame(ic_data)
+    ic_df.to_csv(debug_dir / 'initial_conditions.csv', index=False)
+
+    interp_df = pd.DataFrame(interpolation_details)
+    interp_df.to_csv(debug_dir / 'interpolation_details.csv', index=False)
+
+    # Save combined parameter metadata
+    all_params = []
+
+    # Add physiological parameters
+    for idx, param in enumerate(physio_params):
+        all_params.append({
+            'index': idx,
+            'category': 'physiological',
+            'itemid': param.get('itemid'),
+            'param_type': param['param_type'],
+            'param_name': param['param_name']
+        })
+
+    # Add medication parameters
+    for idx, med in enumerate(medication_info):
+        all_params.append({
+            'index': len(physio_params) + idx,
+            'category': 'medication',
+            'itemid': med['itemid'],
+            'param_type': med['medication_type'],
+            'param_name': med['medication_name']
+        })
+
+    # Add crystalloid sum
+    all_params.append({
+        'index': len(physio_params) + len(medication_info),
+        'category': 'medication',
+        'itemid': -1,
+        'param_type': 'crystalloid_sum',
+        'param_name': 'crystalloid_sum'
+    })
+
+    param_df = pd.DataFrame(all_params)
+    param_df.to_csv(debug_dir / 'parameter_info.csv', index=False)
+
+    print(f"Saved initial conditions debug CSV for patient {stay_id} to {debug_dir}")
+    print(f"Files created:")
+    print(f"  - initial_conditions.csv: IC values and masks for each trajectory")
+    print(f"  - interpolation_details.csv: Details about interpolation from raw data")
+    print(f"  - parameter_info.csv: Complete parameter metadata (physio + meds)")
+
+    return debug_dir
+
+
+def create_initial_condition_tensors(
+        chartevents_path,  # Path to raw chartevents parquet
+        inputevents_path,  # Path to raw inputevents parquet
+        trajectory_metadata_path,
+        physio_params,
+        medication_info,  # List of medication metadata
+        co_itemids,
+        icustays_path='../../data/icustays.csv',
+        max_co_age_minutes=10,
+        co_guess=4.0,
+        cache_dir='../../data/initial_conditions',
+        n_workers=4,
+        debug_patient_id=32128372
+):
+    """
+    Create initial condition tensors for all patients with trajectories.
+
+    Initial conditions include BOTH physiological values AND medication rates at t0,
+    all interpolated from raw data for maximum accuracy.
+
+    Parameters:
+    - chartevents_path: Path to RAW chart events parquet
+    - inputevents_path: Path to RAW input events parquet
+    - trajectory_metadata_path: Path to medication trajectory metadata
+    - physio_params: List of physiological parameters
+    - medication_info: List of medication metadata
+    - co_itemids: List of CO item IDs
+    - icustays_path: Path to ICU stays data
+    - max_co_age_minutes: Maximum age of CO measurement for R_TPR (default 10)
+    - co_guess: Default CO value if no recent measurement (default 4.0)
+    - cache_dir: Directory to save initial condition tensors
+    - n_workers: Number of parallel workers
+    - debug_patient_id: Patient ID to save debug CSV for (default 32128372)
+
+    Returns:
+    - Dictionary with all initial condition information
+    """
+    # Create cache directory
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
+    # Load trajectory metadata
+    print("Loading trajectory metadata...")
+    with open(trajectory_metadata_path, 'rb') as f:
+        trajectory_data = pickle.load(f)
+
+    all_trajectories = trajectory_data['all_trajectories']
+    interval_minutes = trajectory_data['interval_minutes']
+
+    # Load ICU stays to get admission times
+    print("Loading ICU admission times...")
+    icustays_df = pl.read_csv(icustays_path)
+    if icustays_df.schema['intime'] != pl.Datetime:
+        icustays_df = icustays_df.with_columns(
+            pl.col('intime').str.to_datetime()
+        )
+
+    # Create stay_id to admission time mapping
+    stay_admission_map = {}
+    for row in icustays_df.select(['stay_id', 'intime']).iter_rows(named=True):
+        stay_admission_map[row['stay_id']] = row['intime']
+
+    print(f"Processing initial conditions for {len(all_trajectories)} patients")
+    print(f"Initial condition will include:")
+    print(f"  - {len(physio_params)} physiological parameters (interpolated from chartevents)")
+    print(f"  - {len(medication_info)} medications (interpolated from inputevents)")
+    print(f"  - 1 crystalloid sum")
+    print(f"  Total: {len(physio_params) + len(medication_info) + 1} features")
+
+    # Prepare processing function
+    process_func = partial(
+        extract_initial_conditions_for_patient,
+        chartevents_path=chartevents_path,
+        inputevents_path=inputevents_path,
+        physio_params=physio_params,
+        medication_info=medication_info,
+        co_itemids=co_itemids,
+        interval_minutes=interval_minutes,
+        max_co_age_minutes=max_co_age_minutes,
+        co_guess=co_guess,
+        cache_dir=cache_dir
+    )
+
+    all_initial_conditions = {}
+
+    if n_workers > 1:
+        # Parallel processing
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {}
+
+            for stay_id, trajectories in all_trajectories.items():
+                if stay_id not in stay_admission_map:
+                    print(f"Warning: No admission time found for stay_id {stay_id}")
+                    continue
+
+                # Extract trajectory boundaries
+                boundaries = [(traj['start_idx'], traj['end_idx'])
+                              for traj in trajectories]
+
+                future = executor.submit(
+                    process_func,
+                    stay_id=stay_id,
+                    trajectory_boundaries=boundaries,
+                    icu_admission_time=stay_admission_map[stay_id]
+                )
+                futures[future] = stay_id
+
+            # Collect results
+            for future in tqdm(concurrent.futures.as_completed(futures),
+                               total=len(futures), desc="Processing initial conditions"):
+                stay_id = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        all_initial_conditions[stay_id] = result
+
+                        # Save debug CSV for specific patient
+                        if int(stay_id) == debug_patient_id:
+                            save_initial_conditions_debug_csv(
+                                stay_id,
+                                result,
+                                physio_params,
+                                medication_info,
+                                cache_dir
+                            )
+                except Exception as exc:
+                    print(f'Stay ID {stay_id} generated an exception: {exc}')
+                    import traceback
+                    traceback.print_exc()
+    else:
+        # Sequential processing
+        for stay_id, trajectories in tqdm(all_trajectories.items(),
+                                          desc="Processing initial conditions"):
+            if stay_id not in stay_admission_map:
+                print(f"Warning: No admission time found for stay_id {stay_id}")
+                continue
+
+            boundaries = [(traj['start_idx'], traj['end_idx'])
+                          for traj in trajectories]
+
+            result = process_func(
+                stay_id=stay_id,
+                trajectory_boundaries=boundaries,
+                icu_admission_time=stay_admission_map[stay_id]
+            )
+
+            if result:
+                all_initial_conditions[stay_id] = result
+
+                # Save debug CSV for specific patient
+                if int(stay_id) == debug_patient_id:
+                    save_initial_conditions_debug_csv(
+                        stay_id,
+                        result,
+                        physio_params,
+                        medication_info,
+                        cache_dir
+                    )
+
+    # Calculate statistics
+    total_ics = sum(len(ics) for ics in all_initial_conditions.values())
+    complete_physio = sum(
+        sum(1 for ic in ics if ic['has_complete_physio'])
+        for ics in all_initial_conditions.values()
+    )
+    complete_all = sum(
+        sum(1 for ic in ics if ic['has_complete_data'])
+        for ics in all_initial_conditions.values()
+    )
+
+    print(f"\nInitial condition extraction complete:")
+    print(f"Total patients processed: {len(all_initial_conditions)}")
+    print(f"Total initial conditions created: {total_ics}")
+    print(f"ICs with complete physiological data: {complete_physio} ({complete_physio / total_ics * 100:.1f}%)")
+    print(f"ICs with complete data (physio + meds): {complete_all} ({complete_all / total_ics * 100:.1f}%)")
+
+    # Save metadata
+    ic_metadata = {
+        'all_initial_conditions': all_initial_conditions,
+        'physio_params': physio_params,
+        'medication_info': medication_info,
+        'max_co_age_minutes': max_co_age_minutes,
+        'co_guess': co_guess,
+        'total_ics': total_ics,
+        'complete_physio': complete_physio,
+        'complete_all': complete_all,
+        'interval_minutes': interval_minutes,
+        'n_physio_features': len(physio_params),
+        'n_med_features': len(medication_info) + 1  # +1 for crystalloid sum
+    }
+
+    metadata_file = Path(cache_dir) / "initial_conditions_metadata.pkl"
+    with open(metadata_file, "wb") as f:
+        pickle.dump(ic_metadata, f)
+
+    print(f"\nSaved initial conditions metadata to {metadata_file}")
+    print(f"Saved {total_ics} initial condition tensors to {cache_dir}")
+
+    # Check if debug patient was found
+    if debug_patient_id in all_initial_conditions:
+        print(
+            f"\nDebug CSV saved for patient {debug_patient_id} in {cache_dir}/patient_{debug_patient_id}_initial_conditions/")
+
+    return all_initial_conditions
+
 
 def main():
     # Heart Rate: 220045
@@ -2056,10 +2799,11 @@ def main():
         # 221653, Dobutamine, Dobutamine, inputevents, Medications, mg, Solution,,
 
         # 221986, Milrinone, Milrinone, inputevents, Medications, mg, Solution,,
-    all_patients_chartevents_path = "../../data/treated_patients_chartevents.parquet"
+    relevant_patients_chartevents_path = "../../data/treated_patients_chartevents.parquet"
     patient_metadata_path = "../../data/patients.csv"
     hr_params_path = "../../data/hr_params.csv"
-    inputevents_path = "../../data/treated_patients_inputevents.parquet"
+    relevant_patients_inputevents_path = "../../data/treated_patients_inputevents.parquet"
+    icustays_path = "../../data/icustays.csv"
 
     # Define the lists (these should match what was used in process_mimic_data)
     crystalloids_list = [225158, 225159, 225161]  # NaCl 0.9%, 0.45%, 3%
@@ -2067,21 +2811,21 @@ def main():
     SV_list = [228375]  # Add your SV measurement IDs here
 
     all_patients_chartevents = find_relevant_patients(measurements=[220045, 220052, 220074, 220088, 224842, 228369, 229897, 228375], MAP_id=220052)
-    hr_params = find_min_max_heartrates(all_patients_chartevents_path, metadata_path=patient_metadata_path, save_path=hr_params_path)
+    hr_params = find_min_max_heartrates(relevant_patients_chartevents_path, metadata_path=patient_metadata_path, save_path=hr_params_path)
 
     inputevents = find_relevant_inputevents(all_patients_chartevents=all_patients_chartevents,
-                                            save_path=inputevents_path,
+                                            save_path=relevant_patients_inputevents_path,
                                             events=[225158,225159,225161,221906,229630,229631,229632,221662,221653,221986])
 
 
-    meds_matrix = create_medication_tensors(inputevents_path=inputevents_path,
+    meds_matrix = create_medication_tensors(inputevents_path=relevant_patients_inputevents_path,
                                           crystalloid_itemids =crystalloids_list,
                                           vasopressor_itemids=vasopressors_list)
 
 
 
 
-    physio_matrix = create_physio_tensors(chartevents_path=all_patients_chartevents_path,
+    physio_matrix = create_physio_tensors(chartevents_path=relevant_patients_chartevents_path,
                                           hr_itemids=[220045],
                                           map_itemids=[220052],
                                           cvp_itemids=[220074],
@@ -2102,15 +2846,32 @@ def main():
     # Detect t0 points and create training data
     #training_data = detect_t0(results_df, crystalloids_list, vasopressors_list)
     df = debug_specific_patient()
-    print("\n" + "=" * 60)
-    print("DEBUGGING TIME AGGREGATION")
-    print("=" * 60)
+    with open("../../data/med_tensors/trajectory_metadata.pkl", 'rb') as f:
+        med_metadata = pickle.load(f)
+    medication_info = med_metadata['medication_info']
 
-    # Debug MAP aggregation for patient 32128372
-    #debug_time_aggregation(
-      #  stay_id=32128372,
-      #  itemid=220045  # MAP
-    #)
+    physio_params = [
+        {'itemid': 220045, 'param_type': 'HR', 'param_name': 'HR'},
+        {'itemid': 220052, 'param_type': 'MAP', 'param_name': 'MAP'},
+        {'itemid': 220074, 'param_type': 'CVP', 'param_name': 'CVP'},
+        {'itemid': 228375, 'param_type': 'SV', 'param_name': 'SV'},
+        {'itemid': None, 'param_type': 'R_TPR', 'param_name': 'R_TPR'}
+    ]
+
+    initial_conditions = create_initial_condition_tensors(
+        chartevents_path=relevant_patients_chartevents_path,  # Raw chartevents for physio interpolation
+        inputevents_path=relevant_patients_inputevents_path,  # Raw inputevents for medication interpolation
+        trajectory_metadata_path="../../data/med_tensors/trajectory_metadata.pkl",
+        physio_params=physio_params,
+        medication_info=medication_info,
+        co_itemids=[220088, 224842, 228369, 229897],
+        icustays_path=icustays_path,
+        max_co_age_minutes=10,  # Maximum age of CO measurement to use for R_TPR
+        co_guess=4.0,  # Default CO if no recent measurement
+        cache_dir='../../data/initial_conditions',
+        n_workers=4,
+        debug_patient_id=32128372  # Patient to save debug CSV for
+    )
 
 
 if __name__ == "__main__":
