@@ -705,42 +705,74 @@ def process_single_patient_physio(
 
     # Save each trajectory using the provided boundaries
     trajectory_info = []
-    for traj_num, (start_idx, end_idx) in enumerate(trajectory_boundaries):
-        # Extract trajectory slice
-        traj_values = values_array[start_idx:end_idx, :]
-        traj_mask = mask_array[start_idx:end_idx, :]
-        traj_abs_time = abs_time_array[start_idx:end_idx]
-        traj_rel_time = rel_time_array[start_idx:end_idx]
+    # Loop up to the second to last boundary to define p_out
+    for traj_num in range(len(trajectory_boundaries) - 1):
+        # Current trajectory defines p_in
+        start_idx_in, end_idx_in = trajectory_boundaries[traj_num]
+        
+        # Next trajectory defines the end of p_out
+        _, end_idx_out = trajectory_boundaries[traj_num + 1]
 
-        # Length is the number of time points in this trajectory
-        length = end_idx - start_idx
+        # --- P_IN ---
+        p_in_values = values_array[start_idx_in:end_idx_in, :]
+        p_in_mask = mask_array[start_idx_in:end_idx_in, :]
+        p_in_abs_time = abs_time_array[start_idx_in:end_idx_in]
+        p_in_rel_time = rel_time_array[start_idx_in:end_idx_in]
+        p_in_len = end_idx_in - start_idx_in
 
         # Convert to tensors
-        values_tensor = torch.from_numpy(traj_values).float()
-        mask_tensor = torch.from_numpy(traj_mask).float()
-        abs_time_tensor = torch.from_numpy(traj_abs_time).float()
-        rel_time_tensor = torch.from_numpy(traj_rel_time).float()
-
-        # Save tensor with matching trajectory number
-        file_path = os.path.join(cache_dir, f"p_tensor_{int(stay_id)}_traj_{traj_num:03d}.pt")
+        p_in_values_tensor = torch.from_numpy(p_in_values).float()
+        p_in_mask_tensor = torch.from_numpy(p_in_mask).float()
+        p_in_abs_time_tensor = torch.from_numpy(p_in_abs_time).float()
+        p_in_rel_time_tensor = torch.from_numpy(p_in_rel_time).float()
+        
+        # Save p_in tensor
+        file_path_in = os.path.join(cache_dir, f"p_tensor_in_{int(stay_id)}_traj_{traj_num:03d}.pt")
         torch.save(
-            (values_tensor, mask_tensor, abs_time_tensor, rel_time_tensor, length),
-            file_path
+            (p_in_values_tensor, p_in_mask_tensor, p_in_abs_time_tensor, p_in_rel_time_tensor, p_in_len),
+            file_path_in
+        )
+
+        # --- P_OUT ---
+        # p_out is the segment from the end of p_in to the end of the next full trajectory
+        p_out_values = values_array[end_idx_in:end_idx_out, :]
+        p_out_mask = mask_array[end_idx_in:end_idx_out, :]
+        p_out_abs_time = abs_time_array[end_idx_in:end_idx_out]
+        p_out_rel_time = rel_time_array[end_idx_in:end_idx_out]
+        p_out_len = end_idx_out - end_idx_in
+
+        # Convert to tensors
+        p_out_values_tensor = torch.from_numpy(p_out_values).float()
+        p_out_mask_tensor = torch.from_numpy(p_out_mask).float()
+        p_out_abs_time_tensor = torch.from_numpy(p_out_abs_time).float()
+        p_out_rel_time_tensor = torch.from_numpy(p_out_rel_time).float()
+
+        # Save p_out tensor
+        file_path_out = os.path.join(cache_dir, f"p_tensor_out_{int(stay_id)}_traj_{traj_num:03d}.pt")
+        torch.save(
+            (p_out_values_tensor, p_out_mask_tensor, p_out_abs_time_tensor, p_out_rel_time_tensor, p_out_len),
+            file_path_out
         )
 
         # Calculate trajectory metadata
-        has_any_data = np.any(traj_mask > 0)
+        has_any_data_in = np.any(p_in_mask > 0)
+        has_any_data_out = np.any(p_out_mask > 0)
 
         trajectory_info.append({
             'stay_id': stay_id,
             'trajectory_num': traj_num,
-            'start_idx': start_idx,
-            'end_idx': end_idx,
-            'length': length,
-            'start_time_hours': 0.0,  # Always starts at ICU admission
-            'end_time_hours': rel_time_array[end_idx - 1] if end_idx > 0 else 0,
-            'has_physio_data': has_any_data,
-            'file_path': file_path
+            'p_in_start_idx': start_idx_in,
+            'p_in_end_idx': end_idx_in,
+            'p_in_length': p_in_len,
+            'p_out_start_idx': end_idx_in,
+            'p_out_end_idx': end_idx_out,
+            'p_out_length': p_out_len,
+            'start_time_hours': 0.0,
+            'end_time_hours': rel_time_array[end_idx_out - 1] if end_idx_out > 0 else 0,
+            'has_physio_data_in': has_any_data_in,
+            'has_physio_data_out': has_any_data_out,
+            'file_path_in': file_path_in,
+            'file_path_out': file_path_out
         })
 
     return (stay_id, trajectory_info)
@@ -1304,7 +1336,7 @@ def save_trajectory_tensor(
     abs_time_tensor = torch.from_numpy(traj_abs_time).float()
     rel_time_tensor = torch.from_numpy(traj_rel_time).float()
 
-    # Save tensor
+    # Save tensor with matching trajectory number
     file_path = os.path.join(cache_dir, f"med_tensor_{int(stay_id)}_traj_{traj_num:03d}.pt")
     torch.save(
         (values_tensor, mask_tensor, abs_time_tensor, rel_time_tensor, length),

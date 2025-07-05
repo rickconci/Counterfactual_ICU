@@ -19,6 +19,7 @@ from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
 
 #from CV_data_6_new import create_load_save_data, CVDataModule_final
 from CV_data_beta import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
+from src.MIMIC_data import MIMICDataModule
 
 from model_beta import Hybrid_VAE_SDE
 from utils_beta import process_input
@@ -72,60 +73,72 @@ def main(args):
         wandb_logger = None
         if DEBUG: print(f"[DEBUG] main_beta.py: Wandb logger not used.")
 
-    dataset_params = {
-        'fixed_tx': args.fixed_tx,
-        'include_all_inputs':args.include_all_inputs, 
-        'gamma': args.gamma,
-        'sigma_tx': 0.01,
-        'confounder_type': args.confounder_type,
+    if args.dataset_type == 'synthetic':
+        dataset_params = {
+            'fixed_tx': args.fixed_tx,
+            'include_all_inputs':args.include_all_inputs, 
+            'gamma': args.gamma,
+            'sigma_tx': 0.01,
+            'confounder_type': args.confounder_type,
 
-        'non_confounded_effect': False,
-        'noise_std': 0.0,
-        't_span': 60,
-        't_treatment': 45,
-        't_cutoff':40,
-        'seed': args.seed,
-        'pre_treatment_dims': [0, 1],
-        'post_treatment_dims': [0],
-        'normalize': False,
-        'N': 1280,
-        'debug': args.debug # <<< Pass debug flag >>>
-    }
-    if DEBUG: print(f"[DEBUG] main_beta.py: Dataset params created: {dataset_params}")
+            'non_confounded_effect': False,
+            'noise_std': 0.0,
+            't_span': 60,
+            't_treatment': 45,
+            't_cutoff':40,
+            'seed': args.seed,
+            'pre_treatment_dims': [0, 1],
+            'post_treatment_dims': [0],
+            'normalize': False,
+            'N': 1280,
+            'debug': args.debug # <<< Pass debug flag >>>
+        }
+        if DEBUG: print(f"[DEBUG] main_beta.py: Dataset params created: {dataset_params}")
 
-    filename_parts = [
-        f"sd={args.seed}",
-        f"gm={args.gamma}",
-        f"ftx={args.fixed_tx}",
-        f"allin={args.include_all_inputs}"
-        f"cnf={args.confounder_type}",
-        f"enc={args.use_encoder}",
-        f"txsig={args.prior_tx_sigma}",
-        f"revert={args.self_reverting_prior_control}",
-        f"klw={args.KL_weighting_SDE}",
-        f"SDEhd={args.SDEnet_hidden_dim}"
-    ]
-    unique_dir_name = "_".join(filename_parts)
+        unique_dir_name = "_".join([
+            f"sd={args.seed}",
+            f"gm={args.gamma}",
+            f"ftx={args.fixed_tx}",
+            f"allin={args.include_all_inputs}"
+            f"cnf={args.confounder_type}",
+            f"enc={args.use_encoder}",
+            f"txsig={args.prior_tx_sigma}",
+            f"revert={args.self_reverting_prior_control}",
+            f"klw={args.KL_weighting_SDE}",
+            f"SDEhd={args.SDEnet_hidden_dim}"
+        ])
 
-    print('dataset_params',dataset_params)
-    data_path = os.path.join(saving_dir, 'data_created')
-    if DEBUG: print(f"[DEBUG] main_beta.py: Data path set to: {data_path}")
+        print('dataset_params',dataset_params)
+        data_path = os.path.join(saving_dir, 'data_created')
+        if DEBUG: print(f"[DEBUG] main_beta.py: Data path set to: {data_path}")
 
-    dataset_params['r_tpr_mod'] = -0.5
-    if DEBUG: print(f"[DEBUG] main_beta.py: Calling create_load_save_data for train/val data.")
-    train_val_data = create_load_save_data(dataset_params, data_path)
-    if DEBUG: print(f"[DEBUG] main_beta.py: train_val_data loaded. Type: {type(train_val_data)}")
-    dataset_params['r_tpr_mod'] = +0.2 
-    if DEBUG: print(f"[DEBUG] main_beta.py: Calling create_load_save_data for test data.")
-    test_data = create_load_save_data(dataset_params, data_path)
-    if DEBUG: print(f"[DEBUG] main_beta.py: test_data loaded. Type: {type(test_data)}")
-    
-    if DEBUG: print(f"[DEBUG] main_beta.py: Initializing CVDataModule_IID.")
-    cv_data_module_IID = CVDataModule_IID(train_val_data = train_val_data, batch_size=args.batch_size, num_workers = 0, debug=args.debug) # <<< Pass debug flag >>>
-    if DEBUG: print(f"[DEBUG] main_beta.py: CVDataModule_IID initialized.")
-    if DEBUG: print(f"[DEBUG] main_beta.py: Initializing CVDataModule_OOD.")
-    cv_data_module_OOD = CVDataModule_OOD(OOD_test_data = test_data, batch_size=args.batch_size, num_workers = 0, debug=args.debug) # <<< Pass debug flag >>>
-    if DEBUG: print(f"[DEBUG] main_beta.py: CVDataModule_OOD initialized.")
+        dataset_params['r_tpr_mod'] = -0.5
+        if DEBUG: print(f"[DEBUG] main_beta.py: Calling create_load_save_data for train/val data.")
+        train_val_data = create_load_save_data(dataset_params, data_path)
+        if DEBUG: print(f"[DEBUG] main_beta.py: train_val_data loaded. Type: {type(train_val_data)}")
+        dataset_params['r_tpr_mod'] = +0.2 
+        if DEBUG: print(f"[DEBUG] main_beta.py: Calling create_load_save_data for test data.")
+        test_data = create_load_save_data(dataset_params, data_path)
+        if DEBUG: print(f"[DEBUG] main_beta.py: test_data loaded. Type: {type(test_data)}")
+        
+        if DEBUG: print(f"[DEBUG] main_beta.py: Initializing CVDataModule_IID.")
+        cv_data_module_IID = CVDataModule_IID(train_val_data = train_val_data, batch_size=args.batch_size, num_workers = 0, debug=args.debug) # <<< Pass debug flag >>>
+        if DEBUG: print(f"[DEBUG] main_beta.py: CVDataModule_IID initialized.")
+        if DEBUG: print(f"[DEBUG] main_beta.py: Initializing CVDataModule_OOD.")
+        cv_data_module_OOD = CVDataModule_OOD(OOD_test_data = test_data, batch_size=args.batch_size, num_workers = 0, debug=args.debug) # <<< Pass debug flag >>>
+        if DEBUG: print(f"[DEBUG] main_beta.py: CVDataModule_OOD initialized.")
+        data_module = cv_data_module_IID
+        data_module.setup() # Need to call this to get dims
+
+    elif args.dataset_type == 'mimic':
+        data_module = MIMICDataModule(data_root=args.data_root, 
+                                      icu_stays_path=args.icu_stays_path, 
+                                      batch_size=args.batch_size, 
+                                      num_workers=0)
+        data_module.setup()
+        unique_dir_name = f"MIMIC_DATA_seed={args.seed}" # Simplified name for now
+    else:
+        raise ValueError("Invalid dataset_type specified. Choose 'synthetic' or 'mimic'.")
 
 
     if DEBUG: print(f"[DEBUG] main_beta.py: Initializing Hybrid_VAE_SDE model.")
@@ -134,9 +147,9 @@ def main(args):
                            variational_sampling = args.variational_sampling,
 
                            #Encoder
-                           encoder_input_dim =  cv_data_module_IID.encoder_input_dim, 
+                           encoder_input_dim =  data_module.encoder_input_dim, 
                            encoder_hidden_dim = args.encoder_hidden_dim,
-                           expert_latent_dims  = cv_data_module_IID.expert_latent_dim ,
+                           expert_latent_dims  = data_module.expert_latent_dim,
                            encoder_SDENN_dims = 0 if args.use_encoder == 'none' else args.encoder_SDENN_dims,
 
                            use_2_5std_encoder_minmax = args.use_2_5std_encoder_minmax,
@@ -221,7 +234,7 @@ def main(args):
         #profiler="simple"   #this helps to identify bottlenecks 
     )
     if DEBUG: print(f"[DEBUG] main_beta.py: Trainer initialized. Starting fit...")
-    trainer.fit(model, cv_data_module_IID)
+    trainer.fit(model, data_module)
     if DEBUG: print(f"[DEBUG] main_beta.py: Trainer fit completed.")
     
     #test_results_IID = trainer.test(ckpt_path='last', dataloaders = cv_data_module_IID.test_dataloader())
@@ -245,6 +258,9 @@ if __name__ == '__main__':
     parser.add_argument('--plot_every', type=int, default=14, help='Plot every how many global steps? ')
 
     # Data specific args
+    parser.add_argument('--dataset_type', type=str, default='synthetic', choices=['synthetic', 'mimic'], help='Which dataset to use.')
+    parser.add_argument('--data_root', type=str, default='data', help='Root directory for MIMIC preprocessed data.')
+    parser.add_argument('--icu_stays_path', type=str, default='data/icustays.csv', help='Path to icustays.csv file.')
     parser.add_argument('--normalise', type=bool, default=False, help='Whether to normalise the data. Recommended ONLY if using an Encoder')
     parser.add_argument('--noise_std', type=float, default=0.0, help='Noise defines how noisy the data is ')
     parser.add_argument('--non_confounded_effect', type=bool, default=False, help='Whether to add non-confounded unsee effect on the treatment (increases the noise of the prediction)')
