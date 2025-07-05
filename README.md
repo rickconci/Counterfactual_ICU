@@ -2,7 +2,14 @@
 
 ## ACS MPhil thesis June 2024 
 
+### To create the meds_matrix dataset
 
+- Create a folder named 'data' with the following files from MIMICS-IV:
+  - icu/icustays.csv saved as 'icustays.csv'
+  - icu/chartevents.csv saved as 'chartevents.csv'
+  - icu/inputevents.csv saved as 'inputevents.csv'
+  - hosp/patients.csv saved as 'patients.csv'
+- run `python src/data_processing/preprocessing.py`
 
 ### To run 
 
