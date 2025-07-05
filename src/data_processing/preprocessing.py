@@ -2801,6 +2801,189 @@ def create_initial_condition_tensors(
     return all_initial_conditions
 
 
+
+def create_prediction_target_tensors_simple(
+        trajectory_metadata_path,
+        p_tensor_dir='../../data/p_tensors',
+        cache_dir='../../data/prediction_targets',
+        debug_patient_id=32128372
+):
+    """
+    Create prediction target tensors by extracting MAP and CVP from existing p_out tensors.
+
+    Since p_out already contains the physiological data for the prediction window
+    (from end of current trajectory to end of next trajectory), we just need to
+    extract the MAP and CVP columns.
+
+    Parameters:
+    - trajectory_metadata_path: Path to medication trajectory metadata
+    - p_tensor_dir: Directory containing p_out tensors
+    - cache_dir: Directory to save prediction target tensors
+    - debug_patient_id: Patient ID to save debug info for
+
+    Returns:
+    - Dictionary containing prediction target information
+    """
+    # Create cache directory
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
+    # Load trajectory metadata to get patient list
+    print("Loading trajectory metadata...")
+    with open(trajectory_metadata_path, 'rb') as f:
+        med_trajectory_data = pickle.load(f)
+
+    all_med_trajectories = med_trajectory_data['all_trajectories']
+
+    # Load physio metadata to get parameter indices
+    physio_metadata_path = Path(p_tensor_dir) / "physio_trajectory_metadata.pkl"
+    with open(physio_metadata_path, 'rb') as f:
+        physio_metadata = pickle.load(f)
+
+    physio_params = physio_metadata['physio_params']
+
+    # Find MAP and CVP indices
+    map_idx = None
+    cvp_idx = None
+
+    for idx, param in enumerate(physio_params):
+        if param['param_type'] == 'MAP':
+            map_idx = idx
+        elif param['param_type'] == 'CVP':
+            cvp_idx = idx
+
+    if map_idx is None or cvp_idx is None:
+        raise ValueError("Could not find MAP or CVP indices in physiological parameters")
+
+    print(f"MAP index: {map_idx}, CVP index: {cvp_idx}")
+
+    # Process each patient
+    all_prediction_targets = {}
+    patients_processed = 0
+    total_targets_created = 0
+
+    for stay_id, trajectories in tqdm(all_med_trajectories.items(), desc="Creating prediction targets"):
+        patient_targets = []
+
+        # Process each trajectory (except the last one which has no prediction window)
+        for traj_num in range(len(trajectories) - 1):
+            # Load the corresponding p_out tensor
+            p_out_path = Path(p_tensor_dir) / f"p_tensor_out_{int(stay_id)}_traj_{traj_num:03d}.pt"
+
+            if not p_out_path.exists():
+                print(f"Warning: p_out tensor not found for patient {stay_id}, trajectory {traj_num}")
+                continue
+
+            # Load p_out tensor
+            p_out_values, p_out_mask, p_out_abs_time, p_out_rel_time, p_out_len = torch.load(p_out_path)
+
+            # Extract only MAP and CVP columns
+            pred_values = torch.stack([
+                p_out_values[:, map_idx],  # MAP
+                p_out_values[:, cvp_idx]  # CVP
+            ], dim=1)
+
+            pred_mask = torch.stack([
+                p_out_mask[:, map_idx],  # MAP mask
+                p_out_mask[:, cvp_idx]  # CVP mask
+            ], dim=1)
+
+            # Save prediction target tensor
+            pred_target_path = Path(cache_dir) / f"prediction_target_{int(stay_id)}_traj_{traj_num:03d}.pt"
+            torch.save(
+                (pred_values, pred_mask, p_out_abs_time, p_out_rel_time, p_out_len),
+                pred_target_path
+            )
+
+            # Store metadata
+            patient_targets.append({
+                'stay_id': stay_id,
+                'trajectory_num': traj_num,
+                'length': p_out_len,
+                'has_map_data': torch.any(pred_mask[:, 0] > 0).item(),
+                'has_cvp_data': torch.any(pred_mask[:, 1] > 0).item(),
+                'file_path': str(pred_target_path)
+            })
+
+            total_targets_created += 1
+
+        if patient_targets:
+            all_prediction_targets[stay_id] = patient_targets
+            patients_processed += 1
+
+            # Save debug CSV for specific patient
+            if int(stay_id) == debug_patient_id:
+                save_prediction_target_debug_csv(
+                    stay_id, patient_targets, trajectories, cache_dir
+                )
+
+    print(f"\nPrediction target creation complete:")
+    print(f"Total patients processed: {patients_processed}")
+    print(f"Total prediction targets created: {total_targets_created}")
+
+    # Save metadata
+    metadata = {
+        'all_prediction_targets': all_prediction_targets,
+        'map_idx': map_idx,
+        'cvp_idx': cvp_idx,
+        'total_targets': total_targets_created,
+        'source': 'extracted_from_p_out_tensors'
+    }
+
+    metadata_file = Path(cache_dir) / "prediction_target_metadata.pkl"
+    with open(metadata_file, "wb") as f:
+        pickle.dump(metadata, f)
+
+    print(f"\nSaved metadata to {metadata_file}")
+
+    return all_prediction_targets
+
+
+def save_prediction_target_debug_csv(stay_id, patient_targets, trajectories, output_dir):
+    """
+    Save debug CSV files for a specific patient's prediction targets.
+    """
+    debug_dir = Path(output_dir) / f"patient_{stay_id}_prediction_targets"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save summary of all prediction windows
+    summary_data = []
+
+    for target_info in patient_targets:
+        traj_num = target_info['trajectory_num']
+
+        # Load the tensor to get more details
+        pred_values, pred_mask, _, _, pred_len = torch.load(target_info['file_path'])
+
+        summary_data.append({
+            'trajectory_num': traj_num,
+            'length': pred_len,
+            'has_map_data': target_info['has_map_data'],
+            'has_cvp_data': target_info['has_cvp_data'],
+            'map_measurements': torch.sum(pred_mask[:, 0]).item(),
+            'cvp_measurements': torch.sum(pred_mask[:, 1]).item(),
+            'map_mean': torch.mean(pred_values[pred_mask[:, 0] > 0, 0]).item() if target_info['has_map_data'] else None,
+            'cvp_mean': torch.mean(pred_values[pred_mask[:, 1] > 0, 1]).item() if target_info['has_cvp_data'] else None
+        })
+
+        # Save individual prediction window
+        window_df = pd.DataFrame({
+            'time_idx': range(pred_len),
+            'MAP_value': pred_values[:, 0].numpy(),
+            'MAP_mask': pred_mask[:, 0].numpy(),
+            'CVP_value': pred_values[:, 1].numpy(),
+            'CVP_mask': pred_mask[:, 1].numpy()
+        })
+        window_df.to_csv(debug_dir / f'prediction_window_traj_{traj_num:03d}.csv', index=False)
+
+    # Save summary
+    summary_df = pd.DataFrame(summary_data)
+    summary_df.to_csv(debug_dir / 'prediction_windows_summary.csv', index=False)
+
+    print(f"Saved debug CSV files for patient {stay_id} to {debug_dir}")
+
+
+
+
 def main():
     # Heart Rate: 220045
     # MAP: 220052
@@ -2903,6 +3086,13 @@ def main():
         cache_dir='../../data/initial_conditions',
         n_workers=4,
         debug_patient_id=32128372  # Patient to save debug CSV for
+    )
+
+    prediction_targets = create_prediction_target_tensors_simple(
+        trajectory_metadata_path="../../data/med_tensors/trajectory_metadata.pkl",
+        p_tensor_dir='../../data/p_tensors',
+        cache_dir='../../data/prediction_targets',
+        debug_patient_id=32128372
     )
 
 

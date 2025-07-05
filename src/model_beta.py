@@ -618,18 +618,36 @@ class Hybrid_VAE_SDE(LightningModule):
 
     def training_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0: print(f"[DEBUG] Hybrid_VAE_SDE training_step: batch_idx={batch_idx}, first_element_type={type(batch[0])}")
-        #print("TRAINING")
         X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
         batch_size = X.shape[0]
 
+        # Let encoder run (for learning/regularization)
         X_for_encoder = self._prepare_encoder_input(X, init_states)
-        
-        z1_input, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
-        
-        latent_traj, logqp_path, i_ext_path = self.forward_latent(init_latents = z1_input, 
-                                                                    ts = time_post[0, :], 
-                                                                    Tx = T,
-                                                                    time_to_tx = torch.zeros(batch_size).to(self.device))
+        z1_encoder, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
+
+        # BUT OVERRIDE with your actual initial conditions!
+        # Extract the expert dimensions from init_states
+        expert_init = init_states[:, 2:8]  # [p_a, p_v, s_reflex, sv, r_tpr_mod, ...]
+
+        # If encoder has additional latent dims beyond expert dims
+        if self.encoder_SDENN_dims > 0:
+            # Keep encoder's extra latents, but use your IC for expert dims
+            encoder_extra = z1_encoder[:, :, self.expert_latent_dims:]
+            z1_override = torch.cat([
+                expert_init.unsqueeze(1).repeat(1, self.num_samples, 1),
+                encoder_extra
+            ], dim=-1)
+        else:
+            # Just use your IC
+            z1_override = expert_init.unsqueeze(1).repeat(1, self.num_samples, 1)
+
+        # Use YOUR initial conditions for the ODE
+        latent_traj, logqp_path, i_ext_path = self.forward_latent(
+            init_latents=z1_override,  # Your IC instead of encoder output
+            ts=time_post[0, :],
+            Tx=T,
+            time_to_tx=torch.zeros(batch_size).to(self.device)
+        )
         
         #print('latent_traj', latent_traj.shape)
         decoded_traj = self.forward_dec(latent_traj)
