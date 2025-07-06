@@ -19,7 +19,7 @@ from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
 
 #from CV_data_6_new import create_load_save_data, CVDataModule_final
 from CV_data_beta import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
-from src.MIMIC_data import MIMICDataModule
+from MIMIC_data import MIMICDataModule
 
 from model_beta import Hybrid_VAE_SDE
 from utils_beta import process_input
