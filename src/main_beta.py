@@ -137,6 +137,11 @@ def main(args):
                                       num_workers=0)
         data_module.setup()
         unique_dir_name = f"MIMIC_DATA_seed={args.seed}" # Simplified name for now
+
+        dataset_params = dict()
+        # predict MAP and CVP
+        dataset_params['post_treatment_dims'] = 2
+        dataset_params['normalize'] = True
     else:
         raise ValueError("Invalid dataset_type specified. Choose 'synthetic' or 'mimic'.")
 
@@ -259,8 +264,8 @@ if __name__ == '__main__':
 
     # Data specific args
     parser.add_argument('--dataset_type', type=str, default='synthetic', choices=['synthetic', 'mimic'], help='Which dataset to use.')
-    parser.add_argument('--data_root', type=str, default='data', help='Root directory for MIMIC preprocessed data.')
-    parser.add_argument('--icu_stays_path', type=str, default='data/icustays.csv', help='Path to icustays.csv file.')
+    parser.add_argument('--data_root', type=str, default='../data/processed_data', help='Root directory for MIMIC preprocessed data.')
+    parser.add_argument('--icu_stays_path', type=str, default='data/input_data/icustays.csv', help='Path to icustays.csv file.')
     parser.add_argument('--normalise', type=bool, default=False, help='Whether to normalise the data. Recommended ONLY if using an Encoder')
     parser.add_argument('--noise_std', type=float, default=0.0, help='Noise defines how noisy the data is ')
     parser.add_argument('--non_confounded_effect', type=bool, default=False, help='Whether to add non-confounded unsee effect on the treatment (increases the noise of the prediction)')

@@ -13,6 +13,7 @@ class MIMICDataset(Dataset):
         self.p_tensor_dir = os.path.join(data_root, 'p_tensors')
         self.m_tensor_dir = os.path.join(data_root, 'med_tensors')
         self.ic_tensor_dir = os.path.join(data_root, 'initial_conditions')
+        self.target_tensor_dir = os.path.join(data_root, 'prediction_targets')
         
         # Load metadata
         ic_metadata_path = os.path.join(self.ic_tensor_dir, 'initial_conditions_metadata.pkl')
@@ -24,7 +25,7 @@ class MIMICDataset(Dataset):
 
         # Each trajectory from the metadata (which corresponds to a t0) is a sample
         self.samples = []
-        for stay_id, trajectories in self.all_initial_conditions.items():
+        for hadm_id, trajectories in self.all_initial_conditions.items():
             if not trajectories: continue
             
             # The preprocessing script that creates p_in/p_out only runs for trajectories that have a "next" one.
@@ -35,7 +36,7 @@ class MIMICDataset(Dataset):
                 for i in range(len(sorted_trajs) - 1):
                     traj_info = sorted_trajs[i]
                     self.samples.append({
-                        'stay_id': stay_id,
+                        'hadm_id': hadm_id,
                         'traj_num': traj_info['trajectory_num'],
                     })
 
@@ -62,35 +63,38 @@ class MIMICDataset(Dataset):
 
     def __getitem__(self, idx):
         sample_info = self.samples[idx]
-        stay_id = sample_info['stay_id']
+        hadm_id = sample_info['hadm_id']
         traj_num = sample_info['traj_num']
 
-        p_in_path = os.path.join(self.p_tensor_dir, f"p_tensor_in_{stay_id}_traj_{traj_num:03d}.pt")
+        p_in_path = os.path.join(self.p_tensor_dir, f"p_tensor_in_{hadm_id}_traj_{traj_num:03d}.pt")
         p_in_values, p_in_mask, p_in_abs_time, p_in_rel_time, p_in_len = torch.load(p_in_path)
         
-        ic_path = os.path.join(self.ic_tensor_dir, f"ic_tensor_{stay_id}_traj_{traj_num:03d}.pt")
+        ic_path = os.path.join(self.ic_tensor_dir, f"ic_tensor_{hadm_id}_traj_{traj_num:03d}.pt")
         ic_tensor, ic_mask_tensor = torch.load(ic_path)
         
-        m_path = os.path.join(self.m_tensor_dir, f"med_tensor_{stay_id}_traj_{traj_num:03d}.pt")
+        m_path = os.path.join(self.m_tensor_dir, f"med_tensor_{hadm_id}_traj_{traj_num:03d}.pt")
         med_tensor_in, _, _, _, _ = torch.load(m_path)
         
-        p_out_path = os.path.join(self.p_tensor_dir, f"p_tensor_out_{stay_id}_traj_{traj_num:03d}.pt")
+        p_out_path = os.path.join(self.target_tensor_dir, f"prediction_target_{hadm_id}_traj_{traj_num:03d}.pt")
         p_out_values, _, p_out_abs_time, p_out_rel_time, _ = torch.load(p_out_path)
-        
-        # The output trajectory Y_fact is just p_out_values
-        Y_fact = p_out_values
+
         # The time for Y should be relative to t0
         t_Y = p_out_rel_time - p_out_rel_time[0] if len(p_out_rel_time) > 0 else p_out_rel_time
 
         # The full trajectory for evaluation/plotting is p_in and p_out concatenated
-        full_fact_traj = torch.cat([p_in_values, p_out_values], dim=0)
+        # Pad p_out_values with zeros for the missing 3 features
+        p_out_padded = torch.cat([
+            p_out_values,
+            torch.zeros(p_out_values.shape[0], 3)  # or torch.full((p_out_values.shape[0], 3), float('nan'))
+        ], dim=1)
+        full_fact_traj = torch.cat([p_in_values, p_out_padded], dim=0)
         t_full = torch.cat([p_in_rel_time, p_out_rel_time])
 
         return {
             "X": p_in_values,
-            "Y_fact": Y_fact,
+            "Y_fact": p_out_values,
             "T": torch.tensor(1.0), # Assuming treatment for all MIMIC data for now
-            "Y_cf": torch.zeros_like(Y_fact), # No counterfactuals in real data
+            "Y_cf": torch.zeros_like(p_out_values), # No counterfactuals in real data
             "p": torch.tensor(0.0), # Propensity score not applicable here
             "init_state": ic_tensor,
             "t_X": p_in_rel_time,
