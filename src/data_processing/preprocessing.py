@@ -56,7 +56,7 @@ def parse_args():
 
 def find_relevant_patients(measurements, MAP_id = 220052, load_path_events = "../../data/chartevents.csv",
                           load_path_stays = "../../data/icustays.csv",  save_path = "../../data/treated_patients_chartevents.parquet",
-                          data_limit=1000000):
+                          data_limit=None):
     """
     Finds all potentially relevant patients by filtering on those that have had a blood pressure event and
     that have stayed in the ICU for over 24h.
@@ -72,16 +72,18 @@ def find_relevant_patients(measurements, MAP_id = 220052, load_path_events = "..
             dataset containing all occurrences of the treatment to be used to filter patients
     """
     if not os.path.exists(save_path):
-        long_stays = (pl.scan_csv(load_path_stays).limit(data_limit)
-                      .filter(pl.col("los") > 1)
-                      .collect())
+        long_stays_query = pl.scan_csv(load_path_stays)
+        treated_patients_query = pl.scan_csv(load_path_events)
+        if data_limit is not None:
+            long_stays_query = long_stays_query.limit(data_limit)
+            treated_patients_query = treated_patients_query.limit(data_limit)
+
+        long_stays = (long_stays_query.filter(pl.col("los") > 1).collect())
         long_stays_id = long_stays["hadm_id"].unique().to_list()
-        # Find patients with a blood pressure event
-        treated_patients = (pl.scan_csv(load_path_events).limit(data_limit)
-                       .filter(pl.col("hadm_id").is_in(long_stays_id))
-                       .filter(pl.col("itemid") == MAP_id)
-                       .filter(pl.col("value").cast(pl.Float64, strict=False) < 70)
-                       .collect())
+        treated_patients = (treated_patients_query.filter(pl.col("hadm_id").is_in(long_stays_id))
+                                .filter(pl.col("itemid") == MAP_id)
+                                .filter(pl.col("value").cast(pl.Float64, strict=False) < 70)
+                                .collect())
 
         treated_patients_all_values = read_large_csv_with_polars(load_path_events, treated_patients, measurements, data_limit=data_limit)
         treated_patients_all_values.write_parquet(save_path)
@@ -92,7 +94,7 @@ def find_relevant_patients(measurements, MAP_id = 220052, load_path_events = "..
 
     return treated_patients_all_values
 
-def read_large_csv_with_polars(load_path, ids_df, measurements, id_column='hadm_id', item_column = 'itemid', data_limit=1000000):
+def read_large_csv_with_polars(load_path, ids_df, measurements, id_column='hadm_id', item_column = 'itemid', data_limit=None):
     """
     Function to get all measurements from patients that have had the treatment
     Args:
@@ -109,13 +111,15 @@ def read_large_csv_with_polars(load_path, ids_df, measurements, id_column='hadm_
 
     valid_ids = ids_df[id_column].unique().to_list()
     ids_df.write_parquet("../../data/temp.parquet")
-    # Polars handles large files much better
+    query = pl.scan_csv(load_path)
+    if data_limit is not None:
+        query = query.limit(data_limit)
     result = (
-        pl.scan_csv(load_path).limit(data_limit)
-        .filter(pl.col(id_column).is_in(valid_ids))
+        query.filter(pl.col(id_column).is_in(valid_ids))
         .filter(pl.col(item_column).is_in(measurements))
         .collect()
     )
+
     return result
 
 
@@ -156,11 +160,13 @@ def find_relevant_inputevents(all_patients_chartevents, save_path, events, input
         schema_overrides = {
             'totalamount': pl.Float64  # or pl.Float32 if you want less precision
         }
+        query = pl.scan_csv(inputevents_path, schema_overrides=schema_overrides)
+        if data_limit is not None:
+            query = query.limit(data_limit)
+        all_patients_inputevents = (query.filter(pl.col(patient_id).is_in(patients))
+                                        .filter(pl.col(item_column).is_in(events))
+                                        .collect())
 
-        all_patients_inputevents = (pl.scan_csv(inputevents_path, schema_overrides=schema_overrides).limit(data_limit)
-                                    .filter(pl.col(patient_id).is_in(patients))
-                                    .filter(pl.col(item_column).is_in(events))
-                                    .collect())
         all_patients_inputevents.write_parquet(save_path)
         print(f"Saved new dataset to {save_path}")
     else:
