@@ -194,6 +194,7 @@ def main(args):
                            adjoint = args.adjoint,
                            plot_every = args.plot_every, 
                            batch_size = args.batch_size,
+                           dataset = args.dataset_type,
                            debug = args.debug # <<< Pass debug flag >>>
     )
     if DEBUG: print(f"[DEBUG] main_beta.py: Hybrid_VAE_SDE model initialized.")

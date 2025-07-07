@@ -57,6 +57,7 @@ class Hybrid_VAE_SDE(LightningModule):
                 KL_weighting_SDE,
                 #admin
                 train_dir, learning_rate, log_wandb, adjoint, plot_every, batch_size,
+                dataset,
                 debug=False # <<< Add debug flag >>>
                 ):
         super().__init__()
@@ -161,6 +162,7 @@ class Hybrid_VAE_SDE(LightningModule):
         ### DECODER
         self.decoder_output_dims = decoder_output_dims
         self.normalised_data = normalised_data
+        self.dataset = dataset
 
         ### LOSS
         self.MSE_loss = nn.MSELoss(reduction = "none")
@@ -618,7 +620,10 @@ class Hybrid_VAE_SDE(LightningModule):
 
     def training_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0: print(f"[DEBUG] Hybrid_VAE_SDE training_step: batch_idx={batch_idx}, first_element_type={type(batch[0])}")
-        X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
+        if self.dataset == "mimic":
+            X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, meds_in = batch
+        else:
+            X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
         batch_size = X.shape[0]
 
         # Let encoder run (for learning/regularization)
@@ -665,7 +670,10 @@ class Hybrid_VAE_SDE(LightningModule):
     def validation_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0: print(f"[DEBUG] Hybrid_VAE_SDE validation_step: batch_idx={batch_idx}")
         #print("VALIDATION")
-        X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
+        if self.dataset == "mimic":
+            X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, meds_in = batch
+        else:
+            X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
         batch_size = X.shape[0]
 
         X_for_encoder = self._prepare_encoder_input(X, init_states)
@@ -690,7 +698,10 @@ class Hybrid_VAE_SDE(LightningModule):
     def test_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0: print(f"[DEBUG] Hybrid_VAE_SDE test_step: batch_idx={batch_idx}")
         #print("TEST")
-        X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
+        if self.dataset == "mimic":
+            X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, meds_in = batch
+        else:
+            X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
         batch_size = X.shape[0]
 
         X_for_encoder = self._prepare_encoder_input(X, init_states)
