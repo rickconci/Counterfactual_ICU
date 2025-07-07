@@ -20,7 +20,7 @@ import argparse
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Process MIMIC-III data for ICU patient trajectories')
+    parser = argparse.ArgumentParser(description='Process MIMIC-IV data for ICU patient trajectories')
 
     # Time interval parameters
     parser.add_argument('--interval-minutes', type=int, default=5,
@@ -49,13 +49,15 @@ def parse_args():
                         help='Limit on number of rows to read from CSV files (default: None for unlimited)')
 
     # Output directories
-    parser.add_argument('--output-dir', type=str, default='../../data',
-                        help='Base output directory (default: ../../data)')
+    parser.add_argument('--output-dir', type=str, default='../../data/processed_data',
+                        help='Base output directory (default: ../../data/processed_data)')
+    parser.add_argument('--input-dir', type=str, default='../../data/input_data',
+                        help='Base input directory (default: ../../input_data)')
 
     return parser.parse_args()
 
-def find_relevant_patients(measurements, MAP_id = 220052, load_path_events = "../../data/chartevents.csv",
-                          load_path_stays = "../../data/icustays.csv",  save_path = "../../data/treated_patients_chartevents.parquet",
+def find_relevant_patients(measurements, MAP_id = 220052, load_path_events = "../../data/input_data/chartevents.csv",
+                          load_path_stays = "../../data/input_data/icustays.csv",  save_path = "../../data/processed_data/treated_patients_chartevents.parquet",
                           data_limit=None):
     """
     Finds all potentially relevant patients by filtering on those that have had a blood pressure event and
@@ -110,7 +112,6 @@ def read_large_csv_with_polars(load_path, ids_df, measurements, id_column='hadm_
     """
 
     valid_ids = ids_df[id_column].unique().to_list()
-    ids_df.write_parquet("../../data/temp.parquet")
     query = pl.scan_csv(load_path)
     if data_limit is not None:
         query = query.limit(data_limit)
@@ -153,8 +154,8 @@ def find_min_max_heartrates(all_patients_path, save_path, metadata_path, hr_ID =
     return hr_params
 
 
-def find_relevant_inputevents(all_patients_chartevents, save_path, events, inputevents_path = "../../data/inputevents.csv",
-                             patient_id = "hadm_id", item_column = "itemid", data_limit=1000000):
+def find_relevant_inputevents(all_patients_chartevents, save_path, events, inputevents_path = "../../data/input_data/inputevents.csv",
+                             patient_id = "hadm_id", item_column = "itemid", data_limit=None):
     if not os.path.exists(save_path):
         patients = all_patients_chartevents[patient_id].unique().to_list()
         schema_overrides = {
@@ -196,11 +197,11 @@ def analyze_icu_stays(icustays_path='../../data/icustays.csv'):
     return icustays_df['los'].describe()
 
 
-def debug_specific_patient(parquet_path='../../data/treated_patients_inputevents.parquet',
+def debug_specific_patient(parquet_path='../../data/processed_data/treated_patients_inputevents.parquet',
                             itemid=225158,
                             hadm_id=20214994,
-                            output_file='../../data/debug_inputevents.csv',
-                            chartevents_path = '../../data/treated_patients_chartevents.parquet'):
+                            output_file='../../data/processed_data/debug_inputevents.csv',
+                            chartevents_path = '../../data/processed_data/treated_patients_chartevents.parquet'):
     """
     Extract and examine all records for a specific itemid and hadm_id
     """
@@ -232,7 +233,7 @@ def debug_specific_patient(parquet_path='../../data/treated_patients_inputevents
             print(f"  {row['starttime']} -> {row['endtime']}: {row['rate']} mL/hr ({row['statusdescription']})")
 
     chartevents = pl.scan_parquet(chartevents_path).filter(pl.col("hadm_id") == hadm_id).collect()
-    chartevents.write_csv("../../data/debug_chartevents.csv")
+    chartevents.write_csv("../../data/processed_data/debug_chartevents.csv")
 
     return filtered
 
@@ -246,10 +247,15 @@ def process_single_patient_physio(
         interval_minutes,
         icu_admission_time,
         trajectory_boundaries,
-        cache_dir
+        cache_dir,
+        save_prediction_targets=True,
+        prediction_target_dir="../../data/processed_data/prediction_targets"
 ):
     """
     Process physiological measurements for a single patient and save as trajectory tensors.
+
+    Now optionally saves prediction target tensors (MAP and CVP only) at the same time
+    to avoid re-reading p_out tensors later.
 
     Uses the same trajectory boundaries as medication tensors (based on t0 triggers).
 
@@ -369,6 +375,8 @@ def process_single_patient_physio(
 
     # Save each trajectory using the provided boundaries
     trajectory_info = []
+    prediction_target_info = []  # NEW: Track prediction target info
+
     # Loop up to the second to last boundary to define p_out
     for traj_num in range(len(trajectory_boundaries) - 1):
         # Current trajectory defines p_in
@@ -411,12 +419,39 @@ def process_single_patient_physio(
         p_out_abs_time_tensor = torch.from_numpy(p_out_abs_time).float()
         p_out_rel_time_tensor = torch.from_numpy(p_out_rel_time).float()
 
-        # Save p_out tensor
-        file_path_out = os.path.join(cache_dir, f"p_tensor_out_{int(hadm_id)}_traj_{traj_num:03d}.pt")
-        torch.save(
-            (p_out_values_tensor, p_out_mask_tensor, p_out_abs_time_tensor, p_out_rel_time_tensor, p_out_len),
-            file_path_out
-        )
+        # NEW: Save prediction target tensor if requested
+        if save_prediction_targets and prediction_target_dir is not None:
+            if map_idx is not None and cvp_idx is not None:
+                # Extract only MAP and CVP from p_out
+                pred_values = torch.stack([
+                    p_out_values_tensor[:, map_idx],  # MAP
+                    p_out_values_tensor[:, cvp_idx]  # CVP
+                ], dim=1)
+
+                pred_mask = torch.stack([
+                    p_out_mask_tensor[:, map_idx],  # MAP mask
+                    p_out_mask_tensor[:, cvp_idx]  # CVP mask
+                ], dim=1)
+
+                # Save prediction target tensor
+                pred_target_path = os.path.join(
+                    prediction_target_dir,
+                    f"prediction_target_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+                )
+                torch.save(
+                    (pred_values, pred_mask, p_out_abs_time_tensor, p_out_rel_time_tensor, p_out_len),
+                    pred_target_path
+                )
+
+                # Store metadata
+                prediction_target_info.append({
+                    'hadm_id': hadm_id,
+                    'trajectory_num': traj_num,
+                    'length': p_out_len,
+                    'has_map_data': torch.any(pred_mask[:, 0] > 0).item(),
+                    'has_cvp_data': torch.any(pred_mask[:, 1] > 0).item(),
+                    'file_path': pred_target_path
+                })
 
         # Calculate trajectory metadata
         has_any_data_in = np.any(p_in_mask > 0)
@@ -435,11 +470,14 @@ def process_single_patient_physio(
             'end_time_hours': rel_time_array[end_idx_out - 1] if end_idx_out > 0 else 0,
             'has_physio_data_in': has_any_data_in,
             'has_physio_data_out': has_any_data_out,
-            'file_path_in': file_path_in,
-            'file_path_out': file_path_out
+            'file_path_in': file_path_in
         })
 
-    return (hadm_id, trajectory_info)
+    # NEW: Return prediction target info if created
+    if save_prediction_targets:
+        return (hadm_id, trajectory_info, prediction_target_info)
+    else:
+        return (hadm_id, trajectory_info)
 
 def save_patient_physio_as_csv_with_rtpr(
         hadm_id,
@@ -486,6 +524,7 @@ def save_patient_physio_as_csv_with_rtpr(
     # Track CO values for r_tpr calculation
     co_values_array = np.zeros((n_intervals,), dtype=np.float32)
     co_mask_array = np.zeros((n_intervals,), dtype=np.float32)
+    co_count_array = np.zeros((n_intervals,), dtype=np.int32)
 
     # Process each physiological parameter (except r_tpr)
     for idx, param_info in enumerate(physio_params):
@@ -521,9 +560,14 @@ def save_patient_physio_as_csv_with_rtpr(
                     if co_mask_array[time_idx] == 0:
                         co_values_array[time_idx] = row['value']
                         co_mask_array[time_idx] = 1.0
+                        co_count_array[time_idx] = 1  # ADD THIS!
                     else:
-                        current_val = co_values_array[time_idx]
-                        co_values_array[time_idx] = (current_val + row['value']) / 2
+                        # FIXED: Use proper running average
+                        current_count = co_count_array[time_idx]
+                        current_sum = co_values_array[time_idx] * current_count
+                        new_count = current_count + 1
+                        co_values_array[time_idx] = (current_sum + row['value']) / new_count
+                        co_count_array[time_idx] = new_count
 
     # Calculate r_tpr
     if r_tpr_idx is not None and map_idx is not None and cvp_idx is not None:
@@ -638,20 +682,22 @@ def create_physio_tensors(
         co_itemids,
         trajectory_metadata_path,
         time_interval_minutes=5,
-        icustays_path='../../data/icustays.csv',
-        los_data_path='../../data/icustays.csv',
-        cache_dir='../../data/p_tensors',
+        icustays_path='../../data/input_data/icustays.csv',
+        los_data_path='../../data/input_data/icustays.csv',
+        cache_dir='../../data/processed_data/p_tensors',
+        prediction_target_dir='../../data/processed_data/prediction_targets',  # NEW
         n_workers=4,
         max_co_age_minutes=10,
-        co_guess=4.0
+        co_guess=4.0,
+        debug_patient_id=20214994  # NEW: Add debug patient parameter
 ):
     """
     Create physiological measurement tensors aligned with medication trajectories.
-    Now accepts max_co_age_minutes and co_guess as parameters.
+    Now also creates prediction target tensors (MAP and CVP) at the same time.
     """
-    # [Rest of function remains the same, just uses the parameters instead of hardcoded values]
-    # Create cache directory
+    # Create cache directories
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    Path(prediction_target_dir).mkdir(parents=True, exist_ok=True)  # NEW
 
     # Load trajectory metadata from medication processing
     print("Loading medication trajectory metadata...")
@@ -787,17 +833,22 @@ def create_physio_tensors(
 
     # Process each patient
     all_physio_trajectory_info = {}
+    all_prediction_targets = {}  # NEW: Track prediction targets
 
-    # Update the process_func to include co_itemids
+    # Update the process_func to include prediction target saving
     process_func = partial(
         process_single_patient_physio,
         chartevents_path=str(temp_prepared_path),
         physio_params=physio_params,
-        co_itemids=co_itemids,  # Pass CO itemids for r_tpr calculation
+        co_itemids=co_itemids,
         n_intervals=n_intervals,
         interval_minutes=time_interval_minutes,
-        cache_dir=cache_dir
+        cache_dir=cache_dir,
+        save_prediction_targets=True,  # NEW
+        prediction_target_dir=prediction_target_dir  # NEW
     )
+
+    # In create_physio_tensors, for BOTH parallel and sequential processing:
 
     if n_workers > 1:
         # Parallel processing
@@ -832,7 +883,41 @@ def create_physio_tensors(
                 hadm_id = futures[future]
                 try:
                     result = future.result()
-                    all_physio_trajectory_info[result[0]] = result[1]
+                    if len(result) == 3:
+                        all_physio_trajectory_info[result[0]] = result[1]
+                        all_prediction_targets[result[0]] = result[2]
+                    else:
+                        all_physio_trajectory_info[result[0]] = result[1]
+
+                    # Save physio inspection CSV for debug patient
+                    if int(hadm_id) == debug_patient_id:
+                        # Need to retrieve the trajectory boundaries again
+                        med_trajectories = all_med_trajectories.get(hadm_id, [])
+                        trajectory_boundaries = [(traj['start_idx'], traj['end_idx'])
+                                                 for traj in med_trajectories]
+                        admission_time = stay_admission_map.get(hadm_id)
+
+                        if admission_time is not None:
+                            save_patient_physio_as_csv_with_rtpr(
+                                hadm_id=hadm_id,
+                                chartevents_path=str(temp_prepared_path),
+                                physio_params=physio_params,
+                                co_itemids=co_itemids,
+                                n_intervals=n_intervals,
+                                interval_minutes=time_interval_minutes,
+                                icu_admission_time=admission_time,
+                                trajectory_boundaries=trajectory_boundaries,
+                                output_dir=cache_dir
+                            )
+
+                    # Save prediction target debug CSV for specific patient
+                    if int(hadm_id) == debug_patient_id and hadm_id in all_prediction_targets:
+                        save_prediction_target_debug_csv(
+                            hadm_id,
+                            all_prediction_targets[hadm_id],
+                            all_med_trajectories.get(hadm_id, []),
+                            prediction_target_dir
+                        )
                 except Exception as exc:
                     print(f'Hadm ID {hadm_id} generated an exception: {exc}')
                     import traceback
@@ -857,14 +942,50 @@ def create_physio_tensors(
                     trajectory_boundaries=trajectory_boundaries,
                     icu_admission_time=admission_time
                 )
-                all_physio_trajectory_info[result[0]] = result[1]
+                if len(result) == 3:
+                    all_physio_trajectory_info[result[0]] = result[1]
+                    all_prediction_targets[result[0]] = result[2]
+                else:
+                    all_physio_trajectory_info[result[0]] = result[1]
 
+                # Save physio inspection CSV for debug patient
+                if int(hadm_id) == debug_patient_id:
+                    save_patient_physio_as_csv_with_rtpr(
+                        hadm_id=hadm_id,
+                        chartevents_path=str(temp_prepared_path),
+                        physio_params=physio_params,
+                        co_itemids=co_itemids,
+                        n_intervals=n_intervals,
+                        interval_minutes=time_interval_minutes,
+                        icu_admission_time=admission_time,
+                        trajectory_boundaries=trajectory_boundaries,
+                        output_dir=cache_dir
+                    )
+
+                # Save prediction target debug CSV for specific patient
+                if int(hadm_id) == debug_patient_id and hadm_id in all_prediction_targets:
+                    save_prediction_target_debug_csv(
+                        hadm_id,
+                        all_prediction_targets[hadm_id],
+                        med_trajectories,
+                        prediction_target_dir
+                    )
+
+    # After processing, add a note about what debug files were saved
+    if debug_patient_id in all_physio_trajectory_info:
+        print(
+            f"\nPhysio inspection CSVs saved for patient {debug_patient_id} in {cache_dir}/patient_{debug_patient_id}_physio_inspection/")
+    if debug_patient_id in all_prediction_targets:
+        print(
+            f"Prediction target CSVs saved for patient {debug_patient_id} in {prediction_target_dir}/patient_{debug_patient_id}_prediction_targets/")
     # Calculate summary statistics
     total_trajectories = sum(len(traj_list) for traj_list in all_physio_trajectory_info.values())
+    total_prediction_targets = sum(len(traj_list) for traj_list in all_prediction_targets.values())  # NEW
 
     print(f"\nProcessing complete:")
     print(f"Total patients processed: {len(all_physio_trajectory_info)}")
     print(f"Total physio trajectories created: {total_trajectories}")
+    print(f"Total prediction targets created: {total_prediction_targets}")  # NEW
 
     temp_prepared_path.unlink(missing_ok=True)
 
@@ -884,8 +1005,32 @@ def create_physio_tensors(
     with open(metadata_file, "wb") as f:
         pickle.dump(physio_metadata, f)
 
+    # NEW: Save prediction target metadata
+    # Find MAP and CVP indices for metadata
+    map_idx = None
+    cvp_idx = None
+    for idx, param in enumerate(physio_params):
+        if param['param_type'] == 'MAP':
+            map_idx = idx
+        elif param['param_type'] == 'CVP':
+            cvp_idx = idx
+
+    prediction_metadata = {
+        'all_prediction_targets': all_prediction_targets,
+        'map_idx': map_idx,
+        'cvp_idx': cvp_idx,
+        'total_targets': total_prediction_targets,
+        'source': 'created_with_physio_tensors'
+    }
+
+    pred_metadata_file = Path(prediction_target_dir) / "prediction_target_metadata.pkl"
+    with open(pred_metadata_file, "wb") as f:
+        pickle.dump(prediction_metadata, f)
+
     print(f"\nSaved physio trajectory metadata to {metadata_file}")
+    print(f"Saved prediction target metadata to {pred_metadata_file}")
     print(f"Saved {total_trajectories} physio trajectory tensors to {cache_dir}")
+    print(f"Saved {total_prediction_targets} prediction target tensors to {prediction_target_dir}")
 
     return all_physio_trajectory_info
 
@@ -1365,9 +1510,9 @@ def create_medication_tensors(
         time_interval_minutes=5,
         trajectory_before_minutes=None,
         trajectory_after_minutes=0,
-        icustays_path='../../data/icustays.csv',
-        los_data_path='../../data/icustays.csv',
-        cache_dir='../../data/med_tensors',
+        icustays_path='../../data/input_data/icustays.csv',
+        los_data_path='../../data/input_data/icustays.csv',
+        cache_dir='../../data/processed_data/med_tensors',
         n_workers=4,
         debug_patient_id=20214994):
     """
@@ -2214,10 +2359,10 @@ def create_initial_condition_tensors(
         physio_params,
         medication_info,
         co_itemids,
-        icustays_path='../../data/icustays.csv',
+        icustays_path='../../data/input_data/icustays.csv',
         max_co_age_minutes=10,
         co_guess=4.0,
-        cache_dir='../../data/initial_conditions',
+        cache_dir='../../data/processed_data/initial_conditions',
         n_workers=4,
         debug_patient_id=20214994):
     """
@@ -2391,141 +2536,6 @@ def create_initial_condition_tensors(
 
     return all_initial_conditions
 
-def create_prediction_target_tensors_simple(
-        trajectory_metadata_path,
-        p_tensor_dir='../../data/p_tensors',
-        cache_dir='../../data/prediction_targets',
-        debug_patient_id=20214994):
-    """
-    Create prediction target tensors by extracting MAP and CVP from existing p_out tensors.
-
-    Since p_out already contains the physiological data for the prediction window
-    (from end of current trajectory to end of next trajectory), we just need to
-    extract the MAP and CVP columns.
-
-    Parameters:
-    - trajectory_metadata_path: Path to medication trajectory metadata
-    - p_tensor_dir: Directory containing p_out tensors
-    - cache_dir: Directory to save prediction target tensors
-    - debug_patient_id: Patient ID to save debug info for
-
-    Returns:
-    - Dictionary containing prediction target information
-    """
-    # Create cache directory
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-
-    # Load trajectory metadata to get patient list
-    print("Loading trajectory metadata...")
-    with open(trajectory_metadata_path, 'rb') as f:
-        med_trajectory_data = pickle.load(f)
-
-    all_med_trajectories = med_trajectory_data['all_trajectories']
-
-    # Load physio metadata to get parameter indices
-    physio_metadata_path = Path(p_tensor_dir) / "physio_trajectory_metadata.pkl"
-    with open(physio_metadata_path, 'rb') as f:
-        physio_metadata = pickle.load(f)
-
-    physio_params = physio_metadata['physio_params']
-
-    # Find MAP and CVP indices
-    map_idx = None
-    cvp_idx = None
-
-    for idx, param in enumerate(physio_params):
-        if param['param_type'] == 'MAP':
-            map_idx = idx
-        elif param['param_type'] == 'CVP':
-            cvp_idx = idx
-
-    if map_idx is None or cvp_idx is None:
-        raise ValueError("Could not find MAP or CVP indices in physiological parameters")
-
-    print(f"MAP index: {map_idx}, CVP index: {cvp_idx}")
-
-    # Process each patient
-    all_prediction_targets = {}
-    patients_processed = 0
-    total_targets_created = 0
-
-    for hadm_id, trajectories in tqdm(all_med_trajectories.items(), desc="Creating prediction targets"):
-        patient_targets = []
-
-        # Process each trajectory (except the last one which has no prediction window)
-        for traj_num in range(len(trajectories) - 1):
-            # Load the corresponding p_out tensor
-            p_out_path = Path(p_tensor_dir) / f"p_tensor_out_{int(hadm_id)}_traj_{traj_num:03d}.pt"
-
-            if not p_out_path.exists():
-                print(f"Warning: p_out tensor not found for patient {hadm_id}, trajectory {traj_num}")
-                continue
-
-            # Load p_out tensor
-            p_out_values, p_out_mask, p_out_abs_time, p_out_rel_time, p_out_len = torch.load(p_out_path)
-
-            # Extract only MAP and CVP columns
-            pred_values = torch.stack([
-                p_out_values[:, map_idx],  # MAP
-                p_out_values[:, cvp_idx]  # CVP
-            ], dim=1)
-
-            pred_mask = torch.stack([
-                p_out_mask[:, map_idx],  # MAP mask
-                p_out_mask[:, cvp_idx]  # CVP mask
-            ], dim=1)
-
-            # Save prediction target tensor
-            pred_target_path = Path(cache_dir) / f"prediction_target_{int(hadm_id)}_traj_{traj_num:03d}.pt"
-            torch.save(
-                (pred_values, pred_mask, p_out_abs_time, p_out_rel_time, p_out_len),
-                pred_target_path
-            )
-
-            # Store metadata
-            patient_targets.append({
-                'hadm_id': hadm_id,
-                'trajectory_num': traj_num,
-                'length': p_out_len,
-                'has_map_data': torch.any(pred_mask[:, 0] > 0).item(),
-                'has_cvp_data': torch.any(pred_mask[:, 1] > 0).item(),
-                'file_path': str(pred_target_path)
-            })
-
-            total_targets_created += 1
-
-        if patient_targets:
-            all_prediction_targets[hadm_id] = patient_targets
-            patients_processed += 1
-
-            # Save debug CSV for specific patient
-            if int(hadm_id) == debug_patient_id:
-                save_prediction_target_debug_csv(
-                    hadm_id, patient_targets, trajectories, cache_dir
-                )
-
-    print(f"\nPrediction target creation complete:")
-    print(f"Total patients processed: {patients_processed}")
-    print(f"Total prediction targets created: {total_targets_created}")
-
-    # Save metadata
-    metadata = {
-        'all_prediction_targets': all_prediction_targets,
-        'map_idx': map_idx,
-        'cvp_idx': cvp_idx,
-        'total_targets': total_targets_created,
-        'source': 'extracted_from_p_out_tensors'
-    }
-
-    metadata_file = Path(cache_dir) / "prediction_target_metadata.pkl"
-    with open(metadata_file, "wb") as f:
-        pickle.dump(metadata, f)
-
-    print(f"\nSaved metadata to {metadata_file}")
-
-    return all_prediction_targets
-
-
 def save_prediction_target_debug_csv(hadm_id, patient_targets, trajectories, output_dir):
     """
     Save debug CSV files for a specific patient's prediction targets.
@@ -2569,10 +2579,6 @@ def save_prediction_target_debug_csv(hadm_id, patient_targets, trajectories, out
 
     print(f"Saved debug CSV files for patient {hadm_id} to {debug_dir}")
 
-
-
-
-
 def main():
     # Heart Rate: 220045
     # MAP: 220052
@@ -2610,12 +2616,15 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    input_dir = Path(args.input_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
+
     # Define paths based on output directory
     relevant_patients_chartevents_path = output_dir / "treated_patients_chartevents.parquet"
-    patient_metadata_path = output_dir / "patients.csv"
+    patient_metadata_path = input_dir / "patients.csv"
     hr_params_path = output_dir / "hr_params.csv"
     relevant_patients_inputevents_path = output_dir / "treated_patients_inputevents.parquet"
-    icustays_path = output_dir / "icustays.csv"
+    icustays_path = input_dir / "icustays.csv"
 
     # Define the lists (these should match what was used in process_mimic_data)
     crystalloids_list = [225158, 225159, 225161]  # NaCl 0.9%, 0.45%, 3%
@@ -2677,9 +2686,11 @@ def main():
         trajectory_metadata_path=str(output_dir / "med_tensors" / "trajectory_metadata.pkl"),
         time_interval_minutes=args.interval_minutes,
         cache_dir=str(output_dir / "p_tensors"),
+        prediction_target_dir=str(output_dir / "prediction_targets"),  # NEW: Add this
         n_workers=args.n_workers,
         max_co_age_minutes=args.max_co_age_minutes,
-        co_guess=args.co_guess
+        co_guess=args.co_guess,
+        debug_patient_id=args.debug_patient_id  # NEW: Add this
     )
 
     #summarize_medication_matrix(meds_matrix)
@@ -2720,14 +2731,6 @@ def main():
         co_guess=args.co_guess,
         cache_dir=str(output_dir / "initial_conditions"),
         n_workers=args.n_workers,
-        debug_patient_id=args.debug_patient_id
-    )
-
-    # Create prediction targets
-    prediction_targets = create_prediction_target_tensors_simple(
-        trajectory_metadata_path=str(output_dir / "med_tensors" / "trajectory_metadata.pkl"),
-        p_tensor_dir=str(output_dir / "p_tensors"),
-        cache_dir=str(output_dir / "prediction_targets"),
         debug_patient_id=args.debug_patient_id
     )
 
