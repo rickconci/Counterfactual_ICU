@@ -2579,6 +2579,138 @@ def save_prediction_target_debug_csv(hadm_id, patient_targets, trajectories, out
 
     print(f"Saved debug CSV files for patient {hadm_id} to {debug_dir}")
 
+def preprocess_baseline_values(df, 
+                               id_col='hadm_id',
+                               categorical_features=None, 
+                               continuous_features=None, 
+                               binary_features=None,
+                               drop_first=True):
+    """
+    Preprocess baseline values for deep learning input while preserving a unique identifier.
+    """
+    # Create a copy of the input dataframe and set the identifier as the index.
+    processed_df = df.copy()
+    if id_col in processed_df.columns:
+        processed_df.set_index(id_col, inplace=True)
+    
+    # Process categorical features with one-hot encoding and ensure 0/1 integer values.
+    if categorical_features is not None:
+        dummies = pd.get_dummies(processed_df[categorical_features], drop_first=drop_first, dummy_na=False).astype(int)
+    else:
+        dummies = pd.DataFrame(index=processed_df.index)
+    
+    # Process continuous features ensuring they are numeric and scale them.
+    if continuous_features is not None:
+        continuous = processed_df[continuous_features].astype(float)
+        # Normalize continuous features
+        for col in continuous.columns:
+            mean = continuous[col].mean()
+            std = continuous[col].std()
+            continuous[col] = (continuous[col] - mean) / std
+    else:
+        continuous = pd.DataFrame(index=processed_df.index)
+        
+    # Process binary features and convert them to integer 0 or 1.
+    if binary_features is not None:
+        binary = processed_df[binary_features].apply(pd.to_numeric, errors='coerce').fillna(0).astype(int)
+    else:
+        binary = pd.DataFrame(index=processed_df.index)
+    
+    # Combine the processed parts into one DataFrame.
+    final_df = pd.concat([continuous, binary, dummies], axis=1)
+    
+    return final_df
+
+def create_baseline_tensors(input_dir, output_dir, trajectory_metadata_path):
+    """
+    Load, merge, preprocess, and save static baseline features for each patient.
+    """
+    print("\nCreating baseline feature tensors...")
+
+    # Load trajectory metadata to get the list of hadm_id's we actually have trajectories for.
+    with open(trajectory_metadata_path, 'rb') as f:
+        trajectory_data = pickle.load(f)
+    valid_hadm_ids = list(trajectory_data['all_trajectories'].keys())
+    print(f"Found {len(valid_hadm_ids)} patients with trajectories.")
+
+    # Load raw MIMIC data tables from the 'hosp' module
+    patients_path = os.path.join(input_dir, 'hosp', 'patients.csv')
+    admission_path = os.path.join(input_dir, 'hosp', 'admissions.csv')
+    transfers_path = os.path.join(input_dir, 'hosp', 'transfers.csv')
+
+    try:
+        patients_df = pd.read_csv(patients_path)
+        admission_df = pd.read_csv(admission_path)
+        transfers_df = pd.read_csv(transfers_path)
+    except FileNotFoundError as e:
+        print(f"Error: Could not find a required MIMIC 'hosp' file. Make sure your input directory is correct.")
+        print(f"File not found: {e.filename}")
+        return
+        
+    # Merge admissions with patients to get age and gender
+    merged_df = pd.merge(admission_df, patients_df, on='subject_id', how='left')
+    
+    # Calculate patient age at the time of admission
+    merged_df['admittime'] = pd.to_datetime(merged_df['admittime'])
+    merged_df['anchor_year'] = pd.to_datetime(merged_df['anchor_year'], format='%Y').dt.year
+    merged_df['age'] = merged_df['admittime'].dt.year - merged_df['anchor_year'] + merged_df['anchor_age']
+
+    # Merge with transfers to get discharge time
+    merged_df = pd.merge(merged_df, transfers_df, on=['hadm_id', 'subject_id'], how='left')
+    
+    # Calculate admission duration in days
+    merged_df['dischtime'] = pd.to_datetime(merged_df['dischtime'])
+    merged_df['admit_duration'] = (merged_df['dischtime'] - merged_df['admittime']).dt.total_seconds() / (3600*24)
+    
+    # Filter by the valid hadm_ids that have trajectories
+    merged_df_final_filtered = merged_df[merged_df['hadm_id'].isin(valid_hadm_ids)]
+    
+    # Apply additional filters as requested
+    merged_with_disch_df_final_filtered = merged_df_final_filtered[merged_df_final_filtered['admit_duration'] <= 10]
+    merged_with_disch_df_final_filtered = merged_with_disch_df_final_filtered[merged_with_disch_df_final_filtered['admit_duration'] >= 2]
+
+    print(f"Found {len(merged_with_disch_df_final_filtered)} patients after duration filtering (2-10 days).")
+    
+    # Define feature lists for preprocessing
+    categorical_features = ['gender', 'race', 'marital_status', 
+                            'insurance', 'language', 'admission_location', 'admission_type']
+    continuous_features = ['age', 'admit_duration']
+    binary_features = [] # None specified in example
+
+    # Preprocess the baseline data
+    processed_baseline_df = preprocess_baseline_values(
+        merged_with_disch_df_final_filtered, 
+        id_col='hadm_id',
+        categorical_features=categorical_features, 
+        continuous_features=continuous_features, 
+        binary_features=binary_features, 
+        drop_first=True
+    )
+    
+    # Save a tensor for each patient
+    baseline_dir = Path(output_dir) / "baseline_tensors"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    
+    saved_count = 0
+    for hadm_id, row in processed_baseline_df.iterrows():
+        tensor = torch.tensor(row.values, dtype=torch.float32)
+        torch.save(tensor, baseline_dir / f"baseline_{hadm_id}.pt")
+        saved_count += 1
+
+    print(f"Saved {saved_count} baseline tensors to {baseline_dir}")
+
+    # Save metadata for the dataloader and model
+    baseline_metadata = {
+        'feature_names': list(processed_baseline_df.columns),
+        'feature_dim': len(processed_baseline_df.columns)
+    }
+    metadata_file = baseline_dir / "baseline_metadata.pkl"
+    with open(metadata_file, "wb") as f:
+        pickle.dump(baseline_metadata, f)
+    
+    print(f"Saved baseline metadata to {metadata_file}")
+    print(f"Baseline feature dimension: {baseline_metadata['feature_dim']}")
+
 def main():
     # Heart Rate: 220045
     # MAP: 220052
@@ -2706,7 +2838,9 @@ def main():
     # Detect t0 points and create training data
     #training_data = detect_t0(results_df, crystalloids_list, vasopressors_list)
     df = debug_specific_patient()
-    with open(output_dir / "med_tensors" / "trajectory_metadata.pkl", 'rb') as f:
+    med_trajectory_metadata_path = str(output_dir / "med_tensors" / "trajectory_metadata.pkl")
+
+    with open(med_trajectory_metadata_path, 'rb') as f:
         med_metadata = pickle.load(f)
     medication_info = med_metadata['medication_info']
 
@@ -2733,6 +2867,14 @@ def main():
         n_workers=args.n_workers,
         debug_patient_id=args.debug_patient_id
     )
+
+    # NEW: Create baseline tensors after all other data is processed
+    create_baseline_tensors(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        trajectory_metadata_path=med_trajectory_metadata_path
+    )
+
 
     print("\nProcessing complete!")
 

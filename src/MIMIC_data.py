@@ -14,6 +14,7 @@ class MIMICDataset(Dataset):
         self.m_tensor_dir = os.path.join(data_root, 'med_tensors')
         self.ic_tensor_dir = os.path.join(data_root, 'initial_conditions')
         self.target_tensor_dir = os.path.join(data_root, 'prediction_targets')
+        self.baseline_tensor_dir = os.path.join(data_root, 'baseline_tensors') # New
         
         # Load metadata
         ic_metadata_path = os.path.join(self.ic_tensor_dir, 'initial_conditions_metadata.pkl')
@@ -26,8 +27,14 @@ class MIMICDataset(Dataset):
         # Each trajectory from the metadata (which corresponds to a t0) is a sample
         self.samples = []
         for hadm_id, trajectories in self.all_initial_conditions.items():
-            if not trajectories: continue
+            if not trajectories:
+                 continue
             
+            # Check if a baseline tensor exists for this hadm_id
+            baseline_path = os.path.join(self.baseline_tensor_dir, f"baseline_{hadm_id}.pt")
+            if not os.path.exists(baseline_path):
+                continue
+
             # The preprocessing script that creates p_in/p_out only runs for trajectories that have a "next" one.
             # So, we only consider trajectories up to the second to last one for each patient stay.
             # The 'trajectory_num' in the metadata corresponds to the t0 event.
@@ -81,6 +88,11 @@ class MIMICDataset(Dataset):
         # The time for Y should be relative to t0
         t_Y = p_out_rel_time - p_out_rel_time[0] if len(p_out_rel_time) > 0 else p_out_rel_time
 
+        # --- New: Load static features from pre-made tensor ---
+        baseline_path = os.path.join(self.baseline_tensor_dir, f"baseline_{hadm_id}.pt")
+        static_feats = torch.load(baseline_path)
+        # --- End new ---
+
         # The full trajectory for evaluation/plotting is p_in and p_out concatenated
         # Pad p_out_values with zeros for the missing 3 features
         p_out_padded = torch.cat([
@@ -92,11 +104,13 @@ class MIMICDataset(Dataset):
 
         return {
             "X": p_in_values,
+            "X_mask": p_in_mask,
             "Y_fact": p_out_values,
             "T": torch.tensor(1.0), # Assuming treatment for all MIMIC data for now
             "Y_cf": torch.zeros_like(p_out_values), # No counterfactuals in real data
             "p": torch.tensor(0.0), # Propensity score not applicable here
             "init_state": ic_tensor,
+            "static": static_feats, # New
             "t_X": p_in_rel_time,
             "t_Y": t_Y,
             "t_full": t_full,
@@ -114,11 +128,20 @@ class MIMICDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.encoder_input_dim = None
         self.expert_latent_dim = None
+        self.static_input_dim = None # New
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
             self.train_dataset = MIMICDataset(self.data_root, self.icu_stays_path, split='train')
             self.val_dataset = MIMICDataset(self.data_root, self.icu_stays_path, split='val')
+
+            # --- New: Get static dim from metadata ---
+            baseline_metadata_path = os.path.join(self.data_root, 'baseline_tensors', 'baseline_metadata.pkl')
+            if os.path.exists(baseline_metadata_path):
+                with open(baseline_metadata_path, 'rb') as f:
+                    baseline_meta = pickle.load(f)
+                    self.static_input_dim = baseline_meta['feature_dim']
+            # --- End New ---
 
             if len(self.train_dataset) > 0:
                 sample0 = self.train_dataset[0]
@@ -131,6 +154,13 @@ class MIMICDataModule(L.LightningDataModule):
                 sample0 = self.test_dataset[0]
                 self.encoder_input_dim = sample0['X'].shape[-1]
                 self.expert_latent_dim = sample0['full_fact_traj'].shape[-1]
+                # Also set static dim if not set
+                if self.static_input_dim is None:
+                    baseline_metadata_path = os.path.join(self.data_root, 'baseline_tensors', 'baseline_metadata.pkl')
+                    if os.path.exists(baseline_metadata_path):
+                        with open(baseline_metadata_path, 'rb') as f:
+                            baseline_meta = pickle.load(f)
+                            self.static_input_dim = baseline_meta['feature_dim']
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers, collate_fn=self.collate_fn)
@@ -144,8 +174,8 @@ class MIMICDataModule(L.LightningDataModule):
     @staticmethod
     def collate_fn(batch):
         # Separate keys that need padding from those that don't
-        pad_keys = ["X", "Y_fact", "Y_cf", "t_X", "t_Y", "t_full", "full_fact_traj", "full_CF_traj", "meds_in"]
-        no_pad_keys = ["T", "p", "init_state"]
+        pad_keys = ["X", "X_mask", "Y_fact", "Y_cf", "t_X", "t_Y", "t_full", "full_fact_traj", "full_CF_traj", "meds_in"]
+        no_pad_keys = ["T", "p", "init_state", "static"]
 
         collated = {}
         
@@ -161,13 +191,14 @@ class MIMICDataModule(L.LightningDataModule):
         # The model expects a tuple/list of tensors, not a dict
         # The order must match the unpacking in the training_step
         ordered_keys = [
-            'X', 'Y_fact', 'T', 'Y_cf', 'p', 'init_state', 
+            'X', 'X_mask', 'Y_fact', 'T', 'Y_cf', 'p', 'init_state', 
             't_X', 't_Y', 't_full', 'full_fact_traj', 'full_CF_traj'
         ]
         
-        # We also have 'meds_in' which is not in the original model input
+        # We also have 'meds_in' and 'static' which are not in the original model input
         # We will append it at the end and modify the model to accept it.
         
         return_list = [collated[k] for k in ordered_keys]
         return_list.append(collated['meds_in'])
+        return_list.append(collated['static'])
         return tuple(return_list) 

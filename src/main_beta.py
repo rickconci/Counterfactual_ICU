@@ -154,7 +154,7 @@ def main(args):
                            #Encoder
                            encoder_input_dim =  data_module.encoder_input_dim, 
                            encoder_hidden_dim = args.encoder_hidden_dim,
-                           expert_latent_dims  = data_module.expert_latent_dim,
+                           expert_latent_dims  = 16, # Fixed by the ODE model
                            encoder_SDENN_dims = 0 if args.use_encoder == 'none' else args.encoder_SDENN_dims,
 
                            use_2_5std_encoder_minmax = args.use_2_5std_encoder_minmax,
@@ -162,6 +162,11 @@ def main(args):
                            variational_encoder = args.variational_encoder,
                            encoder_w_time = args.encoder_w_time,
                            encoder_reverse_time = args.encoder_reverse_time,
+                           
+                           # New static fusion params
+                           static_input_dim = data_module.static_input_dim,
+                           static_hidden_dim = args.static_hidden_dim,
+                           fusion_hidden_dim = args.fusion_hidden_dim,
 
                            #SDE params
                            num_samples = args.num_samples,
@@ -267,6 +272,8 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_type', type=str, default='synthetic', choices=['synthetic', 'mimic'], help='Which dataset to use.')
     parser.add_argument('--data_root', type=str, default='../data/processed_data', help='Root directory for MIMIC preprocessed data.')
     parser.add_argument('--icu_stays_path', type=str, default='data/input_data/icustays.csv', help='Path to icustays.csv file.')
+    parser.add_argument('--static_hidden_dim', type=int, default=16, help='Hidden dimension for the static encoder MLP.')
+    parser.add_argument('--fusion_hidden_dim', type=int, default=32, help='Hidden dimension for the fusion MLP.')
     parser.add_argument('--normalise', type=bool, default=False, help='Whether to normalise the data. Recommended ONLY if using an Encoder')
     parser.add_argument('--noise_std', type=float, default=0.0, help='Noise defines how noisy the data is ')
     parser.add_argument('--non_confounded_effect', type=bool, default=False, help='Whether to add non-confounded unsee effect on the treatment (increases the noise of the prediction)')
@@ -276,7 +283,7 @@ if __name__ == '__main__':
     #PRIMARY Bifurcation args
     parser.add_argument('--gamma', type=int, default=6, help='Gamma defines how confounded the data is. the higher, the less overlap. the lower the more overlap')
     parser.add_argument('--confounder_type', type=str, default='partial_hard', choices=['visible', 'partial', 'partial_hard', 'invisible'], help='the type of confounding present')
-    parser.add_argument('--use_encoder', type=str, default='none', choices=['full', 'partial', 'none'], help='what to do with the encoder!')
+    parser.add_argument('--use_encoder', type=str, default='none', choices=['full', 'partial', 'none', 'raindrop'], help='what to do with the encoder!')
 
     parser.add_argument('--SDEnet_hidden_dim', type=int, default=300, help='Hidden dim for SDE NN  ')
     parser.add_argument('--SDEnet_depth', type=int, default=6, help='Num layeres for SDE NN  ')
