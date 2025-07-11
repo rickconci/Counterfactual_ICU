@@ -17,4 +17,4 @@ __pycache__/
 lightning_logs/
 wandb/
 model_checkpoints/
-data_created/
+data/input_data/

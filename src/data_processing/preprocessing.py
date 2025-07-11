@@ -705,23 +705,29 @@ def create_physio_tensors(
         med_trajectory_data = pickle.load(f)
 
     all_med_trajectories = med_trajectory_data['all_trajectories']
-    med_n_intervals = med_trajectory_data['n_intervals']
 
-    # Load length of stay data
-    print("Loading length of stay data...")
-    los_df = pl.read_csv(los_data_path)
-    max_los_days = los_df['los'].max()
-    max_minutes = max_los_days * 24 * 60
-    max_intervals = int(np.ceil(max_minutes / time_interval_minutes))
+    trajectory_before_minutes = med_trajectory_data.get('trajectory_before_minutes')
+    trajectory_after_minutes = med_trajectory_data.get('trajectory_after_minutes', 0)
 
-    print(f"Maximum intervals: {max_intervals} (based on max LOS of {max_los_days:.2f} days)")
-
-    # Verify interval settings match
-    if max_intervals != med_n_intervals:
-        print(f"Warning: Physio max_intervals ({max_intervals}) differs from medication ({med_n_intervals})")
-        n_intervals = max(max_intervals, med_n_intervals)
+    # Calculate n_intervals based on trajectory window configuration
+    if trajectory_before_minutes is not None:
+        # Fixed window trajectories - all have the same length
+        total_minutes = trajectory_before_minutes + trajectory_after_minutes
+        n_intervals = int(np.ceil(total_minutes / time_interval_minutes))
+        print(
+            f"Using fixed trajectory windows: {trajectory_before_minutes} min before + {trajectory_after_minutes} min after t0")
+        print(f"All trajectories will have {n_intervals} intervals ({total_minutes} minutes)")
     else:
-        n_intervals = max_intervals
+        # Variable length trajectories (from admission to t0) - need max based on actual data
+        # Use the n_intervals from medication metadata which was already calculated correctly
+        n_intervals = med_trajectory_data['n_intervals']
+        print(f"Using variable trajectory windows (admission to t0)")
+        print(f"Maximum intervals: {n_intervals}")
+
+    # Rest of the function continues as before...
+    # Load ICU stays data
+    print("Loading ICU stays data...")
+    icustays_df = pl.read_csv(icustays_path)
 
     # Load ICU stays data
     print("Loading ICU stays data...")
@@ -1270,15 +1276,7 @@ def save_patient_data_as_csv(
 ):
     """
     Save all data for a single patient as CSV files for inspection.
-
-    Creates the following CSV files:
-    - values.csv: Medication rates over time
-    - mask.csv: Mask values over time
-    - time.csv: Time information
-    - trajectories.csv: Trajectory metadata
     """
-    import pandas as pd
-    from pathlib import Path
 
     # Create output directory
     patient_dir = Path(output_dir) / f"patient_{hadm_id}_inspection"
@@ -1296,8 +1294,8 @@ def save_patient_data_as_csv(
         # Check if we have the required columns
         if med_df_patient.height == 0:
             print(f"No medication data found for patient {hadm_id}")
-            # Create empty CSVs
-            time_array = np.arange(n_intervals) * interval_minutes / 60.0
+            # Create empty CSVs with minimal data
+            time_array = np.arange(1) * interval_minutes / 60.0  # Just one row
 
             # Create column names
             col_names = []
@@ -1328,13 +1326,7 @@ def save_patient_data_as_csv(
         print(f"Error reading data for CSV save for patient {hadm_id}: {e}")
         return patient_dir
 
-    # Verify required columns exist
-    required_cols = ['itemid', 'rate', 'start_idx', 'end_idx']
-    missing_cols = [col for col in required_cols if col not in med_df_patient.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}. Available columns: {med_df_patient.columns}")
-
-    # Process patient data (same as process_single_patient_medications)
+    # Process patient data (same logic as process_single_patient_medications)
     # Initialize arrays
     n_medications = len(medication_info) + 2
     values_array = np.zeros((n_intervals, n_medications), dtype=np.float32)
@@ -1413,17 +1405,12 @@ def save_patient_data_as_csv(
     if np.any(has_data):
         actual_length = np.where(has_data)[0][-1] + 1
     else:
-        actual_length = 0
+        actual_length = 1  # At least one row
 
     # Truncate arrays to actual length for CSV
-    if actual_length > 0:
-        values_to_save = values_array[:actual_length]
-        mask_to_save = mask_array[:actual_length]
-        time_to_save = rel_time_array[:actual_length]
-    else:
-        values_to_save = values_array[:1]  # At least one row
-        mask_to_save = mask_array[:1]
-        time_to_save = rel_time_array[:1]
+    values_to_save = values_array[:actual_length]
+    mask_to_save = mask_array[:actual_length]
+    time_to_save = rel_time_array[:actual_length]
 
     # Create column names
     col_names = []
@@ -1449,13 +1436,16 @@ def save_patient_data_as_csv(
         'interval_index': np.arange(len(time_to_save)),
         'time_hours': time_to_save,
         'time_minutes': time_to_save * 60,
-        'icu_admission_time': icu_admission_time
+        'icu_admission_time': str(icu_admission_time)
     })
     time_df.to_csv(patient_dir / 'time.csv', index=False)
 
     # Extract and save trajectory information
     trajectories = extract_trajectories_from_patient(
-        values_array, mask_array, abs_time_array, rel_time_array, t0_trigger_idx
+        values_array, mask_array, abs_time_array, rel_time_array, t0_trigger_idx,
+        trajectory_before_minutes=None,  # Use default for CSV output
+        trajectory_after_minutes=0,
+        interval_minutes=interval_minutes
     )
 
     traj_data = []
@@ -1469,18 +1459,19 @@ def save_patient_data_as_csv(
             'start_idx': start_idx,
             'end_idx': end_idx,
             'length': end_idx - start_idx,
-            'start_time_hours': 0.0,
-            'end_time_hours': rel_time_array[end_idx - 1] if end_idx > 0 else 0,
+            'start_time_hours': rel_time_array[start_idx] if start_idx < len(rel_time_array) else 0,
+            'end_time_hours': rel_time_array[end_idx - 1] if end_idx > 0 and end_idx <= len(rel_time_array) else 0,
             'has_t0_trigger': has_t0_at_end
         })
 
-    traj_df = pd.DataFrame(traj_data)
-    traj_df.to_csv(patient_dir / 'trajectories.csv', index=False)
+    if traj_data:
+        traj_df = pd.DataFrame(traj_data)
+        traj_df.to_csv(patient_dir / 'trajectories.csv', index=False)
 
     # Save summary information
     summary_data = {
         'hadm_id': [hadm_id],
-        'icu_admission_time': [icu_admission_time],
+        'icu_admission_time': [str(icu_admission_time)],
         'total_intervals': [n_intervals],
         'interval_minutes': [interval_minutes],
         'actual_data_length': [actual_length],
@@ -1502,7 +1493,6 @@ def save_patient_data_as_csv(
 
     return patient_dir
 
-
 def create_medication_tensors(
         inputevents_path,
         crystalloid_itemids,
@@ -1521,40 +1511,38 @@ def create_medication_tensors(
     # Create cache directory
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
-    # Load length of stay data to determine max intervals
-    print("Loading length of stay data...")
-    los_df = pl.read_csv(los_data_path)
-
-    # Verify 'los' column exists
-    if 'los' not in los_df.columns:
-        raise ValueError(f"Column 'los' not found in {los_data_path}. Available columns: {los_df.columns}")
-
-    # Get maximum length of stay in days
-    max_los_days = los_df['los'].max()
-    print(f"Maximum length of stay: {max_los_days:.2f} days")
-
-    # Convert to minutes and calculate required intervals
-    max_minutes = max_los_days * 24 * 60  # Convert days to minutes
-    max_intervals = int(np.ceil(max_minutes / time_interval_minutes))
-
-    print(f"Maximum intervals needed: {max_intervals} "
-          f"(based on max LOS of {max_los_days:.2f} days with {time_interval_minutes}-min intervals)")
-
-    # Print trajectory window configuration
-    if trajectory_before_minutes is None:
-        print("Trajectory window: from ICU admission to t0")
-    else:
-        print(
-            f"Trajectory window: {trajectory_before_minutes} minutes before t0 to {trajectory_after_minutes} minutes after t0")
-
-    # Use the time interval parameter directly
     interval_minutes = time_interval_minutes
-    n_intervals = max_intervals
-    total_hours = (n_intervals * interval_minutes) / 60
-    total_days = total_hours / 24
 
-    print(f"Using {n_intervals} intervals of {interval_minutes} minutes each")
-    print(f"Total time span: {total_hours:.1f} hours ({total_days:.1f} days)")
+    # Calculate n_intervals based on trajectory configuration
+    if trajectory_before_minutes is not None:
+        # Fixed window trajectories - calculate intervals from window size
+        total_window_minutes = trajectory_before_minutes + trajectory_after_minutes
+        n_intervals = int(np.ceil(total_window_minutes / interval_minutes))
+
+        print(f"Using fixed trajectory windows:")
+        print(f"  {trajectory_before_minutes} minutes before t0")
+        print(f"  {trajectory_after_minutes} minutes after t0")
+        print(f"  Total window: {total_window_minutes} minutes")
+        print(f"  Number of intervals: {n_intervals} (at {interval_minutes} minutes each)")
+
+        # Don't need max_los_days for fixed windows
+        max_los_days = None
+    else:
+        # Variable length trajectories - need to check maximum LOS
+        print("Using variable trajectory windows (ICU admission to t0)")
+        print("Loading length of stay data...")
+
+        los_df = pl.read_csv(los_data_path)
+        if 'los' not in los_df.columns:
+            raise ValueError(f"Column 'los' not found in {los_data_path}. Available columns: {los_df.columns}")
+
+        max_los_days = los_df['los'].max()
+        max_minutes = max_los_days * 24 * 60
+        n_intervals = int(np.ceil(max_minutes / interval_minutes))
+
+        print(f"Maximum length of stay: {max_los_days:.2f} days")
+        print(f"Maximum intervals needed: {n_intervals} "
+              f"(based on max LOS with {interval_minutes}-min intervals)")
 
     # Load ICU stays data
     print("\nLoading ICU stays data...")
@@ -1750,7 +1738,6 @@ def create_medication_tensors(
         'all_trajectories': all_trajectory_info,
         'medication_info': medication_info,
         'n_intervals': n_intervals,
-        'max_intervals': max_intervals,
         'interval_minutes': interval_minutes,
         'max_los_days': max_los_days,
         'trajectory_before_minutes': trajectory_before_minutes,
@@ -2002,7 +1989,11 @@ def extract_initial_conditions_for_patient(
     # For medications, we need step-wise interpolation since rates are constant during infusion
     for idx, med_info in enumerate(medication_info):
         itemid = med_info['itemid']
-        med_events = med_df_patient.filter(pl.col('itemid') == itemid).sort('start_minutes')
+        if med_df_patient.height > 0 and 'start_minutes' in med_df_patient.columns:
+            med_events = med_df_patient.filter(pl.col('itemid') == itemid).sort('start_minutes')
+        else:
+            # No medication data for this patient
+            med_events = pl.DataFrame()
 
         if med_events.height > 0:
             # Create time-rate pairs for step function
@@ -2634,9 +2625,9 @@ def create_baseline_tensors(input_dir, output_dir, trajectory_metadata_path):
     print(f"Found {len(valid_hadm_ids)} patients with trajectories.")
 
     # Load raw MIMIC data tables from the 'hosp' module
-    patients_path = os.path.join(input_dir, 'hosp', 'patients.csv')
-    admission_path = os.path.join(input_dir, 'hosp', 'admissions.csv')
-    transfers_path = os.path.join(input_dir, 'hosp', 'transfers.csv')
+    patients_path = os.path.join(input_dir, 'patients.csv')
+    admission_path = os.path.join(input_dir, 'admissions.csv')
+    transfers_path = os.path.join(input_dir, 'transfers.csv')
 
     try:
         patients_df = pd.read_csv(patients_path)
