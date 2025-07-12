@@ -16,10 +16,10 @@ device = get_device()
 
 def select_tensor_by_index_list_advanced(tensor, index_list):
     # Convert index list to a tensor of type long
-    indices = torch.tensor(index_list, dtype=torch.long).to(device)
-    
-    # Select along the last dimension using torch.index_select
-    selected_tensor = torch.index_select(tensor, -1, indices).to(tensor)
+    indices = torch.tensor(index_list, dtype=torch.long, device=tensor.device)
+
+    # Use index_select to gather the specified indices
+    selected_tensor = torch.index_select(tensor, -1, indices)
     
     return selected_tensor
     
@@ -63,24 +63,34 @@ def sigmoid(x):
     return 1 / (1 + torch.exp(-x))
 
 
-def normalise_expert_data( y):
-        #print('y to normalise', y.shape, y[0, :])
-        #print('CV_params_prior_mu', CV_params_prior_mu)
-        #print('CV_params_prior_sigma', CV_params_prior_sigma)
-        keys = [
-            'pa', 'pv', 's', 'sv', 
-            'r_tpr_mod', 'f_hr_max', 'f_hr_min', 
-            'r_tpr_max', 'r_tpr_min', 
-            'ca', 'cv', 'k_width', 'p_aset', 'tau'
-        ]
-        normalized_tensors = []
-        for i, key in enumerate(keys):
-            normalized_tensor = ((y[:, i] - CV_params_prior_mu[key]) / CV_params_prior_sigma[key]).unsqueeze(1)
+def normalise_expert_data(y):
+    # If first 2 dims are NN outputs, we should skip them
+    nn_output_dims = 2  # Number of NN output dimensions
+
+    keys = [
+        'pa', 'pv', 's', 'sv',
+        'r_tpr_mod', 'f_hr_max', 'f_hr_min',
+        'r_tpr_max', 'r_tpr_min',
+        'ca', 'cv', 'k_width', 'p_aset', 'tau'
+    ]
+
+    normalized_tensors = []
+
+    # First, keep the NN outputs as-is (or normalize them differently if needed)
+    for i in range(nn_output_dims):
+        normalized_tensors.append(y[:, i].unsqueeze(1))
+
+    # Then normalize the CV parameters starting from the correct index
+    for i, key in enumerate(keys):
+        # Offset by nn_output_dims to get the correct dimension
+        actual_idx = i + nn_output_dims
+        if actual_idx < y.shape[1]:  # Safety check
+            normalized_tensor = ((y[:, actual_idx] - CV_params_prior_mu[key]) / CV_params_prior_sigma[key]).unsqueeze(1)
             normalized_tensors.append(normalized_tensor)
-        
-        SDE_NN_norm_inputs = torch.cat(normalized_tensors, dim=-1)
-        
-        return SDE_NN_norm_inputs
+
+    SDE_NN_norm_inputs = torch.cat(normalized_tensors, dim=-1)
+
+    return SDE_NN_norm_inputs
 
 
 def sigmoid_scale( z0, use_2_5std_encoder_minmax):

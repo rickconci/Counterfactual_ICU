@@ -101,15 +101,18 @@ class Hybrid_VAE_SDE(LightningModule):
         if use_encoder == 'raindrop':
             # For Raindrop, d_model is its internal feature size.
             # Its output before projection will be d_model + d_pe if sensor_wise_mask is False
+            # TODO not quite sure if this is still right
             temporal_embedding_dim = encoder_hidden_dim + 16 # d_model + d_pe
+            # TODO make static true and give complete adj matrix
             self.temporal_encoder = Raindrop_v2(
                 d_inp=encoder_input_dim,
                 d_model=encoder_hidden_dim, 
                 output_dim=temporal_embedding_dim, # Not used since we commented out final layer
                 nhead=4, 
-                nhid=128, 
+                nhid=128,
+                global_structure=torch.ones(encoder_input_dim, encoder_input_dim), #pass a complete adj matrix
                 nlayers=encoder_num_layers,
-                static=False, 
+                static=True,
                 debug=self.debug
             )
         elif use_encoder != 'none':
@@ -229,23 +232,24 @@ class Hybrid_VAE_SDE(LightningModule):
         self.mse_data_cf = [[] for _ in range(batch_size)]
         
     def forward_enc(self, input_vals, time_in, static=None, lengths=None):
-        if self.debug: print(f"[DEBUG] Hybrid_VAE_SDE forward_enc: input_vals_shape={input_vals.shape}, time_in_shape={time_in.shape}, use_encoder={self.use_encoder}")
+        if self.debug: print(
+            f"[DEBUG] Hybrid_VAE_SDE forward_enc: input_vals_shape={input_vals.shape}, time_in_shape={time_in.shape}, use_encoder={self.use_encoder}")
 
         if self.use_encoder == 'raindrop':
-            # Raindrop expects src shape [maxlen, batch_size, features]
-            # It also needs static features and lengths.
-            z1, _, _ = self.enc_model(src=input_vals, static=static, times=time_in, lengths=lengths)
-            # Raindrop doesn't produce a logvar, and its second output is 'distance' which we ignore here.
+            # Fix: should be self.temporal_encoder, not self.enc_model
+            z1, _, _ = self.temporal_encoder(src=input_vals, static=static, times=time_in, lengths=lengths)
             return z1, None, 0
 
         elif self.use_encoder != 'none':
             if self.start_dec_at_treatment:
                 if self.variational_encoder:
-                    z1_mean, z1_logvar = self.enc_model(input_vals, time_in)
+                    # Fix: should be self.temporal_encoder
+                    z1_mean, z1_logvar = self.temporal_encoder(input_vals, time_in)
                     z1 = z1_mean.unsqueeze(1).repeat(1, self.num_samples, 1)
                     logqp0 = 0
                 else:
-                    z1 = self.enc_model(input_vals, time_in)
+                    # Fix: should be self.temporal_encoder
+                    z1 = self.temporal_encoder(input_vals, time_in)
                     if self.debug: print(f"[DEBUG] Hybrid_VAE_SDE forward_enc (non-variational): Encoder output z1_shape (before repeat): {z1.shape}")
                     # The following line seems incorrect as sigmoid_scale is not a method of this class. Assuming it's a typo from original code.
                     # z1 = torch.cat([self.sigmoid_scale(z1[:,:self.expert_latent_dims], self.use_2_5std_encoder_minmax), z1[:, self.expert_latent_dims:] ], dim =-1)
@@ -308,101 +312,277 @@ class Hybrid_VAE_SDE(LightningModule):
         if self.debug and t.item() % 10 == 0:
             print(f"[DEBUG] Hybrid_VAE_SDE apply_SDE_fun: SDE_NN_input_shape={SDE_NN_input.shape}, SDE_NN_output_latents_shape={SDE_NN_output_latents.shape}")
         return SDE_NN_output_latents
-    
 
     def f(self, t, y, Tx, time_to_treatment):  # Approximate posterior drift.
         if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] Hybrid_VAE_SDE f (posterior drift): t={t.item()}, y_shape={y.shape}, Tx_example={Tx[0].item() if Tx.numel() > 0 else 'N/A'}, time_to_treatment_example={time_to_treatment[0].item() if time_to_treatment.numel() > 0 else 'N/A'}")
+            pass
+
+
         batch_size = y.shape[0]
-        #print('y', y.shape)
-        i_ext_1 = y[:,0].unsqueeze(1)
-        i_ext_2 = y[:,1].unsqueeze(1) 
-        p_a = y[:,2].unsqueeze(1) 
-        p_v = y[:,3].unsqueeze(1) 
-        s_reflex = y[:, 4] .unsqueeze(1) 
+        # TODO temporatily delete NaNs for testing
+        if torch.isnan(y).any():
+            print(f"WARNING: NaN detected in f() input at t={t.item()}")
+            nan_mask = torch.isnan(y)
+            print(f"NaN locations: {torch.where(nan_mask)}")
+            # Replace NaN with safe values to prevent propagation
+            y = torch.nan_to_num(y, nan=0.0)
+        # y now contains: [i_ext (2), expert_latents (16), neural_embedding (4)]
+        i_ext_1 = y[:, 0].unsqueeze(1)
+        i_ext_2 = y[:, 1].unsqueeze(1)
+        p_a = y[:, 2].unsqueeze(1)
+        p_v = y[:, 3].unsqueeze(1)
+        s_reflex = y[:, 4].unsqueeze(1)
         sv = y[:, 5].unsqueeze(1)
         r_tpr_mod = y[:, 6].unsqueeze(1)
         f_hr_max = y[:, 7].unsqueeze(1)
         f_hr_min = y[:, 8].unsqueeze(1)
         r_tpr_max = y[:, 9].unsqueeze(1)
-        r_tpr_min= y[:, 10].unsqueeze(1)
+        r_tpr_min = y[:, 10].unsqueeze(1)
         ca = y[:, 11].unsqueeze(1)
         cv = y[:, 12].unsqueeze(1)
         k_width = y[:, 13].unsqueeze(1)
         p_aset = y[:, 14].unsqueeze(1)
         tau = y[:, 15].unsqueeze(1)
 
-        ##print('fixed params 1', f_hr_min[0].item(), f_hr_max[0].item(), r_tpr_max[0].item(), r_tpr_min[0].item(), r_tpr_mod[0].item())
-        ##print('fixed params 2', ca[0].item(), cv[0].item(), tau[0].item(), k_width[0].item(), p_aset[0].item(), )
-            
-
-        #print('TIME, i_ext, p_a pv, s, sv', t.item(), i_ext_1[0].item(),i_ext_2[0].item(), p_a[0].item(), p_v[0].item(), s_reflex[0].item(), sv[0].item())   
-        
         if t.item() >= time_to_treatment:
-            #print('Treatment has started! Estimating effect', t.item(), time_to_treatment )
-            #the neural network is trying to learn the ultimate treatment effect!! this means both fluid function AND the v_fun. V_fun determines the unknown tx_effect multiplied (beyond) the model, hence to be learned
             dt_i_ext_SDE = self.apply_SDE_fun(t, y) * self.SDE_control_weighting
-            #print('dt_i_ext_SDE NN', dt_i_ext_SDE.shape)
-            #print('dt_i_ext_SDE', dt_i_ext_SDE[:3, :])
-            dt_i_ext_SDE_1 = dt_i_ext_SDE[:,0].unsqueeze(1)
-            dt_i_ext_SDE_2 = dt_i_ext_SDE[:,1].unsqueeze(1)
-
+            dt_i_ext_SDE_1 = dt_i_ext_SDE[:, 0].unsqueeze(1)
+            dt_i_ext_SDE_2 = dt_i_ext_SDE[:, 1].unsqueeze(1)
         else:
-            dt_i_ext_SDE = torch.zeros([y.shape[0], self.SDEnet_out_dims])
-        
-        #T is binary and indicates whether a treatment was given or not. 
-        #this is an important step to then create the counterfactuals when we set T as the opposite of what it's trained on (T_cf)
-        i_ext_SDE_1 = Tx[:,None] * i_ext_1
-        i_ext_SDE_2 = Tx[:,None] * i_ext_2 
+            dt_i_ext_SDE_1 = torch.zeros([batch_size, 1]).to(self.device)
+            dt_i_ext_SDE_2 = torch.zeros([batch_size, 1]).to(self.device)
 
-        ##print('i_ext_SDE Has non-0 OUTPUT??', has_nonzero)
-        
-        ##print('i_ext', i_ext_SDE.shape)
-        ##print('i_ext example', i_ext_SDE[:4, :])
+        i_ext_SDE_1 = Tx[:, None] * i_ext_1
+        i_ext_SDE_2 = Tx[:, None] * i_ext_2
 
-        #print('time, i_ext, dt_i_ext_SDE, pa, pv, sv', t.item(),i_ext_1[0].item(),i_ext_2[0].item(), dt_i_ext_SDE[0,0].item(), dt_i_ext_SDE[0,1].item(), p_a[0].item(), p_v[0].item(), sv[0].item())   
-
-    
-        f_hr = s_reflex * (f_hr_max - f_hr_min) + f_hr_min 
+        f_hr = s_reflex * (f_hr_max - f_hr_min) + f_hr_min
         r_tpr = s_reflex * (r_tpr_max - r_tpr_min) + r_tpr_min + r_tpr_mod
-        
-        dva_dt = -1. * (p_a - p_v) / (r_tpr + 1e-7)  + sv * f_hr
-        
-        ##print('dvv_dt pre iext', -1.*dva_dt[:4, 0])
+
+        dva_dt = -1. * (p_a - p_v) / (r_tpr + 1e-7) + sv * f_hr
         dvv_dt = -1. * dva_dt + i_ext_SDE_1
-        ##print('dvv_dt post iext', dvv_dt[:4, 0])
 
-        ##print('f_hr, dva_dt, r_tpr, dvv_dt', f_hr.shape, dva_dt.shape, r_tpr.shape, dvv_dt.shape)
-        ##print('f_hr, dva_dt, r_tpr, dvv_dt', f_hr[0], dva_dt[0], r_tpr[0], dvv_dt[0])
-
-        dpa_dt = dva_dt / (ca )
-        dpv_dt = dvv_dt / (cv ) 
+        dpa_dt = dva_dt / (ca)
+        dpv_dt = dvv_dt / (cv)
         ds_dt = (1. / tau) * (1. - 1. / (1 + torch.exp(-k_width * (p_a - p_aset))) - s_reflex)
-                                  #(1. - 1. / (1 + torch.exp(-k_width * (p_a - p_aset))) - s)
-        #self.sigmoid(k_width * (p_a - p_aset)) - s_reflex)
-        
-        dsv_dt = i_ext_SDE_2 
-        ##print('i_ext_SDE, dsv_dt post iext, dt_i_ext_SDE', i_ext_SDE[0].item(), dsv_dt[0].item(), dt_i_ext_SDE[0].item())
+        dsv_dt = i_ext_SDE_2
 
-        ##print('dpa_dt, dpv_dt, ds_dt, dsv_dt', dpa_dt.shape, dpv_dt.shape, ds_dt.shape, dsv_dt.shape)
-        dt_r_tpr_mod = torch.zeros([batch_size, 1])  
-        dt_f_hr_max = torch.zeros([batch_size, 1])
-        dt_f_hr_min = torch.zeros([batch_size, 1])
-        dt_r_tpr_max = torch.zeros([batch_size, 1])
-        dt_r_tpr_min = torch.zeros([batch_size, 1])
-        dt_ca = torch.zeros([batch_size, 1])
-        dt_cv = torch.zeros([batch_size, 1])
-        dt_k_width = torch.zeros([batch_size, 1])
-        dt_p_aset = torch.zeros([batch_size, 1])
-        dt_tau = torch.zeros([batch_size, 1])
-        underlying_params = torch.cat([dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min, dt_r_tpr_max, dt_r_tpr_min, dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau ], dim=-1).to(self.device)
-        diff_results = torch.cat([dt_i_ext_SDE_1, dt_i_ext_SDE_2, dpa_dt, dpv_dt, ds_dt, dsv_dt, ], dim=-1)
-        final_f_out = torch.cat([diff_results, underlying_params], dim=-1)
-        
-        ##print('diff_results ', diff_results.shape, diff_results[0,:])
-        #print('final_f_out ', final_f_out.shape, final_f_out[0,:])
-        return final_f_out 
-    
+        # Fixed parameters don't change
+        dt_r_tpr_mod = torch.zeros([batch_size, 1]).to(self.device)
+        dt_f_hr_max = torch.zeros([batch_size, 1]).to(self.device)
+        dt_f_hr_min = torch.zeros([batch_size, 1]).to(self.device)
+        dt_r_tpr_max = torch.zeros([batch_size, 1]).to(self.device)
+        dt_r_tpr_min = torch.zeros([batch_size, 1]).to(self.device)
+        dt_ca = torch.zeros([batch_size, 1]).to(self.device)
+        dt_cv = torch.zeros([batch_size, 1]).to(self.device)
+        dt_k_width = torch.zeros([batch_size, 1]).to(self.device)
+        dt_p_aset = torch.zeros([batch_size, 1]).to(self.device)
+        dt_tau = torch.zeros([batch_size, 1]).to(self.device)
+
+
+        # Neural embedding derivatives (zeros - they evolve stochastically)
+        dt_neural_embedding = torch.zeros([batch_size, self.encoder_SDENN_dims]).to(self.device)
+
+        # Construct the output in the correct order to match the state vector y
+        # The order should be: i_ext (2), expert_latents (14), neural_embedding (4)
+        # Total: 20 dimensions
+
+        # For i_ext
+        dt_i_ext = torch.cat([dt_i_ext_SDE_1, dt_i_ext_SDE_2], dim=-1)
+
+        # For expert latents (all 16 dims in the correct order)
+        dt_expert = torch.cat([
+            dpa_dt, dpv_dt, ds_dt, dsv_dt,  # First 4 expert variables (indices 2-5)
+            dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min,  # Next 3 (indices 6-8)
+            dt_r_tpr_max, dt_r_tpr_min,  # Next 2 (indices 9-10)
+            dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau
+        ], dim=-1)
+
+        # Combine all
+        final_f_out = torch.cat([dt_i_ext, dt_expert, dt_neural_embedding], dim=-1)
+
+        if self.debug and t.item() % 10 == 0:
+            print(f"[DEBUG] f: final_f_out shape = {final_f_out.shape} (should be [batch, 22])")
+
+        return final_f_out
+
+    # 3. Fixed f_aug method:
+    def f_aug(self, t, y):
+        if self.debug and t.item() % 10 == 0:
+            print(f"[DEBUG] Hybrid_VAE_SDE f_aug: t={t.item()}, y_shape={y.shape}")
+
+        i_ext = y[:, :self.SDEnet_out_dims]
+        dt_all_dims = y[:, :self.SDEnet_out_dims + self.expert_latent_dims + self.encoder_SDENN_dims]
+        Tx = y[:, -3]
+        time_to_treatment = y[0, -2]
+        valid_time = y[:, -1]
+
+        # Check if this sample should be active
+        active_mask = (t <= valid_time).float().unsqueeze(1)
+
+        # Get normal dynamics
+        f_res = self.f(t, dt_all_dims, Tx, time_to_treatment)
+
+        if self.self_reverting_prior_control:
+            i_ext_2 = i_ext[:, 1].unsqueeze(1)
+            g_iext, h_iext = self.g(t, i_ext_2), self.h(t, i_ext_2)
+            f_iext = f_res[:, 1].unsqueeze(1)
+
+            u = _stable_division(f_iext - h_iext, g_iext)
+            f_logqp = .5 * (u ** 2).sum(dim=1, keepdim=True)
+        else:
+            self.mu = None
+            f_logqp = torch.zeros_like(y[:, 0]).unsqueeze(1).to(self.device)
+
+        # f_res contains derivatives for: i_ext (2) + expert (16) + neural (4) = 22 dims
+        # We need to add derivatives for: logqp (1) + Tx (1) + time_to_tx (1) = 3 dims
+        # Total should be 25 dims
+
+        # Derivatives for Tx and time_to_tx are zero (they don't change)
+        dt_tx = torch.zeros_like(f_logqp)
+        dt_time_to_tx = torch.zeros_like(f_logqp)
+
+        # Apply mask to freeze dynamics after valid time
+        f_out = torch.cat([f_res, f_logqp, dt_tx, dt_time_to_tx, torch.zeros_like(valid_time.unsqueeze(1))], dim=1)
+
+        # Only apply dynamics if still valid
+        f_out[:, :-1] = f_out[:, :-1] * active_mask
+
+        return f_out
+
+    # 4. Fixed h method:
+    def h(self, t, y):  # Prior drift.
+        if self.debug and t.item() % 10 == 0:
+            print(f"[DEBUG] Hybrid_VAE_SDE h (prior drift): t={t.item()}, y_shape={y.shape}")
+
+        # y here should be just i_ext_2 (single dimension)
+        self.mu = torch.tensor([0.0], device=y.device)
+        expanded_mu = self.mu.repeat(y.size(0), 1)
+
+        # Get theta value for i_ext_2
+        if isinstance(self.theta, (int, float)):
+            theta_val = self.theta
+        elif self.theta.dim() == 0:
+            theta_val = self.theta.item()
+        elif self.theta.dim() == 1:
+            theta_val = self.theta[0].item() if self.theta.shape[0] > 0 else self.theta.item()
+        else:  # 2D
+            theta_val = self.theta[0, 0].item()
+
+        theta_for_iext2 = torch.tensor([[theta_val]], device=y.device).repeat(y.size(0), 1)
+
+        return theta_for_iext2 * (expanded_mu - y)
+
+    # 5. Fixed g method:
+    def g(self, t, y):
+        if self.debug and t.item() % 10 == 0:
+            print(f"[DEBUG] Hybrid_VAE_SDE g (diffusion): t={t.item()}, y_shape={y.shape}")
+
+        batch_size = y.shape[0]
+
+        # Handle different shapes of self.sigma
+        if self.sigma.dim() == 1:
+            if self.sigma.shape[0] > 1:
+                sigma_val = self.sigma[0].item()
+            else:
+                sigma_val = self.sigma.item()
+        elif self.sigma.dim() == 2:
+            sigma_val = self.sigma[0, 0].item()
+        else:
+            sigma_val = self.sigma.item()
+
+        # Return as a tensor with shape [batch_size, 1]
+        return torch.full((batch_size, 1), sigma_val, device=y.device)
+
+    # 6. Fixed g_aug method:
+    def g_aug(self, t, y):
+        """Diffusion for augmented dynamics with valid length support."""
+        if self.debug and t.item() % 10 == 0:
+            print(f"[DEBUG] g_aug: t={t.item()}, y_shape={y.shape}")
+
+        batch_size = y.shape[0]
+
+        # Extract valid_time from augmented state (last component)
+        valid_time = y[:, -1]
+
+        # Check if this sample should have active diffusion
+        active_mask = (t <= valid_time).float().unsqueeze(1)
+
+        # Standard diffusion computation
+        i_ext_2 = y[:, 1].unsqueeze(1)
+        g_i_ext_2 = self.g(t, i_ext_2)
+
+        # Build the full diffusion matrix
+        g_i_ext_1 = torch.zeros([batch_size, 1]).to(y.device)
+        g_expert_dims = torch.zeros([batch_size, self.expert_latent_dims]).to(y.device)
+        g_neural_dims = torch.zeros([batch_size, self.encoder_SDENN_dims]).to(y.device)
+        g_logqp = torch.zeros([batch_size, 1]).to(y.device)
+        g_tx = torch.zeros([batch_size, 1]).to(y.device)
+        g_time_to_tx = torch.zeros([batch_size, 1]).to(y.device)
+        g_valid_time = torch.zeros([batch_size, 1]).to(y.device)  # No diffusion for valid_time
+
+        # Concatenate all components
+        g_out = torch.cat([
+            g_i_ext_1, g_i_ext_2, g_expert_dims, g_neural_dims,
+            g_logqp, g_tx, g_time_to_tx, g_valid_time
+        ], dim=1)
+
+        # Apply mask to freeze diffusion after valid time
+        # Don't mask the last component (valid_time itself)
+        g_out[:, :-1] = g_out[:, :-1] * active_mask
+
+        if self.debug and t.item() % 10 == 0:
+            print(
+                f"[DEBUG] g_aug: g_out_shape={g_out.shape} (should be [batch, {self.SDEnet_out_dims + self.expert_latent_dims + self.encoder_SDENN_dims + 4}])")
+
+        return g_out
+
+    def _get_safe_init_states(self, init_states):
+        """
+        Create safe predetermined initial states for debugging.
+        Maintains the same shape as the passed init_states.
+        """
+        batch_size = init_states.shape[0]
+        num_vars = init_states.shape[1]
+
+        # Create stable cardiovascular parameter values
+        # These are normalized values that should work well with your dynamics
+        safe_values = {
+            'p_a': 1.2,  # Arterial pressure (normalized)
+            'p_v': 0.1,  # Venous pressure (normalized)
+            's_reflex': 0.5,  # Baroreflex state (0-1)
+            'sv': 0.7,  # Stroke volume (normalized)
+            'r_tpr_mod': 0.0,  # TPR modifier
+            'f_hr_max': 1.2,  # Max heart rate factor
+            'f_hr_min': 0.8,  # Min heart rate factor
+            'r_tpr_max': 1.5,  # Max TPR
+            'r_tpr_min': 0.5,  # Min TPR
+            'ca': 1.0,  # Arterial compliance
+            'cv': 1.0,  # Venous compliance
+            'k_width': 5.0,  # Sigmoid width
+            'p_aset': 1.0,  # Pressure setpoint
+            'tau': 2.0,  # Time constant
+        }
+
+        # Create tensor with safe values
+        # Assuming first 14 values correspond to the CV parameters above
+        safe_init = torch.zeros_like(init_states)
+
+        # Fill with safe values (adjust indices based on your actual parameter order)
+        safe_init[:] = torch.tensor([
+            safe_values['p_a'], safe_values['p_v'], safe_values['s_reflex'], safe_values['sv'],
+            safe_values['r_tpr_mod'], safe_values['f_hr_max'], safe_values['f_hr_min'],
+            safe_values['r_tpr_max'], safe_values['r_tpr_min'],
+            safe_values['ca'], safe_values['cv'], safe_values['k_width'],
+            safe_values['p_aset'], safe_values['tau']
+        ])[:num_vars]  # Take only as many values as needed
+
+        # If there are more variables than our safe values, fill with reasonable defaults
+        if num_vars > 14:
+            safe_init[:, 14:] = 0.5  # Default normalized value
+
+        return safe_init
+
+
     def prior_diext_dt(self,t):
         factor = -2 * (t - 5) / 5
         exponential = torch.exp(-((t - 5) / 5) ** 2)
@@ -428,136 +608,66 @@ class Hybrid_VAE_SDE(LightningModule):
         #print('derivatives', derivatives.shape)
         return derivatives
 
-    def h(self, t, y):  # Prior drift.
-        if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] Hybrid_VAE_SDE h (prior drift): t={t.item()}, y_shape={y.shape}")
-        #self.mu = self.prior_rate_of_change_of_flow(t)
-        self.mu = torch.tensor([0]).unsqueeze(1).to(self.device)
-        expanded_mu = self.mu.repeat(y.size(0), y.shape[1])
-        #print('theta h', self.theta.shape, self.theta[0,:])
-        #print('mu h', expanded_mu[0,:])
-        #print('y in h', y.shape, y[0,:])
-        #print('mu -y ', expanded_mu[0,:] - y[0,:])
-
-        return self.theta.to(self.device) * (expanded_mu - y)
-
-    def f_aug(self, t, y):  # Drift for augmented dynamics with logqp term.
-        if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] Hybrid_VAE_SDE f_aug: t={t.item()}, y_shape={y.shape}")
-        i_ext = y[:, :self.SDEnet_out_dims]
-        dt_all_dims = y[:, :self.encoder_output_dim + self.SDEnet_out_dims]  # this is i_ext, pa, pv, s, sv and other encoder latents that go straight to the SDENN
-        Tx = y[:, -2]
-        time_to_treatment = y[0, -1]
-        
-        #print('inputs to f', dt_all_dims.shape) # num_samples x sde_dims 
-        
-        f_res = self.f(t, dt_all_dims, Tx, time_to_treatment)
-        
-        if self.self_reverting_prior_control:
-            i_ext_2 = i_ext[:, 1].unsqueeze(1)
-            g_iext, h_iext  = self.g(t, i_ext_2), self.h(t, i_ext_2)
-            f_iext = f_res[:,1].unsqueeze(1)
-            #print('f', f_iext.shape, 'g', g_iext.shape, 'h', h_iext.shape)
-            #print('f mean', f_iext.mean(), 'g mean', g_iext.mean(), 'h mean', h_iext.mean())
-            #print('f', f_iext[:3,:], 'g ', g_iext[:3,:], 'h ', h_iext[:3,:] )
-            
-            #print('doing stable division!')
-            u = _stable_division(f_iext - h_iext, g_iext)
-            #print('u shape', u.shape)
-            f_logqp = .5 * (u ** 2).sum(dim=1, keepdim=True)
-        else:
-            self.mu = None
-            f_logqp = torch.zeros_like(y[:, 0]).unsqueeze(1).to(self.device)
-        
-        #print('f_logqp', f_logqp.shape)
-        #print('f_logqp mean', f_logqp[:3,:])   
-
-        encoder_to_SDENN_latents = torch.zeros(y.shape[0], self.encoder_output_dim - self.expert_latent_dims).to(self.device)
-        f_out = torch.cat([f_res, encoder_to_SDENN_latents, f_logqp, torch.zeros_like(f_logqp), torch.zeros_like(f_logqp)], dim=1)
-        #print('f_aug out', f_out.shape, f_out[0])
-        return f_out
-    
-    def g(self, t, y):  
-        if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] Hybrid_VAE_SDE g (diffusion): t={t.item()}, y_shape={y.shape}")
-        #sigma is different for each values here! 
-        expanded_sigma = self.sigma.repeat(y.size(0), y.shape[1]).to(self.device)
-        #print('sigma g', expanded_sigma.shape, expanded_sigma[0] )
-        return expanded_sigma
-
-    def g_aug(self, t, y):  # Diffusion for augmented dynamics with logqp term.
-        if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] Hybrid_VAE_SDE g_aug: t={t.item()}, y_shape={y.shape}")
-        y_SDE = y[:, 0:self.SDEnet_out_dims+self.expert_latent_dims+self.encoder_SDENN_dims]
-        Tx = y[:, -2] # Tx is the second to last element
-        dt_expert_dims = torch.zeros(y.shape[0], self.expert_latent_dims).to(self.device)
-        encoder_to_SDENN_latents = torch.zeros(y.shape[0], self.encoder_output_dim - self.expert_latent_dims).to(self.device)
-
-        #print('dt_expert_dims gaug', dt_expert_dims.shape)
-        #print('encoder_to_SDENN_latents gaug', encoder_to_SDENN_latents.shape)
-        g_res = self.g(t, y_SDE)
-        #print('g', g_res.shape, g_res[0])
-        g_logqp = torch.zeros(y.size(0), 1).to(y.device)
-
-        g_out = torch.cat([g_res, dt_expert_dims, encoder_to_SDENN_latents,  g_logqp, torch.zeros_like(g_logqp), torch.zeros_like(g_logqp)], dim=1)
-        #print('g out', g_out.shape, g_out[0])
-        return g_out
-
-    def forward_latent(self, init_latents, ts, Tx, time_to_tx):
+    def forward_latent(self, init_latents, ts, Tx, time_to_tx, valid_lengths=None):
+        """
+        Forward through SDE with batch-compatible variable length support.
+        """
         if self.debug:
-            print(f"[DEBUG] Hybrid_VAE_SDE forward_latent: init_latents_shape={init_latents.shape}, ts_shape={ts.shape}, Tx_example={Tx[0].item() if Tx.numel() > 0 else 'N/A'}, time_to_tx_example={time_to_tx[0].item() if time_to_tx.numel() > 0 else 'N/A'}")
-            print(f"[DEBUG] Hybrid_VAE_SDE forward_latent: sdeint_fn is {'adjoint' if self.sdeint_fn == torchsde.sdeint_adjoint else 'standard'}")
-        #inputs of shape [batch x num_samples x dim ]
+            print(f"[DEBUG] forward_latent: init_latents_shape={init_latents.shape}")
+            if valid_lengths is not None:
+                print(f"[DEBUG] forward_latent: valid_lengths={valid_lengths}")
+
         batch_size = init_latents.shape[0]
+
+        # Prepare standard augmented state components
         Tx_expanded = Tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
-        time_to_tx = time_to_tx.unsqueeze(1).unsqueeze(2).repeat(batch_size, self.num_samples, 1).to(init_latents)
-        i_ext = torch.zeros(batch_size,self.num_samples, self.SDEnet_out_dims).to(init_latents)
-        log_path = torch.zeros(batch_size,self.num_samples, 1).to(init_latents)
-        #print('ts',ts.shape)
-        #print('i_ext ', i_ext.shape)
-        #print('init_latents ', init_latents.shape)
-        #print('log_path', log_path.shape)
-        #print(f"Tx_expanded shape: {Tx_expanded.shape}")
-        #print(f"time_to_tx shape: {time_to_tx.to(init_latents).shape}")
+        time_to_tx_expanded = time_to_tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
+        i_ext = torch.zeros(batch_size, self.num_samples, self.SDEnet_out_dims).to(init_latents)
+        log_path = torch.zeros(batch_size, self.num_samples, 1).to(init_latents)
 
-        
-        aug_y0 = torch.cat([i_ext, init_latents,  log_path, Tx_expanded, time_to_tx], dim=-1) 
-        #print('aug_y0', aug_y0.shape, aug_y0[0, 0,:])
+        # Add valid_time to augmented state
+        if valid_lengths is not None:
+            # Convert indices to actual times
+            valid_times = ts[torch.clamp(valid_lengths - 1, min=0)]
+            valid_times_expanded = valid_times.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
+        else:
+            # Use a time beyond the end to indicate no masking needed
+            valid_times_expanded = torch.full((batch_size, self.num_samples, 1),
+                                              ts[-1] + 1.0, device=init_latents.device)
+
+        # Create augmented initial state
+        aug_y0 = torch.cat([
+            i_ext, init_latents, log_path,
+            Tx_expanded, time_to_tx_expanded, valid_times_expanded
+        ], dim=-1)
+
+        # Reshape for SDE integration
         dim_aug = aug_y0.shape[-1]
-        aug_y0 = aug_y0.reshape(-1,dim_aug)
+        aug_y0 = aug_y0.reshape(-1, dim_aug)
 
-        #print('aug_y0', aug_y0.shape) #this will be num_samples x dim = 512 x 4
+        # Run SDE integration
         options = {'dtype': torch.float32}
         aug_ys = self.sdeint_fn(
             sde=self,
             y0=aug_y0,
             ts=ts,
             method='euler',
-            dt=0.05,
+            dt=0.01,
             adaptive=False,
             rtol=1e-3,
             atol=1e-3,
-            options = options, 
+            options=options,
             names={'drift': 'f_aug', 'diffusion': 'g_aug'}
         )
-        
-        #print('len(ts)', len(ts))
-        #print('dim_aug', dim_aug)
-        #print('aug_ys pre_reshape',aug_ys.shape)
-        
-        aug_ys = aug_ys.view(len(ts), batch_size, self.num_samples, dim_aug).permute(1,2,0,3)
-        #reshape(self.num_samples,-1,  len(ts),dim_aug) # reshape for # batch_size x num_samples x times x dim
-        
+
+        # Reshape back and extract outputs (excluding valid_time from outputs)
+        aug_ys = aug_ys.view(len(ts), batch_size, self.num_samples, dim_aug).permute(1, 2, 0, 3)
+
+        # Extract paths (don't include the valid_time in outputs)
         i_ext_path = aug_ys[:, :, :, :self.SDEnet_out_dims]
-        latent_out = aug_ys[:, :, :, self.SDEnet_out_dims:self.expert_latent_dims+self.SDEnet_out_dims]
-        logqp_path = aug_ys[:,: , -1, -3]    #.mean(dim=0)  # KL(t=0) + KL(path).
-       
-        #print('latent_out end of latent ', latent_out.shape, latent_out[0, 0, :, 0])
-        
-        #print('i_ext_path', i_ext_path.shape, i_ext_path[:4,:2,:])
-        #print('logqp_path_extracted', logqp_path.shape)
-       
-        if self.debug: print(f"[DEBUG] Hybrid_VAE_SDE forward_latent: SDE integration complete. zs_shape={latent_out.shape}, logqp_shape={logqp_path.shape}")
+        latent_out = aug_ys[:, :, :, self.SDEnet_out_dims:self.expert_latent_dims + self.SDEnet_out_dims]
+        logqp_path = aug_ys[:, :, -1, -4]  # Note: -4 now because valid_time is at -1
+
         return latent_out, logqp_path, i_ext_path
 
     def forward_dec(self, latent_out):
@@ -568,50 +678,48 @@ class Hybrid_VAE_SDE(LightningModule):
             #print('latent_out', latent_out[1, 0, :, 0])
             #print('latent_out', latent_out[1, 1, :, 0])
             #print('latent device', latent_out.device)
-            if self.normalised_data:
-                latent_out = self.normalise_expert_data(latent_out)
-            else:
-                divisors = self.divisors.view(1, 1, 1, self.expert_latent_dims).to(latent_out.device)
-                latent_out = latent_out / divisors
+        if self.normalised_data:
+            latent_out = normalise_expert_data(latent_out)
+        else:
+            divisors = self.divisors.view(1, 1, 1, self.expert_latent_dims).to(latent_out.device)
+            latent_out = latent_out / divisors
 
-            output_traj = select_tensor_by_index_list_advanced(latent_out, self.decoder_output_dims)
-            #print('output_traj', output_traj.shape, output_traj[0, 0, :, :])
+        output_traj = select_tensor_by_index_list_advanced(latent_out, self.decoder_output_dims)
+        #print('output_traj', output_traj.shape, output_traj[0, 0, :, :])
 
-            if self.debug: print(f"[DEBUG] Hybrid_VAE_SDE forward_dec: decoded_mean_shape={output_traj.shape}")
-            return output_traj
+        if self.debug: print(f"[DEBUG] Hybrid_VAE_SDE forward_dec: decoded_mean_shape={output_traj.shape}")
+        return output_traj
 
-  
+    def compute_factual_loss(self, predicted_traj, true_traj, logqp, mask=None):
+        if self.debug:
+            print(
+                f"[DEBUG] Hybrid_VAE_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}, logqp_mean={logqp.mean().item() if logqp.numel() > 0 else 'N/A'}")
 
-    def compute_factual_loss(self, predicted_traj, true_traj, logqp):
-        if self.debug: print(f"[DEBUG] Hybrid_VAE_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}, logqp_mean={logqp.mean().item() if logqp.numel() > 0 else 'N/A'}")
-        
-        true_traj_expanded = true_traj.unsqueeze(1).repeat(1, self.num_samples, 1, 1) 
-        
-        #print("predicted_traj, true_traj_expanded",predicted_traj.shape, true_traj_expanded.shape)
-        mse_val = self.MSE_loss(predicted_traj, true_traj_expanded)
-        #print(\"mse_val mean\\", mse_val.mean(dim=(1,2,3)).shape)
-        
-        # Gaussian NLL
-        #var = torch.full_like(predicted_traj, self.log_lik_output_scale**2)
-        logpy = distributions.Normal(loc=predicted_traj, scale=self.log_lik_output_scale).log_prob(true_traj_expanded).sum(dim=(2,3)).mean(dim=1)
-        #print(\\"logpy mean\\", logpy.mean().shape)
+        true_traj_expanded = true_traj.unsqueeze(1)
+        print(f"[DEBUG] Hybrid_VAE_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}")
+        # Compute log probability
+        logpy = distributions.Normal(loc=predicted_traj, scale=self.log_lik_output_scale).log_prob(true_traj_expanded)
+
+        if mask is not None:
+            # mask shape: [batch, time]
+            # Expand mask to match logpy dimensions
+            mask_expanded = mask.unsqueeze(1).unsqueeze(-1)  # [batch, 1, time, 1]
+            mask_expanded = mask_expanded.expand(-1, predicted_traj.shape[1], -1, predicted_traj.shape[-1])
+            logpy = logpy * mask_expanded
+
+            # Sum over time and features, then average over samples
+            # Normalize by number of valid timesteps per sequence
+            valid_timesteps = mask.sum(dim=1, keepdim=True).float()
+            logpy = logpy.sum(dim=(2, 3)) / (valid_timesteps.unsqueeze(1) * predicted_traj.shape[-1])
+            logpy = logpy.mean(dim=1)
+        else:
+            logpy = logpy.sum(dim=(2, 3)).mean(dim=1)
 
         current_kl_weight = self.kl_scheduler.val
         self.kl_scheduler.step()
-        
-        loss = -logpy.mean() + self.KL_weighting_SDE * current_kl_weight * logqp.mean() # NLL + KL
-        
-        #print(\\"-logpy.mean() \\", -logpy.mean())
-        #print(\\\"KL term \\\", self.KL_weighting_SDE * logqp.mean())
-        #print(\"TOTAL LOSS \", loss)
 
-        # Corrected debug print statement
-        total_loss_val = loss.item()
-        nll_val = (-logpy.mean()).item()
-        kl_val = (logqp.mean()).item() # Assuming logqp is the KL divergence term directly
-        if self.debug: 
-            print(f"[DEBUG] Hybrid_VAE_SDE compute_factual_loss: total_loss={total_loss_val:.4f}, nll_component={nll_val:.4f}, kl_component={kl_val:.4f}, kl_weight={current_kl_weight:.4f}")
-        
+        loss = -logpy.mean() + self.KL_weighting_SDE * current_kl_weight * logqp.mean()
+
         return loss, -logpy.mean(), logqp.mean()
 
     def compute_counterfactual_loss(self, true_fact, true_cf, pred_fact, pred_cf):
@@ -665,24 +773,33 @@ class Hybrid_VAE_SDE(LightningModule):
 
     def training_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_VAE_SDE training_step: batch_idx={batch_idx}, first_element_type={type(batch[0])}")
+            print(f"[DEBUG] Hybrid_VAE_SDE training_step: batch_idx={batch_idx}, batch_len={len(batch)}")
 
         if self.dataset == "mimic":
-            # Assuming mimic loader provides: X, X_mask, Y, T, ... , meds_in, static
-            X, X_mask, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, meds_in, static_features = batch
+            # Unpack with valid_lengths already computed by collate_fn
+            X, X_mask, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths, meds_in, static_features = batch
         else:
             # Synthetic data path
             X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
-            X_mask = torch.ones_like(X) # Create dummy mask for synthetic
+            X_mask = torch.ones_like(X)
             static_features = None
-        batch_size = X.shape[0]
-        
-        if self.debug and batch_idx == 0:
-            print(f"  X shape: {X.shape}, X snippet:\n{X[0, :2, :2]}")
-            print(f"  X_mask shape: {X_mask.shape}, X_mask snippet:\n{X_mask[0, :2, :2]}")
-            if static_features is not None:
-                print(f"  static_features shape: {static_features.shape}, snippet: {static_features[0]}")
+            valid_lengths = torch.full((X.shape[0],), Y.shape[1], dtype=torch.long)
 
+        batch_size = X.shape[0]
+
+        if self.debug and batch_idx == 0:
+            print(f"  Valid lengths: {valid_lengths}")
+            print(f"  Y shape: {Y.shape}")
+            print(f"  time_post shape: {time_post.shape}")
+
+        # Use the full time grid - it's now guaranteed to be monotonic by collate_fn
+        ts = time_post[0, :]  # All sequences share the same padded time grid structure
+
+        # TODO: Remove this when using real init states
+        init_states_safe = self._get_safe_init_states(init_states)
+        init_states = init_states_safe
+
+        # ENCODER LOGIC SECTION
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
                 # Raindrop expects src shape: [seq_len, batch_size, features]
@@ -691,80 +808,67 @@ class Hybrid_VAE_SDE(LightningModule):
                 mask_t = X_mask.permute(1, 0, 2)
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
                 lengths = X_mask.sum(dim=1)[:, 0]
-                
-                # Get temporal embedding from Raindrop
-                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, time_pre_t, static=None, lengths=lengths)
-                if self.debug and batch_idx == 0: print(f"  temporal_embedding (from Raindrop) shape: {temporal_embedding.shape}, snippet: {temporal_embedding[0, :4]}")
 
-            else: # GRU Encoder path
+                # Get temporal embedding from Raindrop
+                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,
+                                                                 lengths=lengths)
+                logqp0 = 0
+
+            else:  # GRU Encoder path
                 X_for_encoder = self._prepare_encoder_input(X, init_states)
-                temporal_embedding, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
-                if self.debug and batch_idx == 0: print(f"  temporal_embedding (from GRU) shape: {temporal_embedding.shape}, snippet: {temporal_embedding[0, :4]}")
+                temporal_embedding, z1_logvar, logqp0 = self.temporal_encoder(X_for_encoder, time_pre)
 
             # Get static and fused embedding
             static_embedding = self.static_encoder(static_features)
-            if self.debug and batch_idx == 0: print(f"  static_embedding shape: {static_embedding.shape}, snippet: {static_embedding[0, :4]}")
-            
             fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
-            if self.debug and batch_idx == 0: print(f"  fused_embedding shape: {fused_embedding.shape}, snippet: {fused_embedding[0, :4]}")
-
             fused_rep = self.fusion_mlp(fused_embedding)
-            if self.debug and batch_idx == 0: print(f"  fused_rep shape: {fused_rep.shape}, snippet: {fused_rep[0, :4]}")
 
             # Get the two separate outputs from the heads
             predicted_ode_latents = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
-            if self.debug and batch_idx == 0: print(f"  predicted_ode_latents shape: {predicted_ode_latents.shape}, snippet:\n{predicted_ode_latents[0, 0, :4]}")
-            
             neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
-            if self.debug and batch_idx == 0: print(f"  neural_embedding shape: {neural_embedding.shape}, snippet:\n{neural_embedding[0, 0, :4]}")
 
-            logqp0 = 0 # Not variational for this setup
-        
-        elif self.use_encoder != 'none': # GRU Encoder path
+        else:  # No encoder path
             X_for_encoder = self._prepare_encoder_input(X, init_states)
-            temporal_embedding, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
-            
-            static_embedding = self.static_encoder(static_features)
-
-            fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
-            fused_rep = self.fusion_mlp(fused_embedding)
-            
-            predicted_ode_latents = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
-            neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
-            
-        else:
-            # No encoder path
-            X_for_encoder = self._prepare_encoder_input(X, init_states)
-            z1_encoder, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre) # z1_encoder is just init_states here
+            z1_encoder, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
             predicted_ode_latents = z1_encoder[:, :, :self.expert_latent_dims]
             neural_embedding = z1_encoder[:, :, self.expert_latent_dims:]
 
-
-        # Prepare the SDE initial state using the consistent hybrid approach
+        # Prepare the SDE initial state
         z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states)
-        
+
+        # Run SDE with variable lengths - now we can use the full time grid!
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
-            ts=time_post[0, :],
+            ts=ts,
             Tx=T,
-            time_to_tx=torch.zeros(batch_size).to(self.device)
+            time_to_tx=torch.zeros(batch_size).to(self.device),
+            valid_lengths=valid_lengths
         )
 
+        # Decode - no padding needed since we integrated over full length
         decoded_traj = self.forward_dec(latent_traj)
-        
+
+        # Create mask for loss computation using valid_lengths
+        seq_len = Y.shape[1]
+        time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+
         # Use logqp0 from GRU if available, otherwise it's 0
         kl_logqp = logqp0 if self.use_encoder not in ['raindrop', 'none'] else 0
         total_logqp = kl_logqp + logqp_path
 
-        loss, nll, kl_div = self.compute_factual_loss(predicted_traj=decoded_traj, true_traj=Y, logqp=total_logqp)
-        
+        loss, nll, kl_div = self.compute_factual_loss(
+            predicted_traj=decoded_traj,
+            true_traj=Y,
+            logqp=total_logqp,
+            mask=time_mask
+        )
+
         # LOGGING
         self.log('train_total_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_NLL', nll, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_KL', kl_div, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        
-        return loss
 
+        return loss
     def _prepare_sde_initial_state(self, predicted_ode_latents, neural_embedding, init_states):
         """
         Prepares the initial state for the SDE by combining the interpolated initial
@@ -800,15 +904,28 @@ class Hybrid_VAE_SDE(LightningModule):
         return z1_for_sde
 
     def validation_step(self, batch, batch_idx):
-        if self.debug and batch_idx == 0: print(f"[DEBUG] Hybrid_VAE_SDE validation_step: batch_idx={batch_idx}")
-        #print("VALIDATION")
+        if self.debug and batch_idx == 0:
+            print(f"[DEBUG] Hybrid_VAE_SDE validation_step: batch_idx={batch_idx}")
+
         if self.dataset == "mimic":
-            X, X_mask, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, meds_in, static_features = batch
+            # Unpack with valid_lengths
+            X, X_mask, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths, meds_in, static_features = batch
         else:
+            # Synthetic data path
             X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
             X_mask = torch.ones_like(X)
             static_features = None
+            valid_lengths = torch.full((X.shape[0],), Y.shape[1], dtype=torch.long)
+
         batch_size = X.shape[0]
+
+        # Use the full time grid - we'll handle variable lengths in forward_latent
+        ts = time_post[0, :]  # Assuming all sequences share the same time grid
+
+
+        # TODO: Remove this when using real init states
+        init_states_safe = self._get_safe_init_states(init_states)
+        init_states = init_states_safe
 
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
@@ -817,9 +934,10 @@ class Hybrid_VAE_SDE(LightningModule):
                 mask_t = X_mask.permute(1, 0, 2)
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
                 lengths = X_mask.sum(dim=1)[:, 0]
-                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, time_pre_t, static=None, lengths=lengths)
+                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,
+                                                                 lengths=lengths)
                 logqp0 = 0
-            else: # GRU Encoder
+            else:  # GRU Encoder
                 X_for_encoder = self._prepare_encoder_input(X, init_states)
                 temporal_embedding, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
 
@@ -830,42 +948,80 @@ class Hybrid_VAE_SDE(LightningModule):
             predicted_ode_latents = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
             neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
 
-        else: # No encoder
+        else:  # No encoder
             X_for_encoder = self._prepare_encoder_input(X, init_states)
             z1_encoder, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
             predicted_ode_latents = z1_encoder[:, :, :self.expert_latent_dims]
             neural_embedding = z1_encoder[:, :, self.expert_latent_dims:]
 
-
-        # Prepare the SDE initial state using the consistent hybrid approach
+        # Prepare the SDE initial state
         z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states)
 
-        latent_traj, logqp_path, i_ext_path = self.forward_latent(init_latents=z1_for_sde,
-                                                                    ts = time_post[0, :],
-                                                                    Tx = T,
-                                                                    time_to_tx = torch.zeros(batch_size).to(self.device))
-        
+        # Run SDE with variable lengths
+        latent_traj, logqp_path, i_ext_path = self.forward_latent(
+            init_latents=z1_for_sde,
+            ts=ts,
+            Tx=T,
+            time_to_tx=torch.zeros(batch_size).to(self.device),
+            valid_lengths=valid_lengths
+        )
+
+        # Decode
         decoded_traj = self.forward_dec(latent_traj)
 
+        # Create mask for loss computation
+        seq_len = Y.shape[1]
+        time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+
         total_logqp = logqp0 + logqp_path
-        loss, nll, kl_div = self.compute_factual_loss(predicted_traj=decoded_traj, true_traj=Y, logqp=total_logqp)
+        loss, nll, kl_div = self.compute_factual_loss(
+            predicted_traj=decoded_traj,
+            true_traj=Y,
+            logqp=total_logqp,
+            mask=time_mask
+        )
+
         self.log('val_total_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_NLL', nll, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_KL', kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
-        # ... (rest of validation_step remains)
-        
-           
+        # Return outputs for potential use in validation_epoch_end
+        return {
+            'val_loss': loss,
+            'val_nll': nll,
+            'val_kl': kl_div,
+            'decoded_traj': decoded_traj,
+            'true_traj': Y,
+            'mask': time_mask
+        }
+
     def test_step(self, batch, batch_idx):
-        if self.debug and batch_idx == 0: print(f"[DEBUG] Hybrid_VAE_SDE test_step: batch_idx={batch_idx}")
-        #print("TEST")
+        if self.debug and batch_idx == 0:
+            print(f"[DEBUG] Hybrid_VAE_SDE test_step: batch_idx={batch_idx}")
+
         if self.dataset == "mimic":
-            X, X_mask, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, meds_in, static_features = batch
+            # Unpack with valid_lengths
+            X, X_mask, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths, meds_in, static_features = batch
         else:
+            # Synthetic data path
             X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
             X_mask = torch.ones_like(X)
             static_features = None
+            valid_lengths = torch.full((X.shape[0],), Y.shape[1], dtype=torch.long)
+
         batch_size = X.shape[0]
+
+        # Use the full time grid - we'll handle variable lengths in forward_latent
+        ts = time_post[0, :]  # Assuming all sequences share the same time grid
+
+        # Double-check and fix if needed
+        for i in range(1, len(ts)):
+            if ts[i] <= ts[i - 1]:
+                ts[i] = ts[i - 1] + 1e-4
+
+        # TODO: Remove this when using real init states
+        init_states_safe = self._get_safe_init_states(init_states)
+        init_states = init_states_safe
 
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
@@ -874,9 +1030,10 @@ class Hybrid_VAE_SDE(LightningModule):
                 mask_t = X_mask.permute(1, 0, 2)
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
                 lengths = X_mask.sum(dim=1)[:, 0]
-                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, time_pre_t, static=None, lengths=lengths)
+                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,
+                                                                 lengths=lengths)
                 logqp0 = 0
-            else: # GRU
+            else:  # GRU
                 X_for_encoder = self._prepare_encoder_input(X, init_states)
                 temporal_embedding, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
 
@@ -887,17 +1044,61 @@ class Hybrid_VAE_SDE(LightningModule):
             predicted_ode_latents = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
             neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
 
-        else: # No encoder
+        else:  # No encoder
             X_for_encoder = self._prepare_encoder_input(X, init_states)
             z1_encoder, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
             predicted_ode_latents = z1_encoder[:, :, :self.expert_latent_dims]
             neural_embedding = z1_encoder[:, :, self.expert_latent_dims:]
 
-
-        # Prepare the SDE initial state using the consistent hybrid approach
+        # Prepare the SDE initial state
         z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states)
 
-        # ... (rest of test_step remains)
+        # Run SDE with variable lengths
+        latent_traj, logqp_path, i_ext_path = self.forward_latent(
+            init_latents=z1_for_sde,
+            ts=ts,
+            Tx=T,
+            time_to_tx=torch.zeros(batch_size).to(self.device),
+            valid_lengths=valid_lengths
+        )
+
+        # Decode
+        decoded_traj = self.forward_dec(latent_traj)
+
+        # Create mask for loss computation
+        seq_len = Y.shape[1]
+        time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+
+        total_logqp = logqp0 + logqp_path
+        loss, nll, kl_div = self.compute_factual_loss(
+            predicted_traj=decoded_traj,
+            true_traj=Y,
+            logqp=total_logqp,
+            mask=time_mask
+        )
+
+        # Test-specific logging
+        self.log('test_total_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('test_NLL', nll, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('test_KL', kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+        # Compute additional test metrics
+        with torch.no_grad():
+            # MSE only on valid portions
+            mse_per_sample = ((decoded_traj.mean(1) - Y) ** 2) * time_mask.unsqueeze(-1)
+            valid_mse = mse_per_sample.sum() / (time_mask.sum() * Y.shape[-1])
+            self.log('test_mse', valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+        # Return outputs for potential use in test_epoch_end
+        return {
+            'test_loss': loss,
+            'test_nll': nll,
+            'test_kl': kl_div,
+            'test_mse': valid_mse,
+            'decoded_traj': decoded_traj,
+            'true_traj': Y,
+            'mask': time_mask
+        }
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr = self.learning_rate)

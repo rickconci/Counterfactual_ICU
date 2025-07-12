@@ -11,8 +11,8 @@ import os
 from torch.nn.parameter import Parameter
 from torch_geometric.nn.inits import uniform, glorot, zeros, ones, reset
 
-from models.transformer_conv import TransformerConv
-from models.Ob_propagation import Observation_progation
+from transformer_conv import TransformerConv
+from Ob_propagation import Observation_progation
 import warnings
 import numbers
 
@@ -74,7 +74,7 @@ class Raindrop_v2(nn.Module):
         output_dim = dimension of the output embedding
     """
 
-    def __init__(self, d_inp=36, d_model=64, nhead=4, nhid=128, nlayers=2, dropout=0.3, max_len=215, d_static=9,
+    def __init__(self, d_inp=36, d_model=64, nhead=4, nhid=128, nlayers=2, dropout=0.3, max_len=50, d_static=9,
                  MAX=100, perc=0.5, aggreg='mean', output_dim=2, global_structure=None, sensor_wise_mask=False, static=True, debug=False):
         super().__init__()
         from torch.nn import TransformerEncoder, TransformerEncoderLayer

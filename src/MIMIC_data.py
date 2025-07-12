@@ -173,32 +173,116 @@ class MIMICDataModule(L.LightningDataModule):
 
     @staticmethod
     def collate_fn(batch):
-        # Separate keys that need padding from those that don't
-        pad_keys = ["X", "X_mask", "Y_fact", "Y_cf", "t_X", "t_Y", "t_full", "full_fact_traj", "full_CF_traj", "meds_in"]
+        # Define the expected max_len (should match the model's max_len parameter)
+        MAX_LEN = 50  # or get this from somewhere consistent
+
+        pad_keys = ["X", "X_mask", "Y_fact", "Y_cf", "t_X", "t_Y", "t_full", "full_fact_traj", "full_CF_traj",
+                    "meds_in"]
         no_pad_keys = ["T", "p", "init_state", "static"]
 
         collated = {}
-        
-        # Pad sequences
+
+        # Compute valid lengths from t_Y before padding
+        valid_lengths = []
+        for item in batch:
+            t_Y = item['t_Y']
+            # Find where time stops increasing
+            if len(t_Y) > 1:
+                time_diffs = t_Y[1:] - t_Y[:-1]
+                non_increasing = torch.where(time_diffs <= 0)[0]
+
+                if len(non_increasing) > 0:
+                    valid_len = non_increasing[0].item() + 1
+                else:
+                    valid_len = len(t_Y)
+            else:
+                valid_len = 1
+
+            valid_lengths.append(valid_len)
+
+        collated['valid_lengths'] = torch.tensor(valid_lengths, dtype=torch.long)
+
+        # Pad sequences to fixed MAX_LEN
         for key in pad_keys:
             sequences = [item[key] for item in batch]
-            collated[key] = pad_sequence(sequences, batch_first=True, padding_value=0.0)
-            
+
+            if key == "t_Y":  # Special handling for time to ensure monotonicity
+                padded_sequences = []
+                for i, seq in enumerate(sequences):
+                    valid_len = valid_lengths[i]
+                    seq_valid = seq[:valid_len]  # Only the valid part
+
+                    if valid_len < MAX_LEN:
+                        # Create monotonically increasing padding
+                        last_valid_time = seq_valid[-1]
+                        # Add 1.0 time unit for each padded step to ensure strict monotonicity
+                        time_increment = 1.0
+                        padding_times = torch.arange(1, MAX_LEN - valid_len + 1) * time_increment + last_valid_time
+                        padded_seq = torch.cat([seq_valid, padding_times], dim=0)
+                    else:
+                        # Truncate if longer (shouldn't happen with your data)
+                        padded_seq = seq_valid[:MAX_LEN]
+
+                    padded_sequences.append(padded_seq)
+                collated[key] = torch.stack(padded_sequences)
+
+            elif key in ["X", "X_mask", "t_X", "meds_in"]:  # Input sequences
+                # Pad or truncate to MAX_LEN
+                padded_sequences = []
+                for seq in sequences:
+                    if seq.shape[0] < MAX_LEN:
+                        # Pad with zeros
+                        padding = torch.zeros((MAX_LEN - seq.shape[0],) + seq.shape[1:])
+                        padded_seq = torch.cat([seq, padding], dim=0)
+                    else:
+                        # Truncate if longer
+                        padded_seq = seq[:MAX_LEN]
+                    padded_sequences.append(padded_seq)
+                collated[key] = torch.stack(padded_sequences)
+
+            elif key in ["Y_fact", "Y_cf", "t_full", "full_fact_traj", "full_CF_traj"]:  # FIX: Add explicit handling
+                # Pad these to MAX_LEN as well
+                padded_sequences = []
+                for seq in sequences:
+                    if seq.shape[0] < MAX_LEN:
+                        # Pad with zeros (or last value)
+                        padding = torch.zeros((MAX_LEN - seq.shape[0],) + seq.shape[1:])
+                        # Alternative: pad with last value
+                        # padding = seq[-1:].repeat(MAX_LEN - seq.shape[0], *([1] * (seq.ndim - 1)))
+                        padded_seq = torch.cat([seq, padding], dim=0)
+                    else:
+                        # Truncate if longer
+                        padded_seq = seq[:MAX_LEN]
+                    padded_sequences.append(padded_seq)
+                collated[key] = torch.stack(padded_sequences)
+
+            else:
+                # For any remaining sequences, use regular padding to MAX_LEN
+                padded_sequences = []
+                for seq in sequences:
+                    if seq.shape[0] < MAX_LEN:
+                        padding = torch.zeros((MAX_LEN - seq.shape[0],) + seq.shape[1:])
+                        padded_seq = torch.cat([seq, padding], dim=0)
+                    else:
+                        padded_seq = seq[:MAX_LEN]
+                    padded_sequences.append(padded_seq)
+                collated[key] = torch.stack(padded_sequences)
+
         # Stack tensors that don't need padding
         for key in no_pad_keys:
             collated[key] = torch.stack([item[key] for item in batch])
 
-        # The model expects a tuple/list of tensors, not a dict
-        # The order must match the unpacking in the training_step
         ordered_keys = [
-            'X', 'X_mask', 'Y_fact', 'T', 'Y_cf', 'p', 'init_state', 
-            't_X', 't_Y', 't_full', 'full_fact_traj', 'full_CF_traj'
+            'X', 'X_mask', 'Y_fact', 'T', 'Y_cf', 'p', 'init_state',
+            't_X', 't_Y', 't_full', 'full_fact_traj', 'full_CF_traj',
+            'valid_lengths'
         ]
-        
-        # We also have 'meds_in' and 'static' which are not in the original model input
-        # We will append it at the end and modify the model to accept it.
-        
+
         return_list = [collated[k] for k in ordered_keys]
         return_list.append(collated['meds_in'])
         return_list.append(collated['static'])
-        return tuple(return_list) 
+
+        # Debug print
+        # print(f"[DEBUG] Collated Y_fact shape: {collated['Y_fact'].shape}, t_Y shape: {collated['t_Y'].shape}")
+
+        return tuple(return_list)

@@ -154,7 +154,7 @@ def main(args):
                            #Encoder
                            encoder_input_dim =  data_module.encoder_input_dim, 
                            encoder_hidden_dim = args.encoder_hidden_dim,
-                           expert_latent_dims  = 16, # Fixed by the ODE model
+                           expert_latent_dims  = 14, # Fixed by the ODE model
                            encoder_SDENN_dims = 0 if args.use_encoder == 'none' else args.encoder_SDENN_dims,
 
                            use_2_5std_encoder_minmax = args.use_2_5std_encoder_minmax,
@@ -187,7 +187,7 @@ def main(args):
                            final_activation = args.final_activation,
 
                            #decoder params
-                           decoder_output_dims = dataset_params['post_treatment_dims'],
+                           decoder_output_dims = [2,3],
                            normalised_data = dataset_params['normalize'],
                            log_lik_output_scale = args.output_scale,
 
