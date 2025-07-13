@@ -187,7 +187,7 @@ def main(args):
                            final_activation = args.final_activation,
 
                            #decoder params
-                           decoder_output_dims = [2,3],
+                           decoder_output_dims = [0,1],
                            normalised_data = dataset_params['normalize'],
                            log_lik_output_scale = args.output_scale,
 

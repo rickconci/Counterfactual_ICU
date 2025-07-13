@@ -619,6 +619,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
         batch_size = init_latents.shape[0]
 
+
         # Prepare standard augmented state components
         Tx_expanded = Tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
         time_to_tx_expanded = time_to_tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
@@ -671,6 +672,14 @@ class Hybrid_VAE_SDE(LightningModule):
         return latent_out, logqp_path, i_ext_path
 
     def forward_dec(self, latent_out):
+        """
+        Selects the output trajectories from the latents
+        Args:
+            latent_out:
+
+        Returns:
+
+        """
         if self.debug: 
             print(f"[DEBUG] Hybrid_VAE_SDE forward_dec: latent_out_shape={latent_out.shape}")
             #print('latent_out', latent_out[0, 0, :, 0])
@@ -816,7 +825,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
             else:  # GRU Encoder path
                 X_for_encoder = self._prepare_encoder_input(X, init_states)
-                temporal_embedding, z1_logvar, logqp0 = self.temporal_encoder(X_for_encoder, time_pre)
+                temporal_embedding, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
 
             # Get static and fused embedding
             static_embedding = self.static_encoder(static_features)
@@ -836,7 +845,7 @@ class Hybrid_VAE_SDE(LightningModule):
         # Prepare the SDE initial state
         z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states)
 
-        # Run SDE with variable lengths - now we can use the full time grid!
+        # Run SDE with variable lengths
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
             ts=ts,
@@ -845,7 +854,7 @@ class Hybrid_VAE_SDE(LightningModule):
             valid_lengths=valid_lengths
         )
 
-        # Decode - no padding needed since we integrated over full length
+        # Select output trajectories from latents
         decoded_traj = self.forward_dec(latent_traj)
 
         # Create mask for loss computation using valid_lengths
@@ -886,6 +895,7 @@ class Hybrid_VAE_SDE(LightningModule):
         # Part 1: Take the accurate interpolated values
         interpolated_part = init_states.unsqueeze(1).repeat(1, self.num_samples, 1)
 
+        # FIXME is it an issue that some predicted latents ARE the same variables that are also ICs?
         # Part 2: Take the inferred values for the remaining ODE variables from the specific head
         inferred_part = predicted_ode_latents[:, :, num_ic_vars:]
         
@@ -1014,10 +1024,6 @@ class Hybrid_VAE_SDE(LightningModule):
         # Use the full time grid - we'll handle variable lengths in forward_latent
         ts = time_post[0, :]  # Assuming all sequences share the same time grid
 
-        # Double-check and fix if needed
-        for i in range(1, len(ts)):
-            if ts[i] <= ts[i - 1]:
-                ts[i] = ts[i - 1] + 1e-4
 
         # TODO: Remove this when using real init states
         init_states_safe = self._get_safe_init_states(init_states)
