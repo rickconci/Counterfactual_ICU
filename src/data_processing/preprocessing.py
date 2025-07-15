@@ -2702,6 +2702,716 @@ def create_baseline_tensors(input_dir, output_dir, trajectory_metadata_path):
     print(f"Saved baseline metadata to {metadata_file}")
     print(f"Baseline feature dimension: {baseline_metadata['feature_dim']}")
 
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import pickle
+from pathlib import Path
+from tqdm import tqdm
+import os
+
+
+def analyze_t0_intervals(trajectory_metadata_path, med_tensors_dir, output_dir, interval_minutes=5):
+    """
+    Analyze intervals between t_0 events and create a histogram.
+
+    Uses the LAST t₀ event from each trajectory, which should be unique since each
+    trajectory ends at a different t₀ event. This avoids the deduplication problem
+    from overlapping trajectories.
+
+    Parameters:
+    - trajectory_metadata_path: Path to trajectory metadata pickle file
+    - med_tensors_dir: Directory containing medication tensor files
+    - output_dir: Directory to save the histogram
+    - interval_minutes: Minutes per time interval (default 5)
+    """
+    print("Loading trajectory metadata...")
+
+    # Load trajectory metadata
+    with open(trajectory_metadata_path, 'rb') as f:
+        trajectory_data = pickle.load(f)
+
+    all_trajectories = trajectory_data['all_trajectories']
+    medication_info = trajectory_data['medication_info']
+
+    # The t0_trigger is the last column in medication tensors
+    t0_trigger_idx = len(medication_info) + 1  # +1 for crystalloid_sum, +1 for t0_trigger
+
+    print(f"Processing {len(all_trajectories)} patients...")
+    print("Strategy: Taking LAST t₀ event from each trajectory (should be unique)")
+
+    all_t0_intervals = []
+    patient_t0_counts = []
+    total_trajectories_processed = 0
+    debug_patients = 0
+
+    for hadm_id, patient_trajectories in tqdm(all_trajectories.items(), desc="Processing patients"):
+        # Collect the LAST t₀ event from each trajectory
+        # Each trajectory should end at a unique t₀ event
+        patient_t0_times = []
+
+        for traj_info in patient_trajectories:
+            traj_num = traj_info['trajectory_num']
+            tensor_file = Path(med_tensors_dir) / f"med_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+
+            if tensor_file.exists():
+                try:
+                    # Load tensor
+                    values_tensor, mask_tensor, abs_time_tensor, rel_time_tensor, length = torch.load(tensor_file)
+
+                    # Extract t0_trigger column
+                    t0_array = values_tensor[:, t0_trigger_idx].numpy()
+
+                    # Find ALL t0 events in this trajectory
+                    t0_indices = np.where(t0_array == 1)[0]
+
+                    if len(t0_indices) > 0:
+                        # Take ONLY the LAST t₀ event from this trajectory
+                        last_t0_idx = t0_indices[-1]
+                        last_t0_time = rel_time_tensor[last_t0_idx].item()
+                        patient_t0_times.append(last_t0_time)
+
+                        # Debug output for first few patients
+                        if debug_patients < 3:
+                            print(
+                                f"  Patient {hadm_id}, Traj {traj_num}: Last t₀ at index {last_t0_idx}, time {last_t0_time:.3f}h")
+                            if len(t0_indices) > 1:
+                                print(
+                                    f"    (Trajectory had {len(t0_indices)} total t₀ events at indices {list(t0_indices)})")
+                    else:
+                        if debug_patients < 3:
+                            print(f"  Patient {hadm_id}, Traj {traj_num}: No t₀ events found")
+
+                    total_trajectories_processed += 1
+
+                except Exception as e:
+                    print(f"Error processing tensor for patient {hadm_id}, trajectory {traj_num}: {e}")
+                    continue
+            else:
+                if debug_patients < 3:
+                    print(f"Warning: Tensor file not found: {tensor_file}")
+
+        # Sort the t₀ times (should already be unique since each trajectory ends at different t₀)
+        patient_t0_times = sorted(patient_t0_times)
+        patient_t0_counts.append(len(patient_t0_times))
+
+        if debug_patients < 3:
+            print(f"  Patient {hadm_id}: Collected {len(patient_t0_times)} t₀ times: {patient_t0_times}")
+            debug_patients += 1
+
+        # Calculate intervals between consecutive t0 events for this patient
+        if len(patient_t0_times) > 1:
+            intervals = np.diff(patient_t0_times)  # This gives intervals in hours
+
+            # Debug: check for any remaining small intervals
+            small_intervals = intervals[intervals < 0.1]  # Less than 6 minutes
+            if len(small_intervals) > 0 and debug_patients <= 5:
+                print(f"  Patient {hadm_id}: Found {len(small_intervals)} intervals < 6 min:")
+                print(f"    Small intervals (minutes): {small_intervals * 60}")
+                print(f"    All intervals (minutes): {intervals * 60}")
+
+            all_t0_intervals.extend(intervals)
+
+    print(f"\nProcessing summary:")
+    print(f"Total trajectories processed: {total_trajectories_processed}")
+    print(f"Total patients: {len(all_trajectories)}")
+    print(f"Total t₀ intervals found: {len(all_t0_intervals)}")
+    print(f"Average t₀ events per patient: {np.mean(patient_t0_counts):.2f}")
+    print(f"Max t₀ events for a patient: {np.max(patient_t0_counts) if patient_t0_counts else 0}")
+
+    if len(all_t0_intervals) == 0:
+        print("No t₀ intervals found. Cannot create histogram.")
+        return
+
+    # Convert to minutes for more intuitive interpretation
+    all_t0_intervals_minutes = np.array(all_t0_intervals) * 60
+
+    # Show detailed statistics
+    very_small_intervals = all_t0_intervals_minutes[all_t0_intervals_minutes < 1]
+    small_intervals = all_t0_intervals_minutes[all_t0_intervals_minutes < 10]
+
+    print(f"\nInterval distribution:")
+    print(
+        f"Intervals < 1 minute: {len(very_small_intervals)} out of {len(all_t0_intervals_minutes)} ({len(very_small_intervals) / len(all_t0_intervals_minutes) * 100:.1f}%)")
+    print(
+        f"Intervals < 10 minutes: {len(small_intervals)} out of {len(all_t0_intervals_minutes)} ({len(small_intervals) / len(all_t0_intervals_minutes) * 100:.1f}%)")
+    print(f"Min interval: {np.min(all_t0_intervals_minutes):.2f} minutes")
+    print(f"5th percentile: {np.percentile(all_t0_intervals_minutes, 5):.2f} minutes")
+    print(f"10th percentile: {np.percentile(all_t0_intervals_minutes, 10):.2f} minutes")
+    print(f"25th percentile: {np.percentile(all_t0_intervals_minutes, 25):.2f} minutes")
+    print(f"Median interval: {np.median(all_t0_intervals_minutes):.2f} minutes")
+    print(f"75th percentile: {np.percentile(all_t0_intervals_minutes, 75):.2f} minutes")
+    print(f"90th percentile: {np.percentile(all_t0_intervals_minutes, 90):.2f} minutes")
+    print(f"95th percentile: {np.percentile(all_t0_intervals_minutes, 95):.2f} minutes")
+    print(f"Mean interval: {np.mean(all_t0_intervals_minutes):.2f} minutes")
+    print(f"Max interval: {np.max(all_t0_intervals_minutes):.2f} minutes")
+
+    # Create histogram
+    plt.figure(figsize=(12, 8))
+
+    # Create histogram with reasonable bins
+    bins = np.logspace(np.log10(max(0.1, np.min(all_t0_intervals_minutes))),
+                       np.log10(max(all_t0_intervals_minutes)), 50)
+    plt.hist(all_t0_intervals_minutes, bins=bins, alpha=0.7, color='skyblue', edgecolor='black')
+
+    plt.xscale('log')
+    plt.xlabel('Time between t₀ events (minutes)', fontsize=12)
+    plt.ylabel('Frequency', fontsize=12)
+    plt.title(
+        'Distribution of Time Intervals Between t₀ Events\n(Vasopressor increases or significant crystalloid changes)',
+        fontsize=14)
+    plt.grid(True, alpha=0.3)
+
+    # Add statistics as text
+    stats_text = f"""Statistics:
+    Total intervals: {len(all_t0_intervals_minutes)}
+    Mean: {np.mean(all_t0_intervals_minutes):.1f} min
+    Median: {np.median(all_t0_intervals_minutes):.1f} min
+    Min: {np.min(all_t0_intervals_minutes):.1f} min
+    Max: {np.max(all_t0_intervals_minutes):.1f} min
+    25th percentile: {np.percentile(all_t0_intervals_minutes, 25):.1f} min
+    75th percentile: {np.percentile(all_t0_intervals_minutes, 75):.1f} min
+    Intervals < 10 min: {len(small_intervals)} ({len(small_intervals) / len(all_t0_intervals_minutes) * 100:.1f}%)"""
+
+    plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
+
+    # Save histogram
+    output_path = Path(output_dir) / 't0_intervals_histogram.png'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"\nHistogram saved to: {output_path}")
+
+    # Also save raw data for further analysis
+    intervals_data = {
+        'intervals_minutes': all_t0_intervals_minutes,
+        'intervals_hours': all_t0_intervals,
+        'patient_t0_counts': patient_t0_counts,
+        'statistics': {
+            'total_intervals': len(all_t0_intervals_minutes),
+            'mean_minutes': np.mean(all_t0_intervals_minutes),
+            'median_minutes': np.median(all_t0_intervals_minutes),
+            'min_minutes': np.min(all_t0_intervals_minutes),
+            'max_minutes': np.max(all_t0_intervals_minutes),
+            'percentile_5': np.percentile(all_t0_intervals_minutes, 5),
+            'percentile_10': np.percentile(all_t0_intervals_minutes, 10),
+            'percentile_25': np.percentile(all_t0_intervals_minutes, 25),
+            'percentile_75': np.percentile(all_t0_intervals_minutes, 75),
+            'percentile_90': np.percentile(all_t0_intervals_minutes, 90),
+            'percentile_95': np.percentile(all_t0_intervals_minutes, 95),
+            'std_minutes': np.std(all_t0_intervals_minutes),
+            'very_small_count': len(very_small_intervals),
+            'small_count': len(small_intervals)
+        }
+    }
+
+    data_path = Path(output_dir) / 't0_intervals_data.pkl'
+    with open(data_path, 'wb') as f:
+        pickle.dump(intervals_data, f)
+
+    print(f"Raw data saved to: {data_path}")
+
+    # Create a comprehensive summary CSV
+    summary_df = pd.DataFrame({
+        'metric': ['Total intervals', 'Mean (minutes)', 'Median (minutes)',
+                   'Min (minutes)', 'Max (minutes)', '5th percentile (minutes)',
+                   '10th percentile (minutes)', '25th percentile (minutes)',
+                   '75th percentile (minutes)', '90th percentile (minutes)',
+                   '95th percentile (minutes)', 'Std (minutes)',
+                   'Intervals < 1 min', 'Intervals < 10 min'],
+        'value': [len(all_t0_intervals_minutes), np.mean(all_t0_intervals_minutes),
+                  np.median(all_t0_intervals_minutes), np.min(all_t0_intervals_minutes),
+                  np.max(all_t0_intervals_minutes), np.percentile(all_t0_intervals_minutes, 5),
+                  np.percentile(all_t0_intervals_minutes, 10), np.percentile(all_t0_intervals_minutes, 25),
+                  np.percentile(all_t0_intervals_minutes, 75), np.percentile(all_t0_intervals_minutes, 90),
+                  np.percentile(all_t0_intervals_minutes, 95), np.std(all_t0_intervals_minutes),
+                  len(very_small_intervals), len(small_intervals)]
+    })
+
+    summary_path = Path(output_dir) / 't0_intervals_summary.csv'
+    summary_df.to_csv(summary_path, index=False)
+    print(f"Summary statistics saved to: {summary_path}")
+
+    return intervals_data
+
+
+def create_additional_t0_analyses(intervals_data, output_dir):
+    """
+    Create additional analyses and visualizations of t0 intervals.
+    """
+    intervals_minutes = intervals_data['intervals_minutes']
+    patient_t0_counts = intervals_data['patient_t0_counts']
+
+    # Filter data for linear histogram (≤ 600 minutes = 10 hours)
+    filtered_intervals = intervals_minutes[intervals_minutes <= 600]
+
+    # Create a linear scale histogram (filtered to ≤ 10 hours)
+    plt.figure(figsize=(12, 8))
+    plt.hist(filtered_intervals, bins=50, alpha=0.7, color='lightgreen', edgecolor='black')
+    plt.xlabel('Time between t₀ events (minutes)', fontsize=12)
+    plt.ylabel('Frequency', fontsize=12)
+    plt.title('Distribution of Time Intervals Between t₀ Events (Linear Scale, ≤10 hours)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+
+    # Add vertical lines for percentiles (using filtered data)
+    plt.axvline(np.median(filtered_intervals), color='red', linestyle='--',
+                label=f'Median: {np.median(filtered_intervals):.1f} min')
+    plt.axvline(np.mean(filtered_intervals), color='orange', linestyle='--',
+                label=f'Mean: {np.mean(filtered_intervals):.1f} min')
+
+    # Add text showing how many data points were included/excluded
+    total_points = len(intervals_minutes)
+    filtered_points = len(filtered_intervals)
+    excluded_points = total_points - filtered_points
+
+    plt.text(0.98, 0.98,
+             f'Showing {filtered_points}/{total_points} intervals\n({excluded_points} intervals >10h excluded)',
+             transform=plt.gca().transAxes, verticalalignment='top', horizontalalignment='right',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.legend()
+
+    plt.tight_layout()
+    linear_path = Path(output_dir) / 't0_intervals_histogram_linear.png'
+    plt.savefig(linear_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Linear scale histogram saved to: {linear_path}")
+
+    # Create histogram of t0 counts per patient
+    plt.figure(figsize=(10, 6))
+    plt.hist(patient_t0_counts, bins=range(max(patient_t0_counts) + 2),
+             alpha=0.7, color='coral', edgecolor='black')
+    plt.xlabel('Number of t₀ events per patient', fontsize=12)
+    plt.ylabel('Number of patients', fontsize=12)
+    plt.title('Distribution of t₀ Event Counts Per Patient', fontsize=14)
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    counts_path = Path(output_dir) / 't0_counts_per_patient_histogram.png'
+    plt.savefig(counts_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Patient t0 counts histogram saved to: {counts_path}")
+
+
+def add_t0_analysis_to_main(args):
+    """
+    Add this function call to the main() function after processing is complete.
+    """
+    output_dir = Path(args.output_dir)
+
+    # Run the t0 interval analysis
+    trajectory_metadata_path = output_dir / "med_tensors" / "trajectory_metadata.pkl"
+    med_tensors_dir = output_dir / "med_tensors"
+
+    if trajectory_metadata_path.exists() and med_tensors_dir.exists():
+        intervals_data = analyze_t0_intervals(
+            trajectory_metadata_path=str(trajectory_metadata_path),
+            med_tensors_dir=str(med_tensors_dir),
+            output_dir=str(output_dir),
+            interval_minutes=args.interval_minutes
+        )
+
+        if intervals_data:
+            create_additional_t0_analyses(intervals_data, str(output_dir))
+    else:
+        print(f"Could not find required files for t0 analysis:")
+        print(f"  Trajectory metadata: {trajectory_metadata_path.exists()}")
+        print(f"  Med tensors directory: {med_tensors_dir.exists()}")
+
+
+def analyze_physio_data_presence_around_t0(
+        trajectory_metadata_path,
+        physio_metadata_path,
+        med_tensors_dir,
+        physio_tensors_dir,
+        output_dir,
+        interval_minutes=5
+):
+    """
+    Analyze physiological data presence around t_0 events.
+
+    Uses the same "last t₀ from each trajectory" approach to avoid duplicate counting.
+
+    Parameters:
+    - trajectory_metadata_path: Path to medication trajectory metadata
+    - physio_metadata_path: Path to physiological trajectory metadata
+    - med_tensors_dir: Directory containing medication tensors (for t_0 events)
+    - physio_tensors_dir: Directory containing physiological tensors
+    - output_dir: Directory to save visualizations
+    - interval_minutes: Minutes per time interval
+    """
+    print("Loading metadata...")
+
+    # Load trajectory metadata
+    with open(trajectory_metadata_path, 'rb') as f:
+        med_trajectory_data = pickle.load(f)
+
+    with open(physio_metadata_path, 'rb') as f:
+        physio_trajectory_data = pickle.load(f)
+
+    all_trajectories = med_trajectory_data['all_trajectories']
+    medication_info = med_trajectory_data['medication_info']
+    physio_params = physio_trajectory_data['physio_params']
+
+    # The t0_trigger is the last column in medication tensors
+    t0_trigger_idx = len(medication_info) + 1  # +1 for crystalloid_sum, +1 for t0_trigger
+
+    # Define time windows (hours before t_0)
+    time_windows = [1, 3, 5]  # hours
+
+    print(f"Analyzing physiological data presence around t_0 events...")
+    print(f"Time windows: {time_windows} hours before t_0")
+    print(f"Physiological parameters: {len(physio_params)}")
+    print("Strategy: Using LAST t₀ from each trajectory to avoid duplicates")
+
+    # Storage for all data presence measurements
+    # Structure: {window_hours: {param_idx: [presence_ratios], 'overall': [presence_ratios]}}
+    data_presence = {window: {'overall': []} for window in time_windows}
+
+    # Initialize storage for each physiological parameter
+    for window in time_windows:
+        for param_idx, param in enumerate(physio_params):
+            data_presence[window][param_idx] = []
+
+    # Storage for t_0 event metadata
+    t0_events_metadata = []
+
+    total_t0_events = 0
+    processed_patients = 0
+
+    for hadm_id, patient_trajectories in tqdm(all_trajectories.items(), desc="Processing patients"):
+        processed_patients += 1
+
+        # Use the same strategy: take last t₀ from each trajectory
+        for traj_info in patient_trajectories:
+            traj_num = traj_info['trajectory_num']
+
+            # Load medication tensor to find t_0 events
+            med_tensor_file = Path(med_tensors_dir) / f"med_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+            physio_tensor_file = Path(physio_tensors_dir) / f"p_tensor_in_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+
+            if not med_tensor_file.exists() or not physio_tensor_file.exists():
+                continue
+
+            try:
+                # Load medication tensor
+                med_values, med_mask, med_abs_time, med_rel_time, med_length = torch.load(med_tensor_file)
+
+                # Load physiological tensor
+                physio_values, physio_mask, physio_abs_time, physio_rel_time, physio_length = torch.load(
+                    physio_tensor_file)
+
+                # Extract t0_trigger column
+                t0_array = med_values[:, t0_trigger_idx].numpy()
+
+                # Find t0 events (where value = 1)
+                t0_indices = np.where(t0_array == 1)[0]
+
+                if len(t0_indices) > 0:
+                    # Take ONLY the last t₀ from this trajectory
+                    t0_idx = t0_indices[-1]
+                    total_t0_events += 1
+
+                    # Store metadata for this t_0 event
+                    t0_time_hours = med_rel_time[t0_idx].item()
+                    t0_events_metadata.append({
+                        'hadm_id': hadm_id,
+                        'trajectory_num': traj_num,
+                        't0_idx': t0_idx,
+                        't0_time_hours': t0_time_hours
+                    })
+
+                    # For each time window, calculate data presence
+                    for window_hours in time_windows:
+                        # Calculate how many intervals back to look
+                        intervals_back = int(window_hours * 60 / interval_minutes)
+
+                        # Define the window: from (t0_idx - intervals_back) to t0_idx
+                        window_start = max(0, t0_idx - intervals_back)
+                        window_end = t0_idx  # Don't include t0 itself, just before it
+
+                        if window_end <= window_start:
+                            # Not enough data before t0, skip this window
+                            continue
+
+                        # Extract physiological mask for this window
+                        window_mask = physio_mask[window_start:window_end, :]  # Shape: (time_points, n_params)
+
+                        if window_mask.shape[0] == 0:
+                            continue
+
+                        # Calculate overall data presence (across all parameters and time points)
+                        total_possible_measurements = window_mask.shape[0] * window_mask.shape[1]
+                        total_present_measurements = torch.sum(window_mask).item()
+                        overall_presence_ratio = total_present_measurements / total_possible_measurements if total_possible_measurements > 0 else 0
+
+                        data_presence[window_hours]['overall'].append(overall_presence_ratio)
+
+                        # Calculate data presence for each parameter individually
+                        for param_idx in range(window_mask.shape[1]):
+                            param_mask = window_mask[:, param_idx]
+                            param_total_possible = param_mask.shape[0]
+                            param_total_present = torch.sum(param_mask).item()
+                            param_presence_ratio = param_total_present / param_total_possible if param_total_possible > 0 else 0
+
+                            data_presence[window_hours][param_idx].append(param_presence_ratio)
+
+            except Exception as e:
+                print(f"Error processing patient {hadm_id}, trajectory {traj_num}: {e}")
+                continue
+
+    print(f"\nProcessed {processed_patients} patients")
+    print(f"Found {total_t0_events} unique t_0 events")
+
+    # Create visualizations
+    create_data_presence_visualizations(data_presence, physio_params, time_windows, output_dir)
+
+    # Save raw data
+    save_data_presence_data(data_presence, physio_params, time_windows, t0_events_metadata, output_dir)
+
+    return data_presence
+
+
+def create_data_presence_visualizations(data_presence, physio_params, time_windows, output_dir):
+    """
+    Create all the requested visualizations for data presence analysis.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # 1. Overall physiological matrix presence for each time window
+    print("\nCreating overall data presence histograms...")
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle('Overall Physiological Data Presence Before t₀ Events', fontsize=16)
+
+    for i, window_hours in enumerate(time_windows):
+        presence_data = data_presence[window_hours]['overall']
+
+        if len(presence_data) == 0:
+            axes[i].text(0.5, 0.5, 'No data', ha='center', va='center', transform=axes[i].transAxes)
+            axes[i].set_title(f'{window_hours}h before t₀')
+            continue
+
+        axes[i].hist(presence_data, bins=30, alpha=0.7, color='skyblue', edgecolor='black')
+        axes[i].set_xlabel('Proportion of Present Measurements')
+        axes[i].set_ylabel('Number of t₀ Events')
+        axes[i].set_title(f'{window_hours}h before t₀')
+        axes[i].grid(True, alpha=0.3)
+        axes[i].set_xlim(0, 1)
+
+        # Add statistics
+        mean_presence = np.mean(presence_data)
+        median_presence = np.median(presence_data)
+        axes[i].axvline(mean_presence, color='red', linestyle='--', alpha=0.8, label=f'Mean: {mean_presence:.3f}')
+        axes[i].axvline(median_presence, color='orange', linestyle='--', alpha=0.8,
+                        label=f'Median: {median_presence:.3f}')
+        axes[i].legend()
+
+        # Add text with more statistics
+        stats_text = f'n={len(presence_data)}\nStd: {np.std(presence_data):.3f}'
+        axes[i].text(0.02, 0.98, stats_text, transform=axes[i].transAxes,
+                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
+    plt.savefig(output_path / 'overall_data_presence_by_timeframe.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 2. Individual parameter presence for each time window
+    print("Creating individual parameter data presence histograms...")
+
+    n_params = len(physio_params)
+
+    for window_hours in time_windows:
+        # Create a subplot grid for this time window
+        n_cols = 3
+        n_rows = int(np.ceil(n_params / n_cols))
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
+        fig.suptitle(f'Individual Parameter Data Presence: {window_hours}h Before t₀ Events', fontsize=16)
+
+        axes = axes.flatten() if n_params > 1 else [axes]
+
+        for param_idx, param in enumerate(physio_params):
+            presence_data = data_presence[window_hours][param_idx]
+            param_name = param['param_name']
+
+            ax = axes[param_idx]
+
+            if len(presence_data) == 0:
+                ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f'{param_name}')
+                continue
+
+            ax.hist(presence_data, bins=20, alpha=0.7, color='lightgreen', edgecolor='black')
+            ax.set_xlabel('Proportion of Present Measurements')
+            ax.set_ylabel('Number of t₀ Events')
+            ax.set_title(f'{param_name}')
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0, 1)
+
+            # Add statistics
+            mean_presence = np.mean(presence_data)
+            median_presence = np.median(presence_data)
+            ax.axvline(mean_presence, color='red', linestyle='--', alpha=0.8)
+            ax.axvline(median_presence, color='orange', linestyle='--', alpha=0.8)
+
+            # Add text with statistics
+            stats_text = f'n={len(presence_data)}\nMean: {mean_presence:.3f}\nMedian: {median_presence:.3f}\nStd: {np.std(presence_data):.3f}'
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        # Hide unused subplots
+        for idx in range(n_params, len(axes)):
+            axes[idx].set_visible(False)
+
+        plt.tight_layout()
+        plt.savefig(output_path / f'individual_param_presence_{window_hours}h_before_t0.png', dpi=300,
+                    bbox_inches='tight')
+        plt.close()
+
+
+def save_data_presence_data(data_presence, physio_params, time_windows, t0_events_metadata, output_dir):
+    """
+    Save raw data and summary statistics for data presence analysis.
+    """
+    output_path = Path(output_dir)
+
+    # Save raw data
+    with open(output_path / 'data_presence_raw.pkl', 'wb') as f:
+        pickle.dump({
+            'data_presence': data_presence,
+            'physio_params': physio_params,
+            'time_windows': time_windows,
+            't0_events_metadata': t0_events_metadata
+        }, f)
+
+    # Create summary statistics CSV
+    summary_data = []
+
+    for window_hours in time_windows:
+        # Overall statistics
+        overall_data = data_presence[window_hours]['overall']
+        if len(overall_data) > 0:
+            summary_data.append({
+                'time_window_hours': window_hours,
+                'parameter': 'OVERALL',
+                'n_t0_events': len(overall_data),
+                'mean_presence': np.mean(overall_data),
+                'median_presence': np.median(overall_data),
+                'std_presence': np.std(overall_data),
+                'min_presence': np.min(overall_data),
+                'max_presence': np.max(overall_data),
+                'q25_presence': np.percentile(overall_data, 25),
+                'q75_presence': np.percentile(overall_data, 75)
+            })
+
+        # Individual parameter statistics
+        for param_idx, param in enumerate(physio_params):
+            param_data = data_presence[window_hours][param_idx]
+            if len(param_data) > 0:
+                summary_data.append({
+                    'time_window_hours': window_hours,
+                    'parameter': param['param_name'],
+                    'n_t0_events': len(param_data),
+                    'mean_presence': np.mean(param_data),
+                    'median_presence': np.median(param_data),
+                    'std_presence': np.std(param_data),
+                    'min_presence': np.min(param_data),
+                    'max_presence': np.max(param_data),
+                    'q25_presence': np.percentile(param_data, 25),
+                    'q75_presence': np.percentile(param_data, 75)
+                })
+
+    summary_df = pd.DataFrame(summary_data)
+    summary_df.to_csv(output_path / 'data_presence_summary.csv', index=False)
+
+    # Create detailed CSV with all presence ratios
+    detailed_data = []
+
+    for window_hours in time_windows:
+        # Get the maximum length to align all parameters
+        max_length = max(len(data_presence[window_hours]['overall']),
+                         max([len(data_presence[window_hours][i]) for i in range(len(physio_params))] + [0]))
+
+        for i in range(max_length):
+            row = {
+                'time_window_hours': window_hours,
+                't0_event_idx': i
+            }
+
+            # Add overall presence
+            if i < len(data_presence[window_hours]['overall']):
+                row['overall_presence'] = data_presence[window_hours]['overall'][i]
+            else:
+                row['overall_presence'] = np.nan
+
+            # Add individual parameter presence
+            for param_idx, param in enumerate(physio_params):
+                param_data = data_presence[window_hours][param_idx]
+                if i < len(param_data):
+                    row[f"{param['param_name']}_presence"] = param_data[i]
+                else:
+                    row[f"{param['param_name']}_presence"] = np.nan
+
+            detailed_data.append(row)
+
+    detailed_df = pd.DataFrame(detailed_data)
+    detailed_df.to_csv(output_path / 'data_presence_detailed.csv', index=False)
+
+    print(f"\nSaved data presence analysis results:")
+    print(f"  - Raw data: {output_path / 'data_presence_raw.pkl'}")
+    print(f"  - Summary statistics: {output_path / 'data_presence_summary.csv'}")
+    print(f"  - Detailed data: {output_path / 'data_presence_detailed.csv'}")
+
+
+def add_physio_presence_analysis_to_main(args):
+    """
+    Add this function call to the main() function after processing is complete.
+    """
+    output_dir = Path(args.output_dir)
+
+    # Define paths
+    med_trajectory_metadata_path = output_dir / "med_tensors" / "trajectory_metadata.pkl"
+    physio_trajectory_metadata_path = output_dir / "p_tensors" / "physio_trajectory_metadata.pkl"
+    med_tensors_dir = output_dir / "med_tensors"
+    physio_tensors_dir = output_dir / "p_tensors"
+
+    if (med_trajectory_metadata_path.exists() and
+            physio_trajectory_metadata_path.exists() and
+            med_tensors_dir.exists() and
+            physio_tensors_dir.exists()):
+
+        print("\nAnalyzing physiological data presence around t₀ events...")
+        data_presence = analyze_physio_data_presence_around_t0(
+            trajectory_metadata_path=str(med_trajectory_metadata_path),
+            physio_metadata_path=str(physio_trajectory_metadata_path),
+            med_tensors_dir=str(med_tensors_dir),
+            physio_tensors_dir=str(physio_tensors_dir),
+            output_dir=str(output_dir),
+            interval_minutes=args.interval_minutes
+        )
+
+    else:
+        print(f"Could not find required files for physiological data presence analysis:")
+        print(f"  Med trajectory metadata: {med_trajectory_metadata_path.exists()}")
+        print(f"  Physio trajectory metadata: {physio_trajectory_metadata_path.exists()}")
+        print(f"  Med tensors directory: {med_tensors_dir.exists()}")
+        print(f"  Physio tensors directory: {physio_tensors_dir.exists()}")
+
+
+# To integrate this into the main script, add these lines at the end of main():
+# add_t0_analysis_to_main(args)
+# add_physio_presence_analysis_to_main(args)
+
+
 def main():
     # Heart Rate: 220045
     # MAP: 220052
@@ -2772,7 +3482,7 @@ def main():
                                                       MAP_id=220052,
                                                       save_path=str(relevant_patients_chartevents_path),
                                                       data_limit=args.data_limit)
-
+    """
     hr_params = find_min_max_heartrates(
         str(relevant_patients_chartevents_path),
         metadata_path=str(patient_metadata_path),
@@ -2828,7 +3538,7 @@ def main():
 
     # Detect t0 points and create training data
     #training_data = detect_t0(results_df, crystalloids_list, vasopressors_list)
-    df = debug_specific_patient()
+    #df = debug_specific_patient()
     med_trajectory_metadata_path = str(output_dir / "med_tensors" / "trajectory_metadata.pkl")
 
     with open(med_trajectory_metadata_path, 'rb') as f:
@@ -2864,9 +3574,10 @@ def main():
         input_dir=str(input_dir),
         output_dir=str(output_dir),
         trajectory_metadata_path=med_trajectory_metadata_path
-    )
+    )"""
 
-
+    add_t0_analysis_to_main(args)
+    add_physio_presence_analysis_to_main(args)
     print("\nProcessing complete!")
 
 
