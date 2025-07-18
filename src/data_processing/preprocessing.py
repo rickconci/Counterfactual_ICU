@@ -2703,16 +2703,6 @@ def create_baseline_tensors(input_dir, output_dir, trajectory_metadata_path):
     print(f"Baseline feature dimension: {baseline_metadata['feature_dim']}")
 
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import torch
-import pickle
-from pathlib import Path
-from tqdm import tqdm
-import os
-
-
 def analyze_t0_intervals(trajectory_metadata_path, med_tensors_dir, output_dir, interval_minutes=5):
     """
     Analyze intervals between t_0 events and create a histogram.
@@ -3148,7 +3138,7 @@ def analyze_physio_data_presence_around_t0(
                             continue
 
                         # Calculate overall data presence (across all parameters and time points)
-                        total_possible_measurements = window_mask.shape[0] * window_mask.shape[1]
+                        total_possible_measurements = 1
                         total_present_measurements = torch.sum(window_mask).item()
                         overall_presence_ratio = total_present_measurements / total_possible_measurements if total_possible_measurements > 0 else 0
 
@@ -3157,7 +3147,7 @@ def analyze_physio_data_presence_around_t0(
                         # Calculate data presence for each parameter individually
                         for param_idx in range(window_mask.shape[1]):
                             param_mask = window_mask[:, param_idx]
-                            param_total_possible = param_mask.shape[0]
+                            param_total_possible = 1
                             param_total_present = torch.sum(param_mask).item()
                             param_presence_ratio = param_total_present / param_total_possible if param_total_possible > 0 else 0
 
@@ -3181,51 +3171,52 @@ def analyze_physio_data_presence_around_t0(
 
 def create_data_presence_visualizations(data_presence, physio_params, time_windows, output_dir):
     """
-    Create all the requested visualizations for data presence analysis.
+    Create visualizations for physiological data counts around t₀ events.
+    Uses the denominator=1 hack, so data_presence actually contains raw counts.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Overall physiological matrix presence for each time window
-    print("\nCreating overall data presence histograms...")
+    # 1. Overall physiological measurement counts for each time window
+    print("\nCreating overall measurement count histograms...")
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle('Overall Physiological Data Presence Before t₀ Events', fontsize=16)
+    fig.suptitle('Total Physiological Measurements Before t₀ Events', fontsize=16)
 
     for i, window_hours in enumerate(time_windows):
-        presence_data = data_presence[window_hours]['overall']
+        count_data = data_presence[window_hours]['overall']  # These are actually counts due to denominator=1
 
-        if len(presence_data) == 0:
+        if len(count_data) == 0:
             axes[i].text(0.5, 0.5, 'No data', ha='center', va='center', transform=axes[i].transAxes)
             axes[i].set_title(f'{window_hours}h before t₀')
             continue
 
-        axes[i].hist(presence_data, bins=30, alpha=0.7, color='skyblue', edgecolor='black')
-        axes[i].set_xlabel('Proportion of Present Measurements')
+        axes[i].hist(count_data, bins=30, alpha=0.7, color='skyblue', edgecolor='black')
+        axes[i].set_xlabel('Total Number of Measurements')
         axes[i].set_ylabel('Number of t₀ Events')
         axes[i].set_title(f'{window_hours}h before t₀')
         axes[i].grid(True, alpha=0.3)
-        axes[i].set_xlim(0, 1)
 
         # Add statistics
-        mean_presence = np.mean(presence_data)
-        median_presence = np.median(presence_data)
-        axes[i].axvline(mean_presence, color='red', linestyle='--', alpha=0.8, label=f'Mean: {mean_presence:.3f}')
-        axes[i].axvline(median_presence, color='orange', linestyle='--', alpha=0.8,
-                        label=f'Median: {median_presence:.3f}')
+        mean_count = np.mean(count_data)
+        median_count = np.median(count_data)
+        axes[i].axvline(mean_count, color='red', linestyle='--', alpha=0.8,
+                       label=f'Mean: {mean_count:.1f}')
+        axes[i].axvline(median_count, color='orange', linestyle='--', alpha=0.8,
+                       label=f'Median: {median_count:.1f}')
         axes[i].legend()
 
-        # Add text with more statistics
-        stats_text = f'n={len(presence_data)}\nStd: {np.std(presence_data):.3f}'
+        # Add text with statistics
+        stats_text = f'n={len(count_data)}\nStd: {np.std(count_data):.1f}\nMax: {np.max(count_data):.0f}'
         axes[i].text(0.02, 0.98, stats_text, transform=axes[i].transAxes,
                      verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     plt.tight_layout()
-    plt.savefig(output_path / 'overall_data_presence_by_timeframe.png', dpi=300, bbox_inches='tight')
+    plt.savefig(output_path / 'total_measurement_counts_by_timeframe.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 2. Individual parameter presence for each time window
-    print("Creating individual parameter data presence histograms...")
+    # 2. Individual parameter measurement counts for each time window
+    print("Creating individual parameter measurement count histograms...")
 
     n_params = len(physio_params)
 
@@ -3235,36 +3226,35 @@ def create_data_presence_visualizations(data_presence, physio_params, time_windo
         n_rows = int(np.ceil(n_params / n_cols))
 
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
-        fig.suptitle(f'Individual Parameter Data Presence: {window_hours}h Before t₀ Events', fontsize=16)
+        fig.suptitle(f'Individual Parameter Measurement Counts: {window_hours}h Before t₀ Events', fontsize=16)
 
         axes = axes.flatten() if n_params > 1 else [axes]
 
         for param_idx, param in enumerate(physio_params):
-            presence_data = data_presence[window_hours][param_idx]
+            count_data = data_presence[window_hours][param_idx]  # These are actually counts due to denominator=1
             param_name = param['param_name']
 
             ax = axes[param_idx]
 
-            if len(presence_data) == 0:
+            if len(count_data) == 0:
                 ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
                 ax.set_title(f'{param_name}')
                 continue
 
-            ax.hist(presence_data, bins=20, alpha=0.7, color='lightgreen', edgecolor='black')
-            ax.set_xlabel('Proportion of Present Measurements')
+            ax.hist(count_data, bins=20, alpha=0.7, color='lightgreen', edgecolor='black')
+            ax.set_xlabel('Number of Measurements')
             ax.set_ylabel('Number of t₀ Events')
             ax.set_title(f'{param_name}')
             ax.grid(True, alpha=0.3)
-            ax.set_xlim(0, 1)
 
             # Add statistics
-            mean_presence = np.mean(presence_data)
-            median_presence = np.median(presence_data)
-            ax.axvline(mean_presence, color='red', linestyle='--', alpha=0.8)
-            ax.axvline(median_presence, color='orange', linestyle='--', alpha=0.8)
+            mean_count = np.mean(count_data)
+            median_count = np.median(count_data)
+            ax.axvline(mean_count, color='red', linestyle='--', alpha=0.8)
+            ax.axvline(median_count, color='orange', linestyle='--', alpha=0.8)
 
             # Add text with statistics
-            stats_text = f'n={len(presence_data)}\nMean: {mean_presence:.3f}\nMedian: {median_presence:.3f}\nStd: {np.std(presence_data):.3f}'
+            stats_text = f'n={len(count_data)}\nMean: {mean_count:.1f}\nMedian: {median_count:.1f}\nStd: {np.std(count_data):.1f}\nMax: {np.max(count_data):.0f}'
             ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
@@ -3273,27 +3263,28 @@ def create_data_presence_visualizations(data_presence, physio_params, time_windo
             axes[idx].set_visible(False)
 
         plt.tight_layout()
-        plt.savefig(output_path / f'individual_param_presence_{window_hours}h_before_t0.png', dpi=300,
+        plt.savefig(output_path / f'individual_param_counts_{window_hours}h_before_t0.png', dpi=300,
                     bbox_inches='tight')
         plt.close()
 
 
 def save_data_presence_data(data_presence, physio_params, time_windows, t0_events_metadata, output_dir):
     """
-    Save raw data and summary statistics for data presence analysis.
+    Save raw data and summary statistics for measurement count analysis.
+    Updated variable names to reflect that we're dealing with counts (due to denominator=1 hack).
     """
     output_path = Path(output_dir)
 
-    # Save raw data
-    with open(output_path / 'data_presence_raw.pkl', 'wb') as f:
+    # Save raw data (rename for clarity)
+    with open(output_path / 'measurement_counts_raw.pkl', 'wb') as f:
         pickle.dump({
-            'data_presence': data_presence,
+            'measurement_counts': data_presence,  # More accurate name
             'physio_params': physio_params,
             'time_windows': time_windows,
             't0_events_metadata': t0_events_metadata
         }, f)
 
-    # Create summary statistics CSV
+    # Create summary statistics CSV with appropriate column names
     summary_data = []
 
     for window_hours in time_windows:
@@ -3304,13 +3295,13 @@ def save_data_presence_data(data_presence, physio_params, time_windows, t0_event
                 'time_window_hours': window_hours,
                 'parameter': 'OVERALL',
                 'n_t0_events': len(overall_data),
-                'mean_presence': np.mean(overall_data),
-                'median_presence': np.median(overall_data),
-                'std_presence': np.std(overall_data),
-                'min_presence': np.min(overall_data),
-                'max_presence': np.max(overall_data),
-                'q25_presence': np.percentile(overall_data, 25),
-                'q75_presence': np.percentile(overall_data, 75)
+                'mean_count': np.mean(overall_data),
+                'median_count': np.median(overall_data),
+                'std_count': np.std(overall_data),
+                'min_count': np.min(overall_data),
+                'max_count': np.max(overall_data),
+                'q25_count': np.percentile(overall_data, 25),
+                'q75_count': np.percentile(overall_data, 75)
             })
 
         # Individual parameter statistics
@@ -3321,19 +3312,19 @@ def save_data_presence_data(data_presence, physio_params, time_windows, t0_event
                     'time_window_hours': window_hours,
                     'parameter': param['param_name'],
                     'n_t0_events': len(param_data),
-                    'mean_presence': np.mean(param_data),
-                    'median_presence': np.median(param_data),
-                    'std_presence': np.std(param_data),
-                    'min_presence': np.min(param_data),
-                    'max_presence': np.max(param_data),
-                    'q25_presence': np.percentile(param_data, 25),
-                    'q75_presence': np.percentile(param_data, 75)
+                    'mean_count': np.mean(param_data),
+                    'median_count': np.median(param_data),
+                    'std_count': np.std(param_data),
+                    'min_count': np.min(param_data),
+                    'max_count': np.max(param_data),
+                    'q25_count': np.percentile(param_data, 25),
+                    'q75_count': np.percentile(param_data, 75)
                 })
 
     summary_df = pd.DataFrame(summary_data)
-    summary_df.to_csv(output_path / 'data_presence_summary.csv', index=False)
+    summary_df.to_csv(output_path / 'measurement_counts_summary.csv', index=False)
 
-    # Create detailed CSV with all presence ratios
+    # Create detailed CSV with all counts (updated column names)
     detailed_data = []
 
     for window_hours in time_windows:
@@ -3347,29 +3338,29 @@ def save_data_presence_data(data_presence, physio_params, time_windows, t0_event
                 't0_event_idx': i
             }
 
-            # Add overall presence
+            # Add overall count
             if i < len(data_presence[window_hours]['overall']):
-                row['overall_presence'] = data_presence[window_hours]['overall'][i]
+                row['overall_count'] = data_presence[window_hours]['overall'][i]
             else:
-                row['overall_presence'] = np.nan
+                row['overall_count'] = np.nan
 
-            # Add individual parameter presence
+            # Add individual parameter counts
             for param_idx, param in enumerate(physio_params):
                 param_data = data_presence[window_hours][param_idx]
                 if i < len(param_data):
-                    row[f"{param['param_name']}_presence"] = param_data[i]
+                    row[f"{param['param_name']}_count"] = param_data[i]
                 else:
-                    row[f"{param['param_name']}_presence"] = np.nan
+                    row[f"{param['param_name']}_count"] = np.nan
 
             detailed_data.append(row)
 
     detailed_df = pd.DataFrame(detailed_data)
-    detailed_df.to_csv(output_path / 'data_presence_detailed.csv', index=False)
+    detailed_df.to_csv(output_path / 'measurement_counts_detailed.csv', index=False)
 
-    print(f"\nSaved data presence analysis results:")
-    print(f"  - Raw data: {output_path / 'data_presence_raw.pkl'}")
-    print(f"  - Summary statistics: {output_path / 'data_presence_summary.csv'}")
-    print(f"  - Detailed data: {output_path / 'data_presence_detailed.csv'}")
+    print(f"\nSaved measurement count analysis results:")
+    print(f"  - Raw data: {output_path / 'measurement_counts_raw.pkl'}")
+    print(f"  - Summary statistics: {output_path / 'measurement_counts_summary.csv'}")
+    print(f"  - Detailed data: {output_path / 'measurement_counts_detailed.csv'}")
 
 
 def add_physio_presence_analysis_to_main(args):
@@ -3482,7 +3473,7 @@ def main():
                                                       MAP_id=220052,
                                                       save_path=str(relevant_patients_chartevents_path),
                                                       data_limit=args.data_limit)
-    """
+
     hr_params = find_min_max_heartrates(
         str(relevant_patients_chartevents_path),
         metadata_path=str(patient_metadata_path),
@@ -3574,7 +3565,7 @@ def main():
         input_dir=str(input_dir),
         output_dir=str(output_dir),
         trajectory_metadata_path=med_trajectory_metadata_path
-    )"""
+    )
 
     add_t0_analysis_to_main(args)
     add_physio_presence_analysis_to_main(args)

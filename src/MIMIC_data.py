@@ -174,7 +174,7 @@ class MIMICDataModule(L.LightningDataModule):
     @staticmethod
     def collate_fn(batch):
         # Define the expected max_len (should match the model's max_len parameter)
-        MAX_LEN = 50  # or get this from somewhere consistent
+        MAX_LEN = 215  # or get this from somewhere consistent
 
         pad_keys = ["X", "X_mask", "Y_fact", "Y_cf", "t_X", "t_Y", "t_full", "full_fact_traj", "full_CF_traj",
                     "meds_in"]

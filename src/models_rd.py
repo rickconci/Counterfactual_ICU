@@ -74,7 +74,7 @@ class Raindrop_v2(nn.Module):
         output_dim = dimension of the output embedding
     """
 
-    def __init__(self, d_inp=36, d_model=64, nhead=4, nhid=128, nlayers=2, dropout=0.3, max_len=50, d_static=9,
+    def __init__(self, d_inp=36, d_model=64, nhead=4, nhid=128, nlayers=2, dropout=0.3, max_len=215, d_static=9,
                  MAX=100, perc=0.5, aggreg='mean', output_dim=2, global_structure=None, sensor_wise_mask=False, static=True, debug=False):
         super().__init__()
         from torch.nn import TransformerEncoder, TransformerEncoderLayer
@@ -104,7 +104,7 @@ class Raindrop_v2(nn.Module):
         if self.sensor_wise_mask == True:
             encoder_layers = TransformerEncoderLayer(self.d_inp*(self.d_ob+16), nhead, nhid, dropout)
         else:
-            encoder_layers = TransformerEncoderLayer(d_model+16, nhead, nhid, dropout)
+            encoder_layers = TransformerEncoderLayer((self.d_inp * self.d_ob + 16), nhead, nhid, dropout)
 
         self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
 
@@ -322,7 +322,7 @@ class Raindrop_v2(nn.Module):
                 debug_print(f"[Raindrop_v2] extended_missing_mask shape: {extended_missing_mask.shape}")
                 
                 for se in range(self.d_inp): #for each sensor, 
-                    r_out = r_out.view(-1, batch_size, self.d_inp, (self.d_ob+16)) #reshape transformer output to include sensor dim 
+                    r_out = r_out.view(-1, batch_size, self.d_inp, (self.d_ob+16)) #reshape transformer output to include sensor dim
                     out = r_out[:, :, se, :] #select the output for the current sensor
                     len = torch.sum(extended_missing_mask[:, :, se], dim=0).unsqueeze(1) #count the missing values in the current sensor
                     out_sensor = torch.sum(out * (1 - extended_missing_mask[:, :, se].unsqueeze(-1)), dim=0) / (len + 1) #get the mean of the non-missing values

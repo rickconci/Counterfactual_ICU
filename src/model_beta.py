@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import wandb
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -102,7 +103,8 @@ class Hybrid_VAE_SDE(LightningModule):
             # For Raindrop, d_model is its internal feature size.
             # Its output before projection will be d_model + d_pe if sensor_wise_mask is False
             # TODO not quite sure if this is still right
-            temporal_embedding_dim = encoder_hidden_dim + 16 # d_model + d_pe
+            d_ob = max(int(encoder_hidden_dim / encoder_input_dim), 2)
+            temporal_embedding_dim = encoder_input_dim * d_ob + 16  # d_model + d_pe
             # TODO make static true and give complete adj matrix
             self.temporal_encoder = Raindrop_v2(
                 d_inp=encoder_input_dim,
@@ -148,7 +150,7 @@ class Hybrid_VAE_SDE(LightningModule):
                 activations=[nn.ReLU(), nn.ReLU()],
                 debug=self.debug
             )
-            # Head 1: Predicts the initial state for all 16 expert ODE variables
+            # Head 1: Predicts the initial state for all 14 expert ODE variables
             self.ode_latent_head = nn.Linear(fusion_hidden_dim, expert_latent_dims)
             # Head 2: Predicts the separate embedding for the neural SDE component
             self.neural_embedding_head = nn.Linear(fusion_hidden_dim, encoder_SDENN_dims)
@@ -271,6 +273,15 @@ class Hybrid_VAE_SDE(LightningModule):
         return z1, z1_logvar, logqp0
     
     def apply_SDE_fun(self, t, y):
+        """
+        Normalise data and add time information (if the appropriate options have been set).
+        Args:
+            t:
+            y:
+
+        Returns:
+
+        """
         if self.debug and t.item() % 10 == 0: # Avoid excessive printing
             print(f"[DEBUG] Hybrid_VAE_SDE apply_SDE_fun: t={t.item()}, y_shape={y.shape}, normalise_for_SDENN={self.normalise_for_SDENN}, include_time={self.include_time}, SDE_input_state={self.SDE_input_state}")
 
@@ -304,8 +315,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
         #print('SDE_NN_input shape', SDE_NN_input.shape)
         #print('SDE_NN_input example', SDE_NN_input[0,:])
-        SDE_NN_output_latents = self.SDEnet(SDE_NN_input) 
-        #print('SDE_NN_output_latents', SDE_NN_output_latents.shape)
+        SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
         #print('SDE_NN_output_latents example', SDE_NN_output_latents[0, :])
         has_nonzero = SDE_NN_output_latents.ne(0.).any()
         #print('SDE_NN Has non-0 OUTPUT??', has_nonzero)
@@ -317,6 +327,8 @@ class Hybrid_VAE_SDE(LightningModule):
         if self.debug and t.item() % 10 == 0:
             pass
 
+        print(f"Y shape: {y.shape}. Expect 161 x 24")
+
 
         batch_size = y.shape[0]
         # TODO temporatily delete NaNs for testing
@@ -326,7 +338,7 @@ class Hybrid_VAE_SDE(LightningModule):
             print(f"NaN locations: {torch.where(nan_mask)}")
             # Replace NaN with safe values to prevent propagation
             y = torch.nan_to_num(y, nan=0.0)
-        # y now contains: [i_ext (2), expert_latents (16), neural_embedding (4)]
+        # y now contains: [i_ext (2), expert_latents (14), neural_embedding (4)]
         i_ext_1 = y[:, 0].unsqueeze(1)
         i_ext_2 = y[:, 1].unsqueeze(1)
         p_a = y[:, 2].unsqueeze(1)
@@ -344,7 +356,7 @@ class Hybrid_VAE_SDE(LightningModule):
         p_aset = y[:, 14].unsqueeze(1)
         tau = y[:, 15].unsqueeze(1)
 
-        if t.item() >= time_to_treatment:
+        if t.item() >= time_to_treatment: # this will always be the case when working with mimics
             dt_i_ext_SDE = self.apply_SDE_fun(t, y) * self.SDE_control_weighting
             dt_i_ext_SDE_1 = dt_i_ext_SDE[:, 0].unsqueeze(1)
             dt_i_ext_SDE_2 = dt_i_ext_SDE[:, 1].unsqueeze(1)
@@ -454,6 +466,7 @@ class Hybrid_VAE_SDE(LightningModule):
         if self.debug and t.item() % 10 == 0:
             print(f"[DEBUG] Hybrid_VAE_SDE h (prior drift): t={t.item()}, y_shape={y.shape}")
 
+
         # y here should be just i_ext_2 (single dimension)
         self.mu = torch.tensor([0.0], device=y.device)
         expanded_mu = self.mu.repeat(y.size(0), 1)
@@ -512,6 +525,8 @@ class Hybrid_VAE_SDE(LightningModule):
         g_i_ext_2 = self.g(t, i_ext_2)
 
         # Build the full diffusion matrix
+
+        #FIXME apply noise here to ext_2
         g_i_ext_1 = torch.zeros([batch_size, 1]).to(y.device)
         g_expert_dims = torch.zeros([batch_size, self.expert_latent_dims]).to(y.device)
         g_neural_dims = torch.zeros([batch_size, self.encoder_SDENN_dims]).to(y.device)
@@ -612,16 +627,21 @@ class Hybrid_VAE_SDE(LightningModule):
         """
         Forward through SDE with batch-compatible variable length support.
         """
+        #sys.setrecursionlimit(10)
         if self.debug:
             print(f"[DEBUG] forward_latent: init_latents_shape={init_latents.shape}")
             if valid_lengths is not None:
                 print(f"[DEBUG] forward_latent: valid_lengths={valid_lengths}")
 
         batch_size = init_latents.shape[0]
+        print(f"init latents shape: {init_latents.shape}. Expected 23 x 7 x 18")
 
-
+        print(f"Tx shape: {Tx.shape}. Expect [23 x 215]")
         # Prepare standard augmented state components
         Tx_expanded = Tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
+        print(f"Tx expanded shape: {Tx_expanded.shape}. Expected: [23 x 7 x 1]")
+        print(time_to_tx)
+
         time_to_tx_expanded = time_to_tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
         i_ext = torch.zeros(batch_size, self.num_samples, self.SDEnet_out_dims).to(init_latents)
         log_path = torch.zeros(batch_size, self.num_samples, 1).to(init_latents)
@@ -629,25 +649,33 @@ class Hybrid_VAE_SDE(LightningModule):
         # Add valid_time to augmented state
         if valid_lengths is not None:
             # Convert indices to actual times
-            valid_times = ts[torch.clamp(valid_lengths - 1, min=0)]
+            valid_times = ts[torch.clamp(valid_lengths - 1, min=0, max=214)]
+            print(valid_times)
             valid_times_expanded = valid_times.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
+            print(f"Valid times expanded shape: {valid_times_expanded.shape}. Expected: [23, 7, 1]")
         else:
             # Use a time beyond the end to indicate no masking needed
             valid_times_expanded = torch.full((batch_size, self.num_samples, 1),
                                               ts[-1] + 1.0, device=init_latents.device)
+
 
         # Create augmented initial state
         aug_y0 = torch.cat([
             i_ext, init_latents, log_path,
             Tx_expanded, time_to_tx_expanded, valid_times_expanded
         ], dim=-1)
+        print(f"aug_y0 shape: {aug_y0.shape}. Expected 23 x 7 x 24") # 24 = i_ext (2) + init_latents (18) + 1 each for rest
 
         # Reshape for SDE integration
-        dim_aug = aug_y0.shape[-1]
+        dim_aug = aug_y0.shape[-1] # 24
         aug_y0 = aug_y0.reshape(-1, dim_aug)
+        print(f"Aug y0 shape: {aug_y0.shape}") # 161 x 24. Each element in the batch has 7 samples: 7 x 23 = 161. 24 variables
 
         # Run SDE integration
         options = {'dtype': torch.float32}
+
+        # FIXME limited steps for debugging
+        ts = ts[:17]
         aug_ys = self.sdeint_fn(
             sde=self,
             y0=aug_y0,
@@ -661,14 +689,18 @@ class Hybrid_VAE_SDE(LightningModule):
             names={'drift': 'f_aug', 'diffusion': 'g_aug'}
         )
 
+        print(f"Aug_ys shape: {aug_ys.shape}. Expect: [len(ts) x 161 x 24]")
+
         # Reshape back and extract outputs (excluding valid_time from outputs)
         aug_ys = aug_ys.view(len(ts), batch_size, self.num_samples, dim_aug).permute(1, 2, 0, 3)
+        print(f"aug_ys shape: {aug_ys.shape}. Expect: 23 x 7 x 17 x 24")
 
         # Extract paths (don't include the valid_time in outputs)
         i_ext_path = aug_ys[:, :, :, :self.SDEnet_out_dims]
         latent_out = aug_ys[:, :, :, self.SDEnet_out_dims:self.expert_latent_dims + self.SDEnet_out_dims]
         logqp_path = aug_ys[:, :, -1, -4]  # Note: -4 now because valid_time is at -1
 
+        print(f"Latent out: {latent_out.shape}. Expect [23 x 7 x 17 x 14]")
         return latent_out, logqp_path, i_ext_path
 
     def forward_dec(self, latent_out):
@@ -694,7 +726,6 @@ class Hybrid_VAE_SDE(LightningModule):
             latent_out = latent_out / divisors
 
         output_traj = select_tensor_by_index_list_advanced(latent_out, self.decoder_output_dims)
-        #print('output_traj', output_traj.shape, output_traj[0, 0, :, :])
 
         if self.debug: print(f"[DEBUG] Hybrid_VAE_SDE forward_dec: decoded_mean_shape={output_traj.shape}")
         return output_traj
@@ -709,11 +740,15 @@ class Hybrid_VAE_SDE(LightningModule):
         # Compute log probability
         logpy = distributions.Normal(loc=predicted_traj, scale=self.log_lik_output_scale).log_prob(true_traj_expanded)
 
+        print(f"Mask shape: {mask.shape}. Expected: [23 x 17]")
+        print(mask[0])
+
         if mask is not None:
             # mask shape: [batch, time]
             # Expand mask to match logpy dimensions
             mask_expanded = mask.unsqueeze(1).unsqueeze(-1)  # [batch, 1, time, 1]
             mask_expanded = mask_expanded.expand(-1, predicted_traj.shape[1], -1, predicted_traj.shape[-1])
+            print(f"Mask expanded shape: {mask_expanded.shape}")
             logpy = logpy * mask_expanded
 
             # Sum over time and features, then average over samples
@@ -782,10 +817,10 @@ class Hybrid_VAE_SDE(LightningModule):
 
     def training_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_VAE_SDE training_step: batch_idx={batch_idx}, batch_len={len(batch)}")
+            print(f"[DEBUG] Hybrid_VAE_SDE validation_step: batch_idx={batch_idx}")
 
         if self.dataset == "mimic":
-            # Unpack with valid_lengths already computed by collate_fn
+            # Unpack with valid_lengths
             X, X_mask, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths, meds_in, static_features = batch
         else:
             # Synthetic data path
@@ -796,47 +831,51 @@ class Hybrid_VAE_SDE(LightningModule):
 
         batch_size = X.shape[0]
 
-        if self.debug and batch_idx == 0:
-            print(f"  Valid lengths: {valid_lengths}")
-            print(f"  Y shape: {Y.shape}")
-            print(f"  time_post shape: {time_post.shape}")
+        # Use the full time grid - we'll handle variable lengths in forward_latent
+        ts = time_post[0, :]  # Assuming all sequences share the same time grid
 
-        # Use the full time grid - it's now guaranteed to be monotonic by collate_fn
-        ts = time_post[0, :]  # All sequences share the same padded time grid structure
 
         # TODO: Remove this when using real init states
         init_states_safe = self._get_safe_init_states(init_states)
         init_states = init_states_safe
 
-        # ENCODER LOGIC SECTION
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
+                print(f"X shape: {X.shape}. Should be [23 x 215 x 5]")
                 # Raindrop expects src shape: [seq_len, batch_size, features]
                 X_t = X.permute(1, 0, 2)
+                print(f"Time pre shape: {time_pre.shape}. Should be [23x125]")
                 time_pre_t = time_pre.permute(1, 0)
+                print(f"X_Mask shape: {X.shape}. Should be [23 x 215 x 5]")
                 mask_t = X_mask.permute(1, 0, 2)
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
+                print(f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]")
                 lengths = X_mask.sum(dim=1)[:, 0]
-
-                # Get temporal embedding from Raindrop
+                # temporal encoder is raindrop
                 temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,
                                                                  lengths=lengths)
+                print(f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]")
                 logqp0 = 0
-
-            else:  # GRU Encoder path
+            else:  # GRU Encoder
                 X_for_encoder = self._prepare_encoder_input(X, init_states)
                 temporal_embedding, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
 
-            # Get static and fused embedding
+            print(f"Static features shape: {static_features.shape}")
             static_embedding = self.static_encoder(static_features)
             fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
+            print(f"Fused embedding shape: {fused_embedding.shape}: Expect 76 + 16 = 92. [23 x 92]")
             fused_rep = self.fusion_mlp(fused_embedding)
+            print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
 
-            # Get the two separate outputs from the heads
+            # ode latent head outputs 14 (expert dimensions)
             predicted_ode_latents = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
-            neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            print(f"prediction ode latents shape: {predicted_ode_latents.shape}. Expect: [23 x 7 x 14]")
 
-        else:  # No encoder path
+            # neural embedding head outputs: 4
+            neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            print(f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]")
+
+        else:  # No encoder
             X_for_encoder = self._prepare_encoder_input(X, init_states)
             z1_encoder, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
             predicted_ode_latents = z1_encoder[:, :, :self.expert_latent_dims]
@@ -854,17 +893,17 @@ class Hybrid_VAE_SDE(LightningModule):
             valid_lengths=valid_lengths
         )
 
-        # Select output trajectories from latents
+        # Decode
+        print(f"Latent traj shape: {latent_traj.shape}")
         decoded_traj = self.forward_dec(latent_traj)
+        print(f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]")
 
-        # Create mask for loss computation using valid_lengths
+        # Create mask for loss computation
+        Y = Y[:, :17]
         seq_len = Y.shape[1]
         time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
 
-        # Use logqp0 from GRU if available, otherwise it's 0
-        kl_logqp = logqp0 if self.use_encoder not in ['raindrop', 'none'] else 0
-        total_logqp = kl_logqp + logqp_path
-
+        total_logqp = logqp0 + logqp_path
         loss, nll, kl_div = self.compute_factual_loss(
             predicted_traj=decoded_traj,
             true_traj=Y,
@@ -872,10 +911,11 @@ class Hybrid_VAE_SDE(LightningModule):
             mask=time_mask
         )
 
-        # LOGGING
-        self.log('train_total_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train_NLL', nll, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train_KL', kl_div, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train_total_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train_NLL', nll, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train_KL', kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+
 
         return loss
     def _prepare_sde_initial_state(self, predicted_ode_latents, neural_embedding, init_states):
@@ -894,8 +934,9 @@ class Hybrid_VAE_SDE(LightningModule):
 
         # Part 1: Take the accurate interpolated values
         interpolated_part = init_states.unsqueeze(1).repeat(1, self.num_samples, 1)
+        print(f"Interpolated part dims: {interpolated_part}. Expect: [23 x 7 x 5]")
 
-        # FIXME is it an issue that some predicted latents ARE the same variables that are also ICs?
+        # By fiat, we replace the inferred ODE vals with the actual init states
         # Part 2: Take the inferred values for the remaining ODE variables from the specific head
         inferred_part = predicted_ode_latents[:, :, num_ic_vars:]
         
@@ -906,6 +947,8 @@ class Hybrid_VAE_SDE(LightningModule):
         # Note: The neural part comes *after* the expert ODE part.
         expert_part = torch.cat([interpolated_part, inferred_part], dim=-1)
         z1_for_sde = torch.cat([expert_part, neural_part], dim=-1)
+
+        print(f"Z1 for SDE dim: {z1_for_sde.shape}. Expect: [23 x 7 x 18]")
 
 
         if self.debug:
@@ -939,24 +982,39 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
+                print(f"X shape: {X.shape}. Should be [23 x 215 x 5]")
+                # Raindrop expects src shape: [seq_len, batch_size, features]
                 X_t = X.permute(1, 0, 2)
+                print(f"Time pre shape: {time_pre.shape}. Should be [23x125]")
                 time_pre_t = time_pre.permute(1, 0)
+                print(f"X_Mask shape: {X.shape}. Should be [23 x 215 x 5]")
                 mask_t = X_mask.permute(1, 0, 2)
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
+                print(f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]")
                 lengths = X_mask.sum(dim=1)[:, 0]
+                # temporal encoder is raindrop
                 temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,
                                                                  lengths=lengths)
+                print(f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]")
                 logqp0 = 0
             else:  # GRU Encoder
                 X_for_encoder = self._prepare_encoder_input(X, init_states)
                 temporal_embedding, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
 
+            print(f"Static features shape: {static_features.shape}")
             static_embedding = self.static_encoder(static_features)
             fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
+            print(f"Fused embedding shape: {fused_embedding.shape}: Expect 76 + 16 = 92. [23 x 92]")
             fused_rep = self.fusion_mlp(fused_embedding)
+            print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
 
+            # ode latent head outputs 14 (expert dimensions)
             predicted_ode_latents = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            print(f"prediction ode latents shape: {predicted_ode_latents.shape}. Expect: [23 x 7 x 14]")
+
+            # neural embedding head outputs: 4
             neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            print(f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]")
 
         else:  # No encoder
             X_for_encoder = self._prepare_encoder_input(X, init_states)
@@ -977,9 +1035,12 @@ class Hybrid_VAE_SDE(LightningModule):
         )
 
         # Decode
+        print(f"Latent traj shape: {latent_traj.shape}")
         decoded_traj = self.forward_dec(latent_traj)
+        print(f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]")
 
         # Create mask for loss computation
+        Y = Y[:, :17]
         seq_len = Y.shape[1]
         time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
 
@@ -1007,7 +1068,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
     def test_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_VAE_SDE test_step: batch_idx={batch_idx}")
+            print(f"[DEBUG] Hybrid_VAE_SDE validation_step: batch_idx={batch_idx}")
 
         if self.dataset == "mimic":
             # Unpack with valid_lengths
@@ -1031,24 +1092,39 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
+                print(f"X shape: {X.shape}. Should be [23 x 215 x 5]")
+                # Raindrop expects src shape: [seq_len, batch_size, features]
                 X_t = X.permute(1, 0, 2)
+                print(f"Time pre shape: {time_pre.shape}. Should be [23x125]")
                 time_pre_t = time_pre.permute(1, 0)
+                print(f"X_Mask shape: {X.shape}. Should be [23 x 215 x 5]")
                 mask_t = X_mask.permute(1, 0, 2)
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
+                print(f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]")
                 lengths = X_mask.sum(dim=1)[:, 0]
+                # temporal encoder is raindrop
                 temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,
                                                                  lengths=lengths)
+                print(f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]")
                 logqp0 = 0
-            else:  # GRU
+            else:  # GRU Encoder
                 X_for_encoder = self._prepare_encoder_input(X, init_states)
                 temporal_embedding, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
 
+            print(f"Static features shape: {static_features.shape}")
             static_embedding = self.static_encoder(static_features)
             fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
+            print(f"Fused embedding shape: {fused_embedding.shape}: Expect 76 + 16 = 92. [23 x 92]")
             fused_rep = self.fusion_mlp(fused_embedding)
+            print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
 
+            # ode latent head outputs 14 (expert dimensions)
             predicted_ode_latents = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            print(f"prediction ode latents shape: {predicted_ode_latents.shape}. Expect: [23 x 7 x 14]")
+
+            # neural embedding head outputs: 4
             neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            print(f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]")
 
         else:  # No encoder
             X_for_encoder = self._prepare_encoder_input(X, init_states)
@@ -1069,9 +1145,12 @@ class Hybrid_VAE_SDE(LightningModule):
         )
 
         # Decode
+        print(f"Latent traj shape: {latent_traj.shape}")
         decoded_traj = self.forward_dec(latent_traj)
+        print(f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]")
 
         # Create mask for loss computation
+        Y = Y[:, :17]
         seq_len = Y.shape[1]
         time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
 
@@ -1083,28 +1162,26 @@ class Hybrid_VAE_SDE(LightningModule):
             mask=time_mask
         )
 
-        # Test-specific logging
-        self.log('test_total_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('test_total_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)  # val_ -> test_
         self.log('test_NLL', nll, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('test_KL', kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
-        # Compute additional test metrics
         with torch.no_grad():
-            # MSE only on valid portions
-            mse_per_sample = ((decoded_traj.mean(1) - Y) ** 2) * time_mask.unsqueeze(-1)
-            valid_mse = mse_per_sample.sum() / (time_mask.sum() * Y.shape[-1])
-            self.log('test_mse', valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                # MSE only on valid portions
+                mse_per_sample = ((decoded_traj.mean(1) - Y) ** 2) * time_mask.unsqueeze(-1)
+                valid_mse = mse_per_sample.sum() / (time_mask.sum() * Y.shape[-1])
+                self.log('test_mse', valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
-        # Return outputs for potential use in test_epoch_end
+            # Update the return statement:
         return {
-            'test_loss': loss,
-            'test_nll': nll,
-            'test_kl': kl_div,
-            'test_mse': valid_mse,
-            'decoded_traj': decoded_traj,
-            'true_traj': Y,
-            'mask': time_mask
-        }
+                'test_loss': loss,
+                'test_nll': nll,
+                'test_kl': kl_div,
+                'test_mse': valid_mse,  # Add this line
+                'decoded_traj': decoded_traj,
+                'true_traj': Y,
+                'mask': time_mask
+            }
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr = self.learning_rate)

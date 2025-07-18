@@ -63,6 +63,7 @@ def sigmoid(x):
     return 1 / (1 + torch.exp(-x))
 
 
+#TODO I changed this
 def normalise_expert_data(y):
     # If first 2 dims are NN outputs, we should skip them
     nn_output_dims = 2  # Number of NN output dimensions
@@ -78,14 +79,14 @@ def normalise_expert_data(y):
 
     # First, keep the NN outputs as-is (or normalize them differently if needed)
     for i in range(nn_output_dims):
-        normalized_tensors.append(y[:, i].unsqueeze(1))
+        normalized_tensors.append(y[..., i].unsqueeze(-1))  # ← CHANGE: y[:, i] to y[..., i]
 
     # Then normalize the CV parameters starting from the correct index
     for i, key in enumerate(keys):
         # Offset by nn_output_dims to get the correct dimension
         actual_idx = i + nn_output_dims
-        if actual_idx < y.shape[1]:  # Safety check
-            normalized_tensor = ((y[:, actual_idx] - CV_params_prior_mu[key]) / CV_params_prior_sigma[key]).unsqueeze(1)
+        if actual_idx < y.shape[-1]:  # Safety check
+            normalized_tensor = ((y[..., actual_idx] - CV_params_prior_mu[key]) / CV_params_prior_sigma[key]).unsqueeze(-1)  # ← CHANGE: y[:, actual_idx] to y[..., actual_idx]
             normalized_tensors.append(normalized_tensor)
 
     SDE_NN_norm_inputs = torch.cat(normalized_tensors, dim=-1)
