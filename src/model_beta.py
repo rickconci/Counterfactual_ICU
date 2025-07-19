@@ -240,11 +240,11 @@ class Hybrid_VAE_SDE(LightningModule):
         self.mse_data_cf = [[] for _ in range(batch_size)]
 
         self.physio_ranges = {
-            'p_a': (60.0, 180.0), 'p_v': (0.0, 20.0), 's_reflex': (0.0, 1.0),
-            'sv': (40.0, 120.0), 'r_tpr_mod': (-0.5, 0.5), 'f_hr_max': (0.8, 2.0),
-            'f_hr_min': (0.5, 1.2), 'r_tpr_max': (0.8, 2.5), 'r_tpr_min': (0.3, 1.2),
-            'ca': (0.5, 2.0), 'cv': (0.5, 3.0), 'k_width': (1.0, 20.0),
-            'p_aset': (70.0, 120.0), 'tau': (0.5, 10.0)
+            'p_a': (50.0, 180.0), 'p_v': (0.20, 100.0), 's_reflex': (0.0, 1.0),
+            'sv': (40.0, 120.0), 'r_tpr_mod': (0.0, 10), 'f_hr_max': (1.0, 4.0),
+            'f_hr_min': (0.1, 1.0), 'r_tpr_max': (1.5, 2.5), 'r_tpr_min': (0.1, 1.5),
+            'ca': (1.0, 5.0), 'cv': (90.0, 120.0), 'k_width': (0.01, 0.5),
+            'p_aset': (50.0, 90.0), 'tau': (15, 25)
         }
 
         # Pre-compute range tensors for efficiency
@@ -262,8 +262,26 @@ class Hybrid_VAE_SDE(LightningModule):
 
     def transform_sigmoid_to_physiological_ranges(self, sigmoid_values):
         """Simplified version using pre-computed ranges"""
+        # Check input for NaN/inf
+        print(f"[DEBUG] Physiological transform input stats:")
+        print(f"  Shape: {sigmoid_values.shape}")
+        print(f"  Min/Max: {sigmoid_values.min().item()}/{sigmoid_values.max().item()}")
+        print(f"  Contains NaN: {torch.isnan(sigmoid_values).any()}")
+        print(f"  Sample values: {sigmoid_values[0, 0, :5]}")
+
+        # Check that sigmoid values are actually in [0,1] range
+        if sigmoid_values.min().item() < 0 or sigmoid_values.max().item() > 1:
+            print(f"[WARNING] Sigmoid values outside [0,1] range!")
+
         transformed = self.physio_min_vals + sigmoid_values * (self.physio_max_vals - self.physio_min_vals)
-        return torch.clamp(transformed, min=self.physio_min_vals, max=self.physio_max_vals)
+        transformed = torch.clamp(transformed, min=self.physio_min_vals, max=self.physio_max_vals)
+
+        print(f"[DEBUG] Physiological transform output stats:")
+        print(f"  Min/Max: {transformed.min().item()}/{transformed.max().item()}")
+        print(f"  Contains NaN: {torch.isnan(transformed).any()}")
+        print(f"  Sample transformed: {transformed[0, 0, :5]}")
+
+        return transformed
         
     def forward_enc(self, input_vals, time_in, static=None, lengths=None):
         if self.debug: print(
@@ -702,6 +720,28 @@ class Hybrid_VAE_SDE(LightningModule):
         dim_aug = aug_y0.shape[-1] # 24
         aug_y0 = aug_y0.reshape(-1, dim_aug)
         print(f"Aug y0 shape: {aug_y0.shape}") # 161 x 24. Each element in the batch has 7 samples: 7 x 23 = 161. 24 variables
+        print(f"[DEBUG] aug_y0 stats before SDE:")
+        print(f"  Shape: {aug_y0.shape}")
+        print(f"  Contains NaN: {torch.isnan(aug_y0).any()}")
+        print(f"  Contains Inf: {torch.isinf(aug_y0).any()}")
+        print(f"  Min/Max: {aug_y0.min().item()}/{aug_y0.max().item()}")
+
+        # TODO remove this
+        if torch.isnan(aug_y0).any():
+            print(f"[ERROR] NaN in aug_y0 before SDE integration!")
+            nan_locations = torch.where(torch.isnan(aug_y0))
+            print(f"NaN at positions: {nan_locations}")
+            # Print some examples
+            for i in range(min(5, len(nan_locations[0]))):
+                row, col = nan_locations[0][i], nan_locations[1][i]
+                print(f"  aug_y0[{row}, {col}] = NaN")
+            return torch.zeros_like(init_latents), torch.zeros(init_latents.shape[0]), torch.zeros_like(init_latents)
+
+        # Check for extreme values that might cause numerical issues
+        if aug_y0.max().item() > 1e6 or aug_y0.min().item() < -1e6:
+            print(f"[WARNING] Extreme values in aug_y0: min={aug_y0.min().item()}, max={aug_y0.max().item()}")
+
+        breakpoint()
 
         # Run SDE integration
         options = {'dtype': torch.float32}
@@ -968,6 +1008,37 @@ class Hybrid_VAE_SDE(LightningModule):
         # Prepare the SDE initial state
         z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
 
+        if torch.isnan(z1_for_sde).any():
+            print(f"[ERROR] NaN in z1_for_sde at batch {batch_idx}")
+            print(f"NaN locations: {torch.where(torch.isnan(z1_for_sde))}")
+            return torch.tensor(0.0, requires_grad=True, device=self.device)
+
+            # Run SDE
+        latent_traj, logqp_path, i_ext_path = self.forward_latent(
+            init_latents=z1_for_sde,
+            ts=ts,
+            Tx=T,
+            time_to_tx=torch.zeros(batch_size).to(self.device),
+            valid_lengths=valid_lengths
+        )
+
+        # 2. Check SDE output for NaN
+        if torch.isnan(latent_traj).any():
+            print(f"[ERROR] NaN in latent_traj after SDE integration at batch {batch_idx}")
+            print(f"NaN locations: {torch.where(torch.isnan(latent_traj))}")
+            return torch.tensor(0.0, requires_grad=True, device=self.device)
+
+        # Decode
+        decoded_traj = self.forward_dec(latent_traj)
+
+        # 3. Check decoded output for NaN
+        if torch.isnan(decoded_traj).any():
+            print(f"[ERROR] NaN in decoded_traj after decoding at batch {batch_idx}")
+            print(f"NaN locations: {torch.where(torch.isnan(decoded_traj))}")
+            return torch.tensor(0.0, requires_grad=True, device=self.device)
+
+        """
+
         # Run SDE with variable lengths
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
@@ -980,7 +1051,7 @@ class Hybrid_VAE_SDE(LightningModule):
         # Decode
         print(f"Latent traj shape: {latent_traj.shape}")
         decoded_traj = self.forward_dec(latent_traj)
-        print(f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]")
+        print(f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]")"""
 
         # Create mask for loss computation
         Y = Y[:, :17]
@@ -1016,9 +1087,6 @@ class Hybrid_VAE_SDE(LightningModule):
 
         return total_loss  # Return the combined loss
 
-
-
-        return loss
     def _prepare_sde_initial_state(self, predicted_ode_latents, neural_embedding, init_states, ic_mask):
         """
         Prepares the initial state for the SDE by combining the interpolated initial
@@ -1035,7 +1103,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
         # Part 1: Take the accurate interpolated values
         init_states_expanded = init_states.unsqueeze(1).repeat(1, self.num_samples, 1)
-        print(f"Interpolated part dims: {init_states_expanded}. Expect: [23 x 7 x 5]")
+        print(f"Interpolated part dims: {init_states_expanded.shape}. Expect: [23 x 7 x 5]")
 
         ic_mask_expanded = ic_mask.unsqueeze(1).repeat(1, self.num_samples, 1)
 
