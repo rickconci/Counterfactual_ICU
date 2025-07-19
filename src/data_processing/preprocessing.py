@@ -2063,7 +2063,17 @@ def extract_initial_conditions_for_patient(
 
             if idx in physio_interpolators:
                 ic_values[idx] = float(physio_interpolators[idx](t0_minutes))
-                ic_mask[idx] = 1.0
+
+                # Check if we have actual data in the t0 time bin
+                t0_time_idx = int(t0_minutes / interval_minutes)
+                if idx in physio_raw_data:
+                    # Check if any measurement falls in the t0 time bin
+                    times = physio_raw_data[idx]['times']
+                    time_indices = (times / interval_minutes).astype(int)
+                    has_data_in_bin = np.any(time_indices == t0_time_idx)
+                    ic_mask[idx] = 1.0 if has_data_in_bin else 0.0
+                else:
+                    ic_mask[idx] = 0.0
 
                 # Add interpolation details for debugging
                 if idx in physio_raw_data:

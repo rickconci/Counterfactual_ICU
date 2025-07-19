@@ -102,6 +102,8 @@ class MIMICDataset(Dataset):
         full_fact_traj = torch.cat([p_in_values, p_out_padded], dim=0)
         t_full = torch.cat([p_in_rel_time, p_out_rel_time])
 
+        # TODO pass the ic_mask too
+
         return {
             "X": p_in_values,
             "X_mask": p_in_mask,
@@ -110,6 +112,7 @@ class MIMICDataset(Dataset):
             "Y_cf": torch.zeros_like(p_out_values), # No counterfactuals in real data
             "p": torch.tensor(0.0), # Propensity score not applicable here
             "init_state": ic_tensor,
+            "ic_mask": ic_mask_tensor,
             "static": static_feats, # New
             "t_X": p_in_rel_time,
             "t_Y": t_Y,
@@ -178,7 +181,7 @@ class MIMICDataModule(L.LightningDataModule):
 
         pad_keys = ["X", "X_mask", "Y_fact", "Y_cf", "t_X", "t_Y", "t_full", "full_fact_traj", "full_CF_traj",
                     "meds_in"]
-        no_pad_keys = ["T", "p", "init_state", "static"]
+        no_pad_keys = ["T", "p", "init_state", "ic_mask", "static"]
 
         collated = {}
 
@@ -273,7 +276,7 @@ class MIMICDataModule(L.LightningDataModule):
             collated[key] = torch.stack([item[key] for item in batch])
 
         ordered_keys = [
-            'X', 'X_mask', 'Y_fact', 'T', 'Y_cf', 'p', 'init_state',
+            'X', 'X_mask', 'Y_fact', 'T', 'Y_cf', 'p', 'init_state', 'ic_mask',
             't_X', 't_Y', 't_full', 'full_fact_traj', 'full_CF_traj',
             'valid_lengths'
         ]
@@ -281,7 +284,6 @@ class MIMICDataModule(L.LightningDataModule):
         return_list = [collated[k] for k in ordered_keys]
         return_list.append(collated['meds_in'])
         return_list.append(collated['static'])
-
         # Debug print
         # print(f"[DEBUG] Collated Y_fact shape: {collated['Y_fact'].shape}, t_Y shape: {collated['t_Y'].shape}")
 

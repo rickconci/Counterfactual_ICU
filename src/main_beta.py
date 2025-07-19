@@ -318,7 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--final_activation', type=str, default='none', choices=['relu', 'none'], help='Which nonlinearity to add as a final layer to the NN!')
     parser.add_argument('--normalise_for_SDENN', type=bool, default=True, help='Whether to normalise data when handing it to the SDE NN or just scale it )')
     parser.add_argument('--SDEnet_out_dims', type=int, default=2, help='Num output dims for SDE NN  ')
-    parser.add_argument("--output_scale",type=float,default = 0.01, help = "Standard Deviation when computing GaussianNegLL between Y_true and Y_hat")
+    parser.add_argument("--output_scale",type=float,default = 0.1, help = "Standard Deviation when computing GaussianNegLL between Y_true and Y_hat")
     parser.add_argument('--SDE_input_state', type=str, default='full', choices=['full', 'partial'], help='which dims to include in the SDE NN - always do full!')
 
 
