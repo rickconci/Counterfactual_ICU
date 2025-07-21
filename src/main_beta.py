@@ -134,7 +134,8 @@ def main(args):
         data_module = MIMICDataModule(data_root=args.data_root, 
                                       icu_stays_path=args.icu_stays_path, 
                                       batch_size=args.batch_size, 
-                                      num_workers=0)
+                                      num_workers=0,
+                                      random_state=args.seed)
         data_module.setup()
         unique_dir_name = f"MIMIC_DATA_seed={args.seed}" # Simplified name for now
 

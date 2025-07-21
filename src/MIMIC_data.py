@@ -123,7 +123,7 @@ class MIMICDataset(Dataset):
         }
 
 class MIMICDataModule(L.LightningDataModule):
-    def __init__(self, data_root, icu_stays_path, batch_size=32, num_workers=1):
+    def __init__(self, data_root, icu_stays_path, batch_size=32, num_workers=1, random_state = 42):
         super().__init__()
         self.data_root = data_root
         self.icu_stays_path = icu_stays_path
@@ -131,12 +131,13 @@ class MIMICDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.encoder_input_dim = None
         self.expert_latent_dim = None
+        self.random_state = random_state
         self.static_input_dim = None # New
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
-            self.train_dataset = MIMICDataset(self.data_root, self.icu_stays_path, split='train')
-            self.val_dataset = MIMICDataset(self.data_root, self.icu_stays_path, split='val')
+            self.train_dataset = MIMICDataset(self.data_root, self.icu_stays_path, split='train', random_state=self.random_state)
+            self.val_dataset = MIMICDataset(self.data_root, self.icu_stays_path, split='val', random_state=self.random_state)
 
             # --- New: Get static dim from metadata ---
             baseline_metadata_path = os.path.join(self.data_root, 'baseline_tensors', 'baseline_metadata.pkl')
