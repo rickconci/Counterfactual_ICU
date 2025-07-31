@@ -498,7 +498,7 @@ def main_analysis(test_mode: bool = False, max_records: int = None, threshold: f
                 print(f"  Note: {error_count} errors encountered so far")
 
     # Save results
-    output_file = "../processed_data/results.csv"
+    output_file = "../../data/processed_data/results.csv"
     print(f"\nSaving results to {output_file}...")
 
     with open(output_file, 'w', newline='') as csvfile:
@@ -696,7 +696,7 @@ def quick_test():
                 print(f"  ✗ Error processing {record_name}: {e}")
 
         # Save results
-        output_file = "../processed_data/results.csv"
+        output_file = "../../data/processed_data/results.csv"
         print(f"\nSaving results to {output_file}...")
 
         with open(output_file, 'w', newline='') as csvfile:

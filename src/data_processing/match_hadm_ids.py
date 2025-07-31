@@ -888,7 +888,7 @@ def main():
         return
 
     # Save results
-    output_file = "../processed_data/results_with_hadm_id.csv"
+    output_file = "../../data/mimic3refactor/results_with_hadm_id.csv"
     results_df.to_csv(output_file, index=False)
 
     # Summary
