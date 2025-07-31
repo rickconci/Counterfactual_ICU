@@ -28,7 +28,7 @@ def parse_args():
                         help='Time interval in minutes between observations (default: 1)')
 
     # Trajectory window parameters
-    parser.add_argument('--trajectory-before-minutes', type=int, default=60,
+    parser.add_argument('--trajectory-before-minutes', type=int, default=None,
                         help='Minutes before t0 to include in trajectory (default: from ICU admission)')
     parser.add_argument('--trajectory-after-minutes', type=int, default=0,
                         help='Minutes after t0 to include in trajectory (default: 0, ends at t0)')
@@ -200,8 +200,8 @@ def process_single_patient_physio(
         icu_admission_time,
         trajectory_boundaries,
         cache_dir,
-        save_prediction_targets=True,
-        prediction_target_dir="../../data/processed_data/prediction_targets"
+        save_prediction_targets=False,
+        prediction_target_dir="../../data/mimic3refactor/processed_data/prediction_targets"
 ):
     """
     Process physiological measurements for a single patient and save as trajectory tensors.
