@@ -379,7 +379,9 @@ def process_patient_waveforms(hadm_id, patient_id, patient_trajectories, patient
                               icu_admission_time, interval_minutes, prediction_minutes,
                               target_interval_seconds, max_interval_seconds,
                               waveform_cache, database='mimic3wdb-matched'):
-    """Process all trajectories for a patient efficiently"""
+    """
+    FIXED: Process trajectories, but SKIP those that don't fit entirely in a single record
+    """
 
     print(f"\nProcessing patient {patient_id} (HADM {hadm_id}) - {len(patient_ics)} trajectories")
 
@@ -396,93 +398,110 @@ def process_patient_waveforms(hadm_id, patient_id, patient_trajectories, patient
         interval_minutes, prediction_minutes
     )
 
-    # Step 3: Find all records we'll need and group requirements by record
-    records_needed = {}  # {record_key: [time_requirement, ...]}
+    print(f"  Processing {len(time_requirements)} trajectories with {len(patient_records)} available records")
 
-    for req in time_requirements:
-        # Find records for p_tensor
-        p_records = waveform_cache.find_records_for_timerange(
-            patient_id, req['p_tensor_range'][0], req['p_tensor_range'][1]
-        )
-
-        # Find records for prediction targets
-        pred_records = waveform_cache.find_records_for_timerange(
-            patient_id, req['prediction_range'][0], req['prediction_range'][1]
-        )
-
-        # Group by record
-        for record_info in p_records + pred_records:
-            record_key = (record_info['patient_path'], record_info['record_name'])
-            if record_key not in records_needed:
-                records_needed[record_key] = []
-
-            if req not in [r for r in records_needed[record_key]]:
-                records_needed[record_key].append(req)
-
-    print(f"  Will load {len(records_needed)} waveform records")
-
-    # Step 4: Load each needed record once and process all trajectories
     patient_p_tensors = []
     patient_predictions = []
+    skipped_multi_record = 0
+    skipped_no_record = 0
 
-    for record_key, requirements in records_needed.items():
-        record_info = None
-        for rec in patient_records:
-            if (rec['patient_path'], rec['record_name']) == record_key:
-                record_info = rec
-                break
+    # Step 3: Process each trajectory, but SKIP if it spans multiple records
+    for req in time_requirements:
+        traj_num = req['trajectory_num']
+        trajectory_info = req['trajectory_info']
 
-        if record_info is None:
-            continue
+        try:
+            # Find all records that overlap with this trajectory's p_tensor period
+            p_records = waveform_cache.find_records_for_timerange(
+                patient_id, req['p_tensor_range'][0], req['p_tensor_range'][1]
+            )
 
-        # Check if sampling rate is acceptable for predictions
-        if record_info['sampling_rate'] > 0:
-            actual_interval = 1.0 / record_info['sampling_rate']
-            if actual_interval > max_interval_seconds:
-                print(f"    Skipping record {record_info['record_name']} - "
-                      f"sampling too slow ({actual_interval:.1f}s > {max_interval_seconds}s)")
+            # Find all records that overlap with this trajectory's prediction period
+            pred_records = waveform_cache.find_records_for_timerange(
+                patient_id, req['prediction_range'][0], req['prediction_range'][1]
+            )
+
+            # SKIP if trajectory spans multiple records for p_tensor
+            if len(p_records) > 1:
+                print(f"    ✗ Skipping trajectory {traj_num} - spans {len(p_records)} records for p_tensor")
+                skipped_multi_record += 1
+                continue
+            elif len(p_records) == 0:
+                print(f"    ✗ Skipping trajectory {traj_num} - no records cover p_tensor period")
+                skipped_no_record += 1
                 continue
 
-        # Load the record data (cached)
-        record_data = waveform_cache.load_record_data(record_info, database)
-        if record_data is None:
-            continue
+            # SKIP if trajectory spans multiple records for predictions
+            valid_pred_records = []
+            for record_info in pred_records:
+                if record_info['sampling_rate'] > 0:
+                    actual_interval = 1.0 / record_info['sampling_rate']
+                    if actual_interval <= max_interval_seconds:
+                        valid_pred_records.append(record_info)
 
-        # Process all requirements that use this record
-        for req in requirements:
-            traj_num = req['trajectory_num']
-            trajectory_info = req['trajectory_info']
-
-            try:
-                # Create p_tensor if this record covers the trajectory period
-                if (record_info['start_time'] <= req['p_tensor_range'][1] and
-                        record_info['end_time'] >= req['p_tensor_range'][0]):
-
-                    p_tensor_result = create_p_tensor_from_record(
-                        hadm_id, traj_num, trajectory_info, req['p_tensor_range'],
-                        record_data, icu_admission_time, interval_minutes
-                    )
-
-                    if p_tensor_result:
-                        patient_p_tensors.append(p_tensor_result)
-
-                # Create prediction targets if this record covers the prediction period
-                if (record_info['start_time'] <= req['prediction_range'][1] and
-                        record_info['end_time'] >= req['prediction_range'][0]):
-
-                    pred_result = create_prediction_targets_from_record(
-                        hadm_id, traj_num, req['prediction_range'], req['t0_time'],
-                        record_data, prediction_minutes, target_interval_seconds
-                    )
-
-                    if pred_result:
-                        patient_predictions.append(pred_result)
-
-            except Exception as e:
-                print(f"    Error processing trajectory {traj_num} with record {record_info['record_name']}: {e}")
+            if len(valid_pred_records) > 1:
+                print(f"    ✗ Skipping trajectory {traj_num} - spans {len(valid_pred_records)} records for predictions")
+                skipped_multi_record += 1
                 continue
+            elif len(valid_pred_records) == 0:
+                print(f"    ✗ Skipping trajectory {traj_num} - no valid records for predictions")
+                skipped_no_record += 1
+                continue
+
+            # CHECK: Ensure the single p_record FULLY contains the trajectory
+            p_record = p_records[0]
+            if not (p_record['start_time'] <= req['p_tensor_range'][0] and
+                    p_record['end_time'] >= req['p_tensor_range'][1]):
+                print(f"    ✗ Skipping trajectory {traj_num} - record doesn't fully contain trajectory")
+                print(f"      Record: {p_record['start_time']} to {p_record['end_time']}")
+                print(f"      Trajectory: {req['p_tensor_range'][0]} to {req['p_tensor_range'][1]}")
+                skipped_multi_record += 1
+                continue
+
+            # CHECK: Ensure the single pred_record FULLY contains the prediction period
+            pred_record = valid_pred_records[0]
+            if not (pred_record['start_time'] <= req['prediction_range'][0] and
+                    pred_record['end_time'] >= req['prediction_range'][1]):
+                print(f"    ✗ Skipping trajectory {traj_num} - record doesn't fully contain prediction period")
+                skipped_multi_record += 1
+                continue
+
+            print(f"    ✓ Processing trajectory {traj_num} - fits in single records")
+
+            # Create p_tensor from the single overlapping record
+            record_data = waveform_cache.load_record_data(p_record, database)
+            if record_data is None:
+                print(f"    ✗ Failed to load record data for trajectory {traj_num}")
+                continue
+
+            p_tensor_result = create_p_tensor_from_record(
+                hadm_id, traj_num, trajectory_info, req['p_tensor_range'],
+                record_data, icu_admission_time, interval_minutes
+            )
+
+            if p_tensor_result:
+                patient_p_tensors.append(p_tensor_result)
+
+            # Create prediction targets from the single overlapping record
+            pred_record_data = waveform_cache.load_record_data(pred_record, database)
+            if pred_record_data is None:
+                print(f"    ✗ Failed to load prediction record data for trajectory {traj_num}")
+                continue
+
+            pred_result = create_prediction_targets_from_record(
+                hadm_id, traj_num, req['prediction_range'], req['t0_time'],
+                pred_record_data, prediction_minutes, target_interval_seconds
+            )
+
+            if pred_result:
+                patient_predictions.append(pred_result)
+
+        except Exception as e:
+            print(f"    Error processing trajectory {traj_num}: {e}")
+            continue
 
     print(f"  Created {len(patient_p_tensors)} p_tensors and {len(patient_predictions)} prediction targets")
+    print(f"  Skipped {skipped_multi_record} multi-record trajectories, {skipped_no_record} with no coverage")
     return patient_p_tensors, patient_predictions
 
 
