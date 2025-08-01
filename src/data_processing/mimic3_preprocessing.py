@@ -347,14 +347,14 @@ def process_single_patient_physio(
         # Vectorized calculation for SV from CO
         sv_calc_mask = hr_present_mask & (co_mask_array > 0) & (mask_array[:, sv_idx] == 0) & (co_values_array > 0)
         if np.any(sv_calc_mask):
-            values_array[sv_calc_mask, sv_idx] = co_values_array[sv_calc_mask] / values_array[sv_calc_mask, hr_idx]
+            values_array[sv_calc_mask, sv_idx] = (co_values_array[sv_calc_mask] / values_array[sv_calc_mask, hr_idx])*1000
             mask_array[sv_calc_mask, sv_idx] = 1.0
             debug_print(f"    - Calculated {np.sum(sv_calc_mask)} SV values from CO/HR.")
 
         # Vectorized calculation for CO from SV
         co_calc_mask = hr_present_mask & (mask_array[:, sv_idx] > 0) & (co_mask_array == 0) & (values_array[:, sv_idx] > 0)
         if np.any(co_calc_mask):
-            co_values_array[co_calc_mask] = values_array[co_calc_mask, sv_idx] * values_array[co_calc_mask, hr_idx]
+            co_values_array[co_calc_mask] = (values_array[co_calc_mask, sv_idx] * values_array[co_calc_mask, hr_idx])/1000
             co_mask_array[co_calc_mask] = 1.0
             debug_print(f"    - Calculated {np.sum(co_calc_mask)} CO values from SV*HR.")
 

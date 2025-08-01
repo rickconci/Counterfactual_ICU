@@ -377,14 +377,14 @@ def extract_ic_from_loaded_record(hadm_id, traj_num, t0_timestamp, record_data,
         # If we have CO but missing SV: calculate SV = CO / HR
         if (ic_mask.get('CO', 0) > 0 and ic_mask.get('SV', 0) == 0 and
                 ic_values.get('CO', 0) > 0):
-            ic_values['SV'] = ic_values['CO'] / hr_value
+            ic_values['SV'] = (ic_values['CO'] / hr_value)*1000
             ic_mask['SV'] = 1.0
             print(f"      ✓ SV: {ic_values['SV']:.2f} (calculated from CO/HR)")
 
         # If we have SV but missing CO: calculate CO = SV * HR
         elif (ic_mask.get('SV', 0) > 0 and ic_mask.get('CO', 0) == 0 and
               ic_values.get('SV', 0) > 0):
-            ic_values['CO'] = ic_values['SV'] * hr_value
+            ic_values['CO'] = (ic_values['SV'] * hr_value) / 1000
             ic_mask['CO'] = 1.0
             print(f"      ✓ CO: {ic_values['CO']:.2f} (calculated from SV*HR)")
 
