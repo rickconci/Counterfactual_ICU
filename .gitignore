@@ -18,3 +18,4 @@ lightning_logs/
 wandb/
 model_checkpoints/
 data/input_data/
+processed_data/
