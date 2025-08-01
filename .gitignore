@@ -18,3 +18,9 @@ lightning_logs/
 wandb/
 model_checkpoints/
 data/input_data/
+processed_data/
+physionet.org/
+test_res/
+data/
+mimic3refactor/
+OldScripts/
