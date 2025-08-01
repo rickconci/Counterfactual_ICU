@@ -62,7 +62,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def find_relevant_patients(measurements, MAP_id, load_path_events = "../../data/mimic3refactor/input_data/CHARTEVENTS.csv",
+def find_relevant_patients(waveform_patient_ids, measurements, MAP_id, load_path_events = "../../data/mimic3refactor/input_data/CHARTEVENTS.csv",
                           load_path_stays = "../../data/mimic3refactor/input_data/ICUSTAYS.csv",  save_path = "../../data/mimic3refactor/processed_data/treated_patients_chartevents.parquet",
                           data_limit=None):
     """
@@ -93,6 +93,7 @@ def find_relevant_patients(measurements, MAP_id, load_path_events = "../../data/
         long_stays = (long_stays_query.filter(pl.col("LOS") > 1).collect())
         long_stays_id = long_stays["HADM_ID"].unique().to_list()
         treated_patients = (treated_patients_query.filter(pl.col("HADM_ID").is_in(long_stays_id))
+                            .filter(pl.col("SUBJECT_ID").is_in(waveform_patient_ids))
                             .filter(pl.col("ITEMID").is_in(MAP_id))
                             .filter(pl.col("VALUE") != "Not Given")  # Filter out non-numeric values
                             .filter(pl.col("VALUE").cast(pl.Float64, strict=False) < 70)
@@ -123,9 +124,13 @@ def read_large_csv_with_polars(load_path, ids_df, measurements, id_column='HADM_
         Returns: df with the treated patient's events
 
         """
+        chartevents_schema_overrides = {
+            'VALUE': pl.Utf8,  # Read as string first, then filter/convert
+            'VALUENUM': pl.Float64  # If this column exists
+        }
 
         valid_ids = ids_df[id_column].unique().to_list()
-        query = pl.scan_csv(load_path)
+        query = pl.scan_csv(load_path, schema_overrides=chartevents_schema_overrides)
         if data_limit is not None:
             query = query.limit(data_limit)
         result = (
@@ -221,7 +226,7 @@ def process_single_patient_physio(
     """
     # Read only this patient's data from parquet
     chart_df_patient = pl.read_parquet(chartevents_path).filter(
-        pl.col('hadm_id') == hadm_id
+        pl.col('HADM_ID') == hadm_id
     )
 
     # Initialize arrays for all physiological parameters
@@ -259,7 +264,7 @@ def process_single_patient_physio(
         itemid = param_info['itemid']
 
         # Get measurements for this parameter
-        param_events = chart_df_patient.filter(pl.col('itemid') == itemid)
+        param_events = chart_df_patient.filter(pl.col('ITEMID') == itemid)
 
         if param_events.height > 0:
             # Group by time interval and average
@@ -269,7 +274,7 @@ def process_single_patient_physio(
                 if 0 <= time_idx < n_intervals:
                     # If first measurement in this interval, set it
                     if mask_array[time_idx, idx] == 0:
-                        values_array[time_idx, idx] = row['value']
+                        values_array[time_idx, idx] = row['VALUE']
                         mask_array[time_idx, idx] = 1.0
                         count_array[time_idx, idx] = 1
                     else:
@@ -277,19 +282,19 @@ def process_single_patient_physio(
                         current_count = count_array[time_idx, idx]
                         current_sum = values_array[time_idx, idx] * current_count
                         new_count = current_count + 1
-                        values_array[time_idx, idx] = (current_sum + row['value']) / new_count
+                        values_array[time_idx, idx] = (current_sum + row['VALUE']) / new_count
                         count_array[time_idx, idx] = new_count
 
     # Process CO measurements separately for r_tpr calculation
     for co_itemid in co_itemids:
-        co_events = chart_df_patient.filter(pl.col('itemid') == co_itemid)
+        co_events = chart_df_patient.filter(pl.col('ITEMID') == co_itemid)
 
         if co_events.height > 0:
             for row in co_events.iter_rows(named=True):
                 time_idx = row['time_idx']
                 if 0 <= time_idx < n_intervals:
                     if co_mask_array[time_idx] == 0:
-                        co_values_array[time_idx] = row['value']
+                        co_values_array[time_idx] = row['VALUE']
                         co_mask_array[time_idx] = 1.0
                         co_count_array[time_idx] = 1
                     else:
@@ -297,7 +302,7 @@ def process_single_patient_physio(
                         current_count = co_count_array[time_idx]
                         current_sum = co_values_array[time_idx] * current_count
                         new_count = current_count + 1
-                        co_values_array[time_idx] = (current_sum + row['value']) / new_count
+                        co_values_array[time_idx] = (current_sum + row['VALUE']) / new_count
                         co_count_array[time_idx] = new_count
 
     hr_idx = None
@@ -316,13 +321,13 @@ def process_single_patient_physio(
 
                 # If we have CO but missing SV: calculate SV = CO / HR
                 if (co_mask_array[t] > 0 and mask_array[t, sv_idx] == 0 and co_values_array[t] > 0):
-                    values_array[t, sv_idx] = co_values_array[t] / hr_value
+                    values_array[t, sv_idx] = (co_values_array[t] / hr_value) * 1000 # co is in L, SV in ml
                     mask_array[t, sv_idx] = 1.0
                     print(f"      Calculated SV from CO/HR at time {t}: SV = {values_array[t, sv_idx]:.2f}")
 
                 # If we have SV but missing CO: calculate CO = SV * HR
                 elif (mask_array[t, sv_idx] > 0 and co_mask_array[t] == 0 and values_array[t, sv_idx] > 0):
-                    co_values_array[t] = values_array[t, sv_idx] * hr_value
+                    co_values_array[t] = values_array[t, sv_idx] * hr_value / 1000  # co is in L, SV in ml
                     co_mask_array[t] = 1.0
                     print(f"      Calculated CO from SV*HR at time {t}: CO = {co_values_array[t]:.2f}")
 
@@ -1080,7 +1085,7 @@ def save_patient_data_as_csv(
     # Read only this patient's data (from prepared parquet that has start_idx/end_idx)
     try:
         med_df_patient = pl.read_parquet(inputevents_path).filter(
-            pl.col('hadm_id') == hadm_id
+            pl.col('HADM_ID') == hadm_id
         )
 
         print(f"Debug CSV save: Patient {hadm_id} data shape: {med_df_patient.shape}")
@@ -1804,6 +1809,12 @@ def main():
     # Get MIMIC-III item IDs
     mimic3_ids = get_mimic3_item_ids()
 
+    with open('../../data/mimic3refactor/input_data/RECORDS-numerics.txt', 'r') as f:
+        numbers = [int(line.strip().split('/')[1].lstrip('p'))
+                   for line in f
+                   if line.strip() and len(line.strip().split('/')) >= 2
+                   and line.strip().split('/')[1].lstrip('p').isdigit()]
+
     print(f"\nMIMIC-III Item ID Mappings:")
     for category, ids in mimic3_ids.items():
         print(f"  {category}: {ids}")
@@ -1818,7 +1829,7 @@ def main():
 
     # Load the hadm_id filter
     filter_file_path = input_dir / args.hadm_filter_file
-    hadm_ids = find_relevant_patients(measurements=measurements, MAP_id=[225312, 52, 6702], data_limit=args.data_limit)
+    hadm_ids = find_relevant_patients(waveform_patient_ids = numbers, measurements=measurements, MAP_id=[225312, 52, 6702], data_limit=args.data_limit)
 
     unique_hadm_ids = hadm_ids['HADM_ID'].unique().to_list()
 

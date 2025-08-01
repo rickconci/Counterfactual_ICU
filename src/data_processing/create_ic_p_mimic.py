@@ -3,6 +3,7 @@
 Integrated MIMIC-III Waveform Processing: IC Tensors + Prediction Targets
 Creates both initial condition tensors at t_0 and prediction targets for 25min ahead
 Uses efficient patient-batch processing to minimize network calls
+Now with parallel processing support for faster execution
 """
 
 import pandas as pd
@@ -19,6 +20,8 @@ from tqdm import tqdm
 from scipy.interpolate import interp1d
 import warnings
 from collections import defaultdict
+import concurrent.futures
+from functools import partial
 
 warnings.filterwarnings('ignore')
 
@@ -471,12 +474,25 @@ def interpolate_signals_to_grid(signals_data, target_times_seconds):
     return interpolated
 
 
-def create_prediction_targets_from_record(hadm_id, traj_num, t0_timestamp, record_data,
-                                          prediction_minutes, target_interval_seconds):
-    """Create prediction targets from loaded record data starting at t_0"""
+def create_prediction_targets_with_ic_anchor(hadm_id, traj_num, t0_timestamp, record_data,
+                                             ic_values, prediction_minutes, target_interval_seconds,
+                                             min_points_per_minute=12):
+    """
+    Create prediction targets using IC as anchor point for interpolation
 
-    # Calculate prediction time range
-    start_time = t0_timestamp
+    New strategy:
+    1. Use IC values at t_0 as anchor point (time 0)
+    2. Extract prediction window data from t_0 to t_0+25min
+    3. Check data density: require min_points_per_minute for EACH individual minute
+       - Example: 25-minute window = check minutes [0-1, 1-2, 2-3, ..., 24-25]
+       - Each minute must have >= min_points_per_minute data points
+       - Rejects if ANY minute fails (no averaging allowed)
+    4. Interpolate using IC + prediction data (IC not included in final targets)
+    5. Reject if any NaNs remain after interpolation
+    """
+
+    # Calculate full time range (including t_0 for interpolation anchor)
+    start_time = t0_timestamp  # Include t_0 in data extraction
     end_time = t0_timestamp + timedelta(minutes=prediction_minutes)
 
     # Extract signals from record (MAP and CVP only for predictions)
@@ -485,63 +501,149 @@ def create_prediction_targets_from_record(hadm_id, traj_num, t0_timestamp, recor
     )
 
     if not signals_data:
+        print(f"      ✗ No waveform data found in prediction window")
         return None
 
-    # Create target time grid at specified intervals
-    n_prediction_points = int((prediction_minutes * 60) / target_interval_seconds)
-    target_times_seconds = []
+    # Add IC values as anchor points at t_0
+    record_start = record_data['info']['start_time']
+    t0_offset_seconds = (t0_timestamp - record_start).total_seconds()
 
-    for i in range(n_prediction_points):
-        target_time = start_time + timedelta(seconds=i * target_interval_seconds)
-        time_from_start = (target_time - start_time).total_seconds()
-        target_times_seconds.append(time_from_start)
+    required_signals = ['ABP Mean', 'CVP']
+    for signal_name in required_signals:
+        if signal_name in ic_values and signal_name in signals_data:
+            # Add IC value at t_0 to the signal data
+            ic_value = ic_values[signal_name]
 
-    # Interpolate signals
-    interpolated = interpolate_signals_to_grid(signals_data, np.array(target_times_seconds))
+            # Insert IC point at the beginning (sorted by time)
+            signals_data[signal_name]['times'] = np.concatenate([
+                [t0_offset_seconds], signals_data[signal_name]['times']
+            ])
+            signals_data[signal_name]['values'] = np.concatenate([
+                [ic_value], signals_data[signal_name]['values']
+            ])
 
-    if not interpolated:
-        return None
+            print(f"      ✓ Added IC anchor: {signal_name} = {ic_value:.1f} at t_0")
+        elif signal_name in ic_values:
+            # Create new signal data with just IC value
+            signals_data[signal_name] = {
+                'times': np.array([t0_offset_seconds]),
+                'values': np.array([ic_values[signal_name]])
+            }
+            print(f"      ✓ Created IC anchor: {signal_name} = {ic_values[signal_name]:.1f} at t_0")
 
-    # QUALITY CHECK: Require both ABP Mean and CVP for prediction targets
-    required_for_prediction = ['ABP Mean', 'CVP']
-    missing_required = [sig for sig in required_for_prediction if sig not in interpolated]
-
-    if missing_required:
-        print(
-            f"      ✗ Skipping prediction targets for trajectory {traj_num} - missing required signals: {missing_required}")
-        return None
-
-    # Additional check: Make sure these signals have some valid finite values
-    for signal_name in required_for_prediction:
-        signal_values = interpolated[signal_name]
-        if not np.any(np.isfinite(signal_values)):
-            print(f"      ✗ Skipping prediction targets for trajectory {traj_num} - {signal_name} has no valid values")
+    # DATA DENSITY CHECK: Ensure sufficient data points PER MINUTE (not average)
+    total_minutes = prediction_minutes
+    for signal_name in required_signals:
+        if signal_name not in signals_data:
+            print(f"      ✗ Missing required signal: {signal_name}")
             return None
 
-    print(f"      ✓ All required signals present for prediction targets trajectory {traj_num}")
+        signal_times = signals_data[signal_name]['times']
+        t0_offset_seconds = (t0_timestamp - record_start).total_seconds()
+
+        # Check each individual minute in the prediction window
+        minutes_failed = []
+        for minute_idx in range(total_minutes):
+            minute_start = t0_offset_seconds + (minute_idx * 60)  # Start of this minute
+            minute_end = t0_offset_seconds + ((minute_idx + 1) * 60)  # End of this minute
+
+            # Count data points in this specific minute
+            points_in_minute = np.sum((signal_times >= minute_start) & (signal_times < minute_end))
+
+            if points_in_minute < min_points_per_minute:
+                minutes_failed.append({
+                    'minute': minute_idx,
+                    'points': points_in_minute,
+                    'required': min_points_per_minute
+                })
+
+        if minutes_failed:
+            print(f"      ✗ {signal_name}: {len(minutes_failed)}/{total_minutes} minutes fail density requirement")
+            for failure in minutes_failed[:3]:  # Show first 3 failures
+                print(
+                    f"        Minute {failure['minute']}: {failure['points']} points < {failure['required']} required")
+            if len(minutes_failed) > 3:
+                print(f"        ... and {len(minutes_failed) - 3} more minutes")
+            return None
+        else:
+            total_points = len(signal_times)
+            avg_density = total_points / total_minutes
+            print(
+                f"      ✓ {signal_name}: All {total_minutes} minutes pass density check (avg: {avg_density:.1f} points/min)")
+
+    # Create target time grid for prediction (EXCLUDING t_0)
+    n_prediction_points = int((prediction_minutes * 60) / target_interval_seconds)
+    target_times_seconds = np.array([
+        t0_offset_seconds + (i + 1) * target_interval_seconds
+        for i in range(n_prediction_points)
+    ])
+
+    # Interpolate using IC anchor + prediction window data
+    interpolated = {}
+    for signal_name in required_signals:
+        if signal_name not in signals_data:
+            continue
+
+        times = signals_data[signal_name]['times']
+        values = signals_data[signal_name]['values']
+
+        if len(times) < 2:
+            print(f"      ✗ {signal_name}: Need at least 2 points for interpolation")
+            return None
+
+        try:
+            # Remove duplicates and sort
+            unique_indices = np.unique(times, return_index=True)[1]
+            unique_times = times[unique_indices]
+            unique_values = values[unique_indices]
+
+            if len(unique_times) < 2:
+                print(f"      ✗ {signal_name}: Less than 2 unique time points after deduplication")
+                return None
+
+            # Create interpolator
+            interpolator = interp1d(unique_times, unique_values, kind='linear',
+                                    bounds_error=False, fill_value=np.nan)
+
+            # Interpolate to target times (excluding t_0)
+            interpolated_values = interpolator(target_times_seconds)
+
+            # STRICT CHECK: No NaNs allowed after interpolation
+            if np.any(np.isnan(interpolated_values)):
+                n_nans = np.sum(np.isnan(interpolated_values))
+                print(f"      ✗ {signal_name}: {n_nans}/{len(interpolated_values)} NaN values after interpolation")
+                return None
+
+            interpolated[signal_name] = interpolated_values
+            print(f"      ✓ {signal_name}: Perfect interpolation, no NaN values")
+
+        except Exception as e:
+            print(f"      ✗ {signal_name}: Interpolation failed: {e}")
+            return None
+
+    if len(interpolated) != len(required_signals):
+        print(f"      ✗ Only {len(interpolated)}/{len(required_signals)} signals successfully interpolated")
+        return None
+
+    print(f"      ✓ All signals successfully interpolated with IC anchor")
 
     # Create tensor arrays
-    signal_names = ['ABP Mean', 'CVP']
+    signal_names = list(interpolated.keys())
     n_signals = len(signal_names)
 
     values_array = np.zeros((n_prediction_points, n_signals), dtype=np.float32)
-    mask_array = np.zeros((n_prediction_points, n_signals), dtype=np.float32)
+    mask_array = np.ones((n_prediction_points, n_signals), dtype=np.float32)  # All 1s since no NaNs
 
     for i, signal_name in enumerate(signal_names):
-        if signal_name in interpolated:
-            signal_values = interpolated[signal_name]
-            valid_mask = np.isfinite(signal_values)
-
-            values_array[:, i] = np.where(valid_mask, signal_values, 0)
-            mask_array[:, i] = valid_mask.astype(np.float32)
+        values_array[:, i] = interpolated[signal_name]
 
     # Convert to tensors
     values_tensor = torch.from_numpy(values_array).float()
     mask_tensor = torch.from_numpy(mask_array).float()
 
-    # Time tensor (seconds from t_0)
-    time_seconds = np.array([i * target_interval_seconds for i in range(n_prediction_points)])
-    time_tensor = torch.from_numpy(time_seconds).float()
+    # Time tensor (seconds from t_0) - starts at target_interval_seconds
+    time_seconds_from_t0 = np.array([(i + 1) * target_interval_seconds for i in range(n_prediction_points)])
+    time_tensor = torch.from_numpy(time_seconds_from_t0).float()
 
     return {
         'hadm_id': hadm_id,
@@ -551,18 +653,34 @@ def create_prediction_targets_from_record(hadm_id, traj_num, t0_timestamp, recor
             'record_used': f"{record_data['info']['patient_path']}/{record_data['info']['record_name']}",
             'sampling_rate': record_data['info']['sampling_rate'],
             'actual_interval_seconds': 1.0 / record_data['info']['sampling_rate'],
-            'signals_extracted': list(interpolated.keys()),
+            'signals_used': signal_names,
+            'ic_anchor_used': True,
+            'min_points_per_minute': min_points_per_minute,
+            'density_check_method': 'per_minute_strict',
+            'data_density_per_signal': {
+                sig: len(signals_data[sig]['times']) / prediction_minutes
+                for sig in signal_names if sig in signals_data
+            },
             'prediction_window': (start_time, end_time),
-            't0_timestamp': t0_timestamp
+            't0_timestamp': t0_timestamp,
+            'interpolation_method': 'ic_anchored_linear'
         }
     }
 
 
 def process_patient_integrated(hadm_id, patient_id, patient_trajectories, icu_admission_time,
                                interval_minutes, prediction_minutes, target_interval_seconds,
-                               waveform_cache, database='mimic3wdb-matched'):
+                               waveform_cache, ic_cache_dir, prediction_cache_dir,
+                               min_points_per_minute=12, database='mimic3wdb-matched'):
     """
     Integrated processing: Create both IC tensors and prediction targets for each trajectory
+
+    Logic:
+    1. Extract IC at t_0 from the record containing t_0
+    2. Create prediction targets from t_0 to min(t_0+25min, next_t_0) using the SAME record
+    3. Skip trajectory if the record doesn't extend long enough for full prediction window
+
+    This ensures IC and prediction come from the same continuous recording session.
     """
 
     print(f"\nProcessing patient {patient_id} (HADM {hadm_id}) - {len(patient_trajectories)} trajectories")
@@ -576,13 +694,18 @@ def process_patient_integrated(hadm_id, patient_id, patient_trajectories, icu_ad
 
     print(f"  Processing {len(patient_trajectories)} trajectories with {len(patient_records)} available records")
 
+    # Sort trajectories by trajectory number to ensure proper ordering for finding next t_0
+    sorted_trajectories = sorted(patient_trajectories, key=lambda x: x['trajectory_num'])
+
     patient_ics = []
     patient_predictions = []
     processed_count = 0
-    skipped_count = 0
+    skipped_no_records = 0
+    skipped_insufficient_duration = 0
+    skipped_extraction_failed = 0
 
-    # Step 2: Process each trajectory
-    for traj in patient_trajectories:
+    # Step 2: Process each trajectory in sorted order
+    for traj_idx, traj in enumerate(sorted_trajectories):
         traj_num = traj['trajectory_num']
 
         try:
@@ -597,88 +720,155 @@ def process_patient_integrated(hadm_id, patient_id, patient_trajectories, icu_ad
                 patient_id, ic_window_start, ic_window_end
             )
 
-            # Find records for prediction targets (t_0 to t_0 + prediction_minutes)
-            pred_window_end = t0_timestamp + timedelta(minutes=prediction_minutes)
-
-            pred_records = waveform_cache.find_records_for_timerange(
-                patient_id, t0_timestamp, pred_window_end
-            )
-
             # SKIP if no records contain t_0
             if not ic_records:
                 print(f"    ✗ Skipping trajectory {traj_num} - no records contain t_0")
-                skipped_count += 1
+                skipped_no_records += 1
                 continue
 
-            # SKIP if prediction window spans multiple records (for consistency)
-            if len(pred_records) > 1:
-                print(f"    ✗ Skipping trajectory {traj_num} - prediction spans {len(pred_records)} records")
-                skipped_count += 1
-                continue
-            elif len(pred_records) == 0:
-                print(f"    ✗ Skipping trajectory {traj_num} - no records for prediction window")
-                skipped_count += 1
-                continue
+            # Use the first record that contains t_0 for both IC extraction and prediction
+            record = ic_records[0]
+            record_start = record['start_time']
+            record_end = record['end_time']
 
-            # Use the first record that contains t_0 for IC extraction
-            ic_record = ic_records[0]
-            pred_record = pred_records[0]
+            # Calculate when this trajectory should end (25min after t_0 OR next t_0, whichever is earlier)
+            max_prediction_end = t0_timestamp + timedelta(minutes=prediction_minutes)
+
+            # Find next t_0 if there are more trajectories for this patient
+            next_t0 = None
+            if traj_idx + 1 < len(sorted_trajectories):
+                next_traj = sorted_trajectories[traj_idx + 1]
+                next_t0 = calculate_t0_timestamp(next_traj, icu_admission_time, interval_minutes)
+
+            # Determine actual prediction end time
+            if next_t0 is not None and next_t0 < max_prediction_end:
+                actual_prediction_end = next_t0
+                prediction_duration_min = (actual_prediction_end - t0_timestamp).total_seconds() / 60
+                print(f"      Prediction window limited by next t_0: {prediction_duration_min:.1f} min")
+            else:
+                actual_prediction_end = max_prediction_end
+                prediction_duration_min = prediction_minutes
+                print(f"      Full prediction window: {prediction_duration_min:.1f} min")
+
+            # CHECK: Does the record extend at least to our prediction end time?
+            if record_end < actual_prediction_end:
+                time_shortage = (actual_prediction_end - record_end).total_seconds() / 60
+                print(
+                    f"    ✗ Skipping trajectory {traj_num} - record ends {time_shortage:.1f} min before prediction end")
+                print(f"      Record ends: {record_end}")
+                print(f"      Need until: {actual_prediction_end}")
+                skipped_insufficient_duration += 1
+                continue
 
             print(f"    ✓ Processing trajectory {traj_num} at t_0={t0_timestamp}")
+            print(f"      Using record: {record['record_name']} ({record_start} to {record_end})")
+            print(f"      Prediction: t_0 to t_0+{prediction_duration_min:.1f}min")
 
-            # Load record data for IC extraction
-            ic_record_data = waveform_cache.load_record_data(ic_record, database)
-            if ic_record_data is None:
-                print(f"    ✗ Failed to load IC record data for trajectory {traj_num}")
-                skipped_count += 1
+            # Load record data (same record for both IC and prediction)
+            record_data = waveform_cache.load_record_data(record, database)
+            if record_data is None:
+                print(f"    ✗ Failed to load record data for trajectory {traj_num}")
+                skipped_extraction_failed += 1
                 continue
 
             # Extract IC at t_0
             ic_result = extract_ic_from_loaded_record(
-                hadm_id, traj_num, t0_timestamp, ic_record_data
+                hadm_id, traj_num, t0_timestamp, record_data
             )
 
-            if ic_result:
-                patient_ics.append(ic_result)
-                print(f"      ✓ IC extracted for trajectory {traj_num}")
-            else:
+            if not ic_result:
                 print(f"      ✗ IC extraction failed for trajectory {traj_num}")
-                skipped_count += 1
+                skipped_extraction_failed += 1
                 continue
 
-            # Load record data for prediction targets (might be the same record)
-            if ic_record['record_name'] == pred_record['record_name']:
-                # Same record - reuse loaded data
-                pred_record_data = ic_record_data
-            else:
-                # Different record - load it
-                pred_record_data = waveform_cache.load_record_data(pred_record, database)
-
-            if pred_record_data is None:
-                print(f"    ✗ Failed to load prediction record data for trajectory {traj_num}")
-                continue
-
-            # Create prediction targets starting from t_0
-            pred_result = create_prediction_targets_from_record(
-                hadm_id, traj_num, t0_timestamp, pred_record_data,
-                prediction_minutes, target_interval_seconds
+            # Create prediction targets using IC as anchor point
+            # Note: using actual prediction duration (may be < 25min if limited by next t_0)
+            pred_result = create_prediction_targets_with_ic_anchor(
+                hadm_id, traj_num, t0_timestamp, record_data,
+                ic_result['ic_values'],  # Pass IC values as anchor
+                prediction_duration_min, target_interval_seconds,
+                min_points_per_minute
             )
 
-            if pred_result:
-                patient_predictions.append(pred_result)
-                print(f"      ✓ Prediction targets created for trajectory {traj_num}")
-                processed_count += 1
-            else:
+            if not pred_result:
                 print(f"      ✗ Prediction target creation failed for trajectory {traj_num}")
+                continue
+
+            # SAVE BOTH TENSORS IMMEDIATELY
+            # Save IC tensor
+            ic_file = Path(ic_cache_dir) / f"ic_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+            physio_values = [
+                ic_result['ic_values']['HR'],
+                ic_result['ic_values']['ABP Mean'],
+                ic_result['ic_values']['CVP'],
+                ic_result['ic_values'].get('SV', 0.0),
+                ic_result['ic_values'].get('R_TPR', 0.0)
+            ]
+            physio_masks = [
+                ic_result['ic_mask']['HR'],
+                ic_result['ic_mask']['ABP Mean'],
+                ic_result['ic_mask']['CVP'],
+                ic_result['ic_mask'].get('SV', 0.0),
+                ic_result['ic_mask'].get('R_TPR', 0.0)
+            ]
+            ic_tensor = torch.tensor(physio_values, dtype=torch.float32)
+            ic_mask_tensor = torch.tensor(physio_masks, dtype=torch.float32)
+            torch.save((ic_tensor, ic_mask_tensor), ic_file)
+
+            # Save prediction tensor
+            pred_file = Path(prediction_cache_dir) / f"prediction_target_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+            torch.save(pred_result['tensor_data'], pred_file)
+
+            # Store only metadata
+            patient_ics.append({
+                'hadm_id': hadm_id,
+                'trajectory_num': traj_num,
+                't0_timestamp': ic_result['t0_timestamp'],
+                'file_path': str(ic_file),
+                'ic_values': ic_result['ic_values'],
+                'record_used': ic_result['record_used']
+            })
+
+            patient_predictions.append({
+                'hadm_id': hadm_id,
+                'trajectory_num': traj_num,
+                'file_path': str(pred_file),
+                'metadata': pred_result['metadata']
+            })
+
+            print(f"      ✓ Both IC and prediction tensors saved for trajectory {traj_num}")
+            processed_count += 1
 
         except Exception as e:
             print(f"    Error processing trajectory {traj_num}: {e}")
-            skipped_count += 1
+            skipped_extraction_failed += 1
             continue
 
+    total_skipped = skipped_no_records + skipped_insufficient_duration + skipped_extraction_failed
     print(f"  Created {len(patient_ics)} IC tensors and {len(patient_predictions)} prediction targets")
-    print(f"  Processed: {processed_count}, Skipped: {skipped_count}")
+    print(f"  Processed: {processed_count}, Total Skipped: {total_skipped}")
+    print(f"    - No records contain t_0: {skipped_no_records}")
+    print(f"    - Insufficient record duration: {skipped_insufficient_duration}")
+    print(f"    - Extraction failed: {skipped_extraction_failed}")
     return patient_ics, patient_predictions
+
+
+def process_patient_integrated_standalone(
+        hadm_id, patient_id, patient_trajectories, icu_admission_time,
+        interval_minutes, prediction_minutes, target_interval_seconds,
+        ic_cache_dir, prediction_cache_dir, min_points_per_minute=12, database='mimic3wdb-matched'
+):
+    """
+    Standalone version for parallel processing - creates its own WaveformRecordCache
+    """
+    # Create a new cache instance for this worker process
+    waveform_cache = WaveformRecordCache()
+
+    return process_patient_integrated(
+        hadm_id, patient_id, patient_trajectories, icu_admission_time,
+        interval_minutes, prediction_minutes, target_interval_seconds,
+        waveform_cache, ic_cache_dir, prediction_cache_dir, min_points_per_minute, database
+    )
 
 
 def create_integrated_waveform_tensors(
@@ -691,11 +881,24 @@ def create_integrated_waveform_tensors(
         database='mimic3wdb-matched',
         prediction_minutes=25,
         target_interval_seconds=10,
+        min_points_per_minute=12,
+        n_workers=4,
         skip_existing=True
 ):
     """
     Integrated tensor creation: Both IC tensors at t_0 and prediction targets for 25min ahead
     Uses efficient patient-batch processing to minimize network calls
+    Now with parallel processing support for faster execution
+
+    NEW STRATEGY:
+    - IC extracted at t_0 from record containing t_0
+    - IC used as anchor point (time 0) for prediction interpolation
+    - Require min_points_per_minute data density FOR EACH MINUTE (not average)
+    - Prediction targets start after t_0 (IC not included in targets)
+    - Reject trajectory if any NaN values remain after interpolation
+    - Ensures perfect consistency between IC and prediction data
+
+    This ensures IC and predictions come from the same continuous recording.
     """
 
     # Setup
@@ -717,18 +920,32 @@ def create_integrated_waveform_tensors(
     print(f"Processing {len(all_trajectories)} patients")
     print(f"Prediction window: {prediction_minutes} minutes after t_0")
     print(f"Target sampling: {target_interval_seconds}s intervals")
+    print(f"Data quality: min {min_points_per_minute} points EVERY minute (per-minute check)")
+    print(f"Strategy: IC-anchored interpolation with strict NaN rejection")
     print(f"Integrated processing: IC + Prediction targets in one pass")
+    print(f"Parallel workers: {n_workers}")
 
-    # Initialize waveform cache and results storage
-    waveform_cache = WaveformRecordCache()
+    # Initialize results storage
     all_ics = {}
     all_predictions = {}
-
     processed_trajectories = 0
     skipped_trajectories = 0
 
-    # Process each patient (batch processing)
-    for hadm_id in tqdm(all_trajectories.keys(), desc="Processing patients"):
+    # Prepare processing function
+    process_func = partial(
+        process_patient_integrated_standalone,
+        interval_minutes=interval_minutes,
+        prediction_minutes=prediction_minutes,
+        target_interval_seconds=target_interval_seconds,
+        min_points_per_minute=min_points_per_minute,
+        ic_cache_dir=ic_cache_dir,
+        prediction_cache_dir=prediction_cache_dir,
+        database=database
+    )
+
+    # Filter patients that need processing
+    patients_to_process = []
+    for hadm_id in all_trajectories.keys():
         if hadm_id not in patient_mapping or hadm_id not in icu_admission_map:
             continue
 
@@ -736,7 +953,7 @@ def create_integrated_waveform_tensors(
         icu_admission_time = icu_admission_map[hadm_id]
         patient_trajectories = all_trajectories[hadm_id]
 
-        # Check if all files already exist
+        # Check if files already exist
         if skip_existing:
             all_exist = True
             for traj in patient_trajectories:
@@ -753,84 +970,96 @@ def create_integrated_waveform_tensors(
                 skipped_trajectories += len(patient_trajectories)
                 continue
 
-        try:
-            # Process all trajectories for this patient efficiently
-            patient_ics, patient_predictions = process_patient_integrated(
-                hadm_id, patient_id, patient_trajectories, icu_admission_time,
-                interval_minutes, prediction_minutes, target_interval_seconds,
-                waveform_cache, database
-            )
+        patients_to_process.append({
+            'hadm_id': hadm_id,
+            'patient_id': patient_id,
+            'patient_trajectories': patient_trajectories,
+            'icu_admission_time': icu_admission_time
+        })
 
-            # Save IC results
-            ic_info = []
-            for ic_result in patient_ics:
-                traj_num = ic_result['trajectory_num']
+    print(f"Processing {len(patients_to_process)} patients...")
 
-                # Create IC tensor
-                physio_values = [
-                    ic_result['ic_values']['HR'],
-                    ic_result['ic_values']['ABP Mean'],
-                    ic_result['ic_values']['CVP'],
-                    ic_result['ic_values'].get('SV', 0.0),
-                    ic_result['ic_values'].get('R_TPR', 0.0)
-                ]
-                physio_masks = [
-                    ic_result['ic_mask']['HR'],
-                    ic_result['ic_mask']['ABP Mean'],
-                    ic_result['ic_mask']['CVP'],
-                    ic_result['ic_mask'].get('SV', 0.0),
-                    ic_result['ic_mask'].get('R_TPR', 0.0)
-                ]
+    # Process patients
+    if n_workers > 1:
+        # Parallel processing
+        print(f"Using {n_workers} parallel workers")
 
-                ic_tensor = torch.tensor(physio_values, dtype=torch.float32)
-                ic_mask_tensor = torch.tensor(physio_masks, dtype=torch.float32)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {}
 
-                # Save IC tensor
-                ic_file = Path(ic_cache_dir) / f"ic_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
-                torch.save((ic_tensor, ic_mask_tensor), ic_file)
+            for patient_info in patients_to_process:
+                future = executor.submit(
+                    process_func,
+                    hadm_id=patient_info['hadm_id'],
+                    patient_id=patient_info['patient_id'],
+                    patient_trajectories=patient_info['patient_trajectories'],
+                    icu_admission_time=patient_info['icu_admission_time']
+                )
+                futures[future] = patient_info
 
-                ic_info.append({
-                    'hadm_id': hadm_id,
-                    'trajectory_num': traj_num,
-                    't0_timestamp': ic_result['t0_timestamp'],
-                    'file_path': str(ic_file),
-                    'ic_values': ic_result['ic_values'],
-                    'record_used': ic_result['record_used']
-                })
-                processed_trajectories += 1
+            # Collect results
+            for future in tqdm(concurrent.futures.as_completed(futures),
+                               total=len(futures), desc="Processing patients in parallel"):
+                patient_info = futures[future]
+                hadm_id = patient_info['hadm_id']
+                patient_id = patient_info['patient_id']
 
-            # Save prediction results
-            prediction_info = []
-            for prediction in patient_predictions:
-                traj_num = prediction['trajectory_num']
-                pred_file = Path(prediction_cache_dir) / f"prediction_target_{int(hadm_id)}_traj_{traj_num:03d}.pt"
-                torch.save(prediction['tensor_data'], pred_file)
+                try:
+                    patient_ics, patient_predictions = future.result()
 
-                prediction_info.append({
-                    'hadm_id': hadm_id,
-                    'trajectory_num': traj_num,
-                    'file_path': str(pred_file),
-                    'metadata': prediction['metadata']
-                })
+                    # Store in results (tensors already saved by worker)
+                    if patient_ics:
+                        all_ics[hadm_id] = patient_ics
+                        processed_trajectories += len(patient_ics)
+                    if patient_predictions:
+                        all_predictions[hadm_id] = patient_predictions
 
-            # Store in results
-            if ic_info:
-                all_ics[hadm_id] = ic_info
-            if prediction_info:
-                all_predictions[hadm_id] = prediction_info
+                except Exception as exc:
+                    print(f'Patient {patient_id} (HADM {hadm_id}) generated an exception: {exc}')
+                    skipped_trajectories += len(patient_info['patient_trajectories'])
+                    import traceback
+                    traceback.print_exc()
 
-        except Exception as e:
-            print(f"Error processing patient {patient_id}: {e}")
-            skipped_trajectories += len(patient_trajectories)
-            continue
+    else:
+        # Sequential processing
+        print("Using sequential processing")
+        waveform_cache = WaveformRecordCache()
+
+        for patient_info in tqdm(patients_to_process, desc="Processing patients sequentially"):
+            hadm_id = patient_info['hadm_id']
+            patient_id = patient_info['patient_id']
+
+            try:
+                patient_ics, patient_predictions = process_patient_integrated(
+                    hadm_id, patient_id, patient_info['patient_trajectories'],
+                    patient_info['icu_admission_time'], interval_minutes,
+                    prediction_minutes, target_interval_seconds,
+                    waveform_cache, ic_cache_dir, prediction_cache_dir,
+                    min_points_per_minute, database
+                )
+
+                # Store in results
+                if patient_ics:
+                    all_ics[hadm_id] = patient_ics
+                    processed_trajectories += len(patient_ics)
+                if patient_predictions:
+                    all_predictions[hadm_id] = patient_predictions
+
+            except Exception as e:
+                print(f"Error processing patient {patient_id}: {e}")
+                skipped_trajectories += len(patient_info['patient_trajectories'])
+                continue
 
     # Save IC metadata
     ic_metadata = {
         'all_initial_conditions': all_ics,
         'total_ics': sum(len(ics) for ics in all_ics.values()),
         'parameters': ['HR', 'ABP Mean', 'CVP', 'SV', 'R_TPR'],
-        'extraction_method': 'waveform_numerics_integrated',
-        'interval_minutes': interval_minutes
+        'extraction_method': 'waveform_numerics_ic_anchored_parallel',
+        'prediction_strategy': 'ic_anchored_interpolation',
+        'min_points_per_minute': min_points_per_minute,
+        'interval_minutes': interval_minutes,
+        'n_workers': n_workers
     }
 
     ic_metadata_file = Path(ic_cache_dir) / "ic_metadata.pkl"
@@ -844,20 +1073,28 @@ def create_integrated_waveform_tensors(
         'n_signals': 2,
         'prediction_minutes': prediction_minutes,
         'target_interval_seconds': target_interval_seconds,
+        'min_points_per_minute': min_points_per_minute,
         'total_trajectories': sum(len(preds) for preds in all_predictions.values()),
-        'source': 'waveform_numerics_integrated'
+        'source': 'waveform_numerics_ic_anchored_parallel',
+        'interpolation_method': 'ic_anchored_linear_strict',
+        'quality_control': 'per_minute_density_plus_strict_no_nans',
+        'n_workers': n_workers
     }
 
     pred_metadata_file = Path(prediction_cache_dir) / "prediction_target_metadata.pkl"
     with open(pred_metadata_file, "wb") as f:
         pickle.dump(prediction_metadata, f)
 
-    print(f"\n✅ INTEGRATED PROCESSING COMPLETE:")
+    print(f"\n✅ INTEGRATED IC-ANCHORED PROCESSING COMPLETE:")
     print(f"  Trajectories processed: {processed_trajectories}")
     print(f"  Trajectories skipped: {skipped_trajectories}")
     print(f"  IC tensors created: {sum(len(ics) for ics in all_ics.values())}")
     print(f"  Prediction targets created: {sum(len(preds) for preds in all_predictions.values())}")
+    print(f"  Workers used: {n_workers}")
+    print(f"  Data quality: {min_points_per_minute} points required EVERY minute")
+    print(f"  Interpolation: IC-anchored linear with strict NaN rejection")
     print(f"  Network efficiency: ~1-3 calls per patient vs 20+ in naive approach")
+    print(f"  Data consistency: IC and predictions perfectly aligned")
     print(f"  IC metadata saved to: {ic_metadata_file}")
     print(f"  Prediction metadata saved to: {pred_metadata_file}")
 
@@ -871,7 +1108,7 @@ if __name__ == "__main__":
     relevant_patient_ids_path = "../../data/mimic3refactor/processed_data/relevant_patient_ids.csv"
     icustays_path = "../../data/mimic3refactor/input_data/ICUSTAYS.csv"
 
-    # Create integrated waveform tensors
+    # Create integrated waveform tensors with parallel processing and IC anchoring
     ic_results, prediction_results = create_integrated_waveform_tensors(
         trajectory_metadata_path=trajectory_metadata_path,
         relevant_patient_ids_path=relevant_patient_ids_path,
@@ -880,5 +1117,7 @@ if __name__ == "__main__":
         ic_cache_dir="../../data/mimic3refactor/processed_data/initial_conditions",
         prediction_cache_dir="../../data/mimic3refactor/processed_data/waveform_prediction_targets",
         prediction_minutes=25,
-        target_interval_seconds=5
+        target_interval_seconds=5,
+        min_points_per_minute=12,  # Require 12 data points in EVERY minute
+        n_workers=4  # Use 4 parallel workers
     )
