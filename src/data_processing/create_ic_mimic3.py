@@ -19,6 +19,16 @@ import json
 import time
 from functools import lru_cache
 import hashlib
+import concurrent.futures
+
+# --- Debug Setup ---
+DEBUG = os.environ.get('DEBUG', 'False').lower() in ('true', '1', 't')
+
+def debug_print(s):
+    if DEBUG:
+        print(s)
+# --- End Debug Setup ---
+
 
 
 def setup_wfdb_credentials():
@@ -422,6 +432,84 @@ def extract_ic_from_waveform_file(patient_path, record_name, t0_timestamp,
         return None, None
 
 
+def process_patient_simplified(
+    hadm_id,
+    trajectories,
+    patient_mapping,
+    icu_admission_map,
+    interval_minutes,
+    waveform_base_dir,
+    database,
+    cache_dir
+):
+    debug_print(f"[Worker PID: {os.getpid()}] Processing patient HADM_ID: {hadm_id}")
+    if hadm_id not in patient_mapping or hadm_id not in icu_admission_map:
+        debug_print(f"  [Worker PID: {os.getpid()}] Patient {hadm_id} missing from mapping or ICU stay info. Skipping.")
+        return hadm_id, []
+
+    patient_id = patient_mapping[hadm_id]
+    icu_admission_time = icu_admission_map[hadm_id]
+    patient_ics = []
+    debug_print(f"  [Worker PID: {os.getpid()}] Found SUBJECT_ID: {patient_id}, ICU Admission: {icu_admission_time}")
+
+    for i, traj in enumerate(trajectories):
+        traj_num = traj['trajectory_num']
+        debug_print(f"  [Worker PID: {os.getpid()}]  Processing trajectory {i+1}/{len(trajectories)} (traj_num: {traj_num})")
+        
+        t0_timestamp = calculate_t0_timestamp(traj, icu_admission_time, interval_minutes)
+        debug_print(f"    [Worker PID: {os.getpid()}] Calculated t0 timestamp: {t0_timestamp}")
+
+        if waveform_base_dir:
+            debug_print(f"    [Worker PID: {os.getpid()}] Searching for local waveform file...")
+            patient_path, record_name = find_waveform_file_for_t0_local(
+                patient_id, t0_timestamp, waveform_base_dir
+            )
+        else:
+            debug_print(f"    [Worker PID: {os.getpid()}] Searching for remote waveform file...")
+            patient_path, record_name = find_waveform_file_for_t0_remote_with_discovery(
+                patient_id, t0_timestamp, database
+            )
+
+        if patient_path is None or record_name is None:
+            debug_print(f"    [Worker PID: {os.getpid()}] No suitable waveform file found. Skipping trajectory.")
+            continue
+        debug_print(f"    [Worker PID: {os.getpid()}] Found record: {patient_path}/{record_name}")
+
+        debug_print(f"    [Worker PID: {os.getpid()}] Extracting ICs from waveform file...")
+        ic_values, ic_mask = extract_ic_from_waveform_file(
+            patient_path, record_name, t0_timestamp, database=database
+        )
+
+        if ic_values is None:
+            debug_print(f"    [Worker PID: {os.getpid()}] IC extraction failed. Skipping trajectory.")
+            continue
+        debug_print(f"    [Worker PID: {os.getpid()}] Successfully extracted ICs: {ic_values}")
+
+        physio_values = [
+            ic_values['HR'], ic_values['ABP Mean'], ic_values['CVP'],
+            ic_values.get('SV', 0.0), ic_values.get('R_TPR', 0.0)
+        ]
+        physio_masks = [
+            ic_mask['HR'], ic_mask['ABP Mean'], ic_mask['CVP'],
+            ic_mask.get('SV', 0.0), ic_mask.get('R_TPR', 0.0)
+        ]
+        ic_tensor = torch.tensor(physio_values, dtype=torch.float32)
+        ic_mask_tensor = torch.tensor(physio_masks, dtype=torch.float32)
+
+        ic_file_path = Path(cache_dir) / f"ic_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+        debug_print(f"    [Worker PID: {os.getpid()}] Saving tensor to {ic_file_path}")
+        torch.save((ic_tensor, ic_mask_tensor), ic_file_path)
+
+        patient_ics.append({
+            'hadm_id': hadm_id, 'trajectory_num': traj_num, 't0_timestamp': t0_timestamp,
+            'file_path': str(ic_file_path), 'ic_values': ic_values, 'record_used': f"{patient_path}/{record_name}"
+        })
+
+    debug_print(f"  [Worker PID: {os.getpid()}] Finished processing patient {hadm_id}. Found {len(patient_ics)} valid trajectories.")
+    return hadm_id, patient_ics
+
+
+
 def create_ic_tensors_simplified(
         medication_trajectory_metadata_path,
         relevant_patient_ids_path,
@@ -429,187 +517,88 @@ def create_ic_tensors_simplified(
         waveform_base_dir=None,
         cache_dir='initial_conditions_waveform',
         database='mimic3wdb-matched',
-        skip_existing=True
+        skip_existing=True,
+        n_workers=4
 ):
     """
-    Simplified IC tensor creation from MIMIC-III waveform data WITH CACHING
+    Simplified IC tensor creation from MIMIC-III waveform data WITH CACHING & PARALLEL PROCESSING
     """
-    # Setup
+    debug_print("--- Starting Simplified IC Tensor Creation ---")
     if not setup_wfdb_credentials():
         return None
 
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
-    # CACHING: Load existing metadata if it exists
-    metadata_file = Path(cache_dir) / "ic_metadata.pkl"
-    existing_initial_conditions = {}
-    if skip_existing and metadata_file.exists():
-        try:
-            with open(metadata_file, 'rb') as f:
-                existing_metadata = pickle.load(f)
-            existing_initial_conditions = existing_metadata.get('all_initial_conditions', {})
-            print(f"FOUND EXISTING IC DATA FOR {len(existing_initial_conditions)} PATIENTS")
-        except Exception as e:
-            print(f"Could not load existing metadata: {e}")
-            existing_initial_conditions = {}
-
-    # Load required data
-    print("Loading trajectory metadata...")
+    debug_print(f"Loading trajectory metadata from: {medication_trajectory_metadata_path}")
     with open(medication_trajectory_metadata_path, 'rb') as f:
         med_metadata = pickle.load(f)
-
     all_trajectories = med_metadata['all_trajectories']
     interval_minutes = med_metadata['interval_minutes']
+    debug_print(f"Loaded metadata for {len(all_trajectories)} patients.")
 
-    print("Loading patient mapping...")
+    debug_print(f"Loading patient mapping from: {relevant_patient_ids_path}")
     patient_mapping = load_hadm_to_patient_mapping(relevant_patient_ids_path)
 
-    print("Loading ICU stays...")
+    debug_print(f"Loading ICU stays from: {icustays_path}")
     import polars as pl
     icustays_df = pl.read_csv(icustays_path)
     if icustays_df.schema['INTIME'] != pl.Datetime:
         icustays_df = icustays_df.with_columns(
             pl.col('INTIME').str.to_datetime()
         )
+    icu_admission_map = {row['HADM_ID']: row['INTIME'] for row in icustays_df.select(['HADM_ID', 'INTIME']).iter_rows(named=True)}
 
-    # Create ICU admission time mapping
-    icu_admission_map = {}
-    for row in icustays_df.select(['HADM_ID', 'INTIME']).iter_rows(named=True):
-        icu_admission_map[row['HADM_ID']] = row['INTIME']
+    all_initial_conditions = {}
+    tasks = []
+    skipped_patients = 0
 
-    # CACHING: Start with existing data
-    all_initial_conditions = existing_initial_conditions.copy()
-    total_ics_created = sum(len(ics) for ics in existing_initial_conditions.values())
-    patients_processed = 0
-    patients_skipped = 0
-
-    for hadm_id, trajectories in tqdm(all_trajectories.items(), desc="Processing patients"):
-        # Check if we have mapping and ICU data for this patient
-        if hadm_id not in patient_mapping:
-            continue
-        if hadm_id not in icu_admission_map:
-            continue
-
-        # CACHING: Check if patient already processed
-        if skip_existing and hadm_id in existing_initial_conditions:
-            patient_ics = existing_initial_conditions[hadm_id]
-            files_exist = all(Path(ic['file_path']).exists() for ic in patient_ics)
-
-            if files_exist:
-                print(f"SKIPPING PATIENT {hadm_id} - ALREADY PROCESSED ({len(patient_ics)} trajectories)")
-                patients_skipped += 1
+    debug_print("Preparing tasks for parallel processing...")
+    for hadm_id, trajectories in all_trajectories.items():
+        if skip_existing:
+            all_files_exist = True
+            for traj in trajectories:
+                traj_num = traj['trajectory_num']
+                ic_file_path = Path(cache_dir) / f"ic_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+                if not ic_file_path.exists():
+                    all_files_exist = False
+                    break
+            if all_files_exist:
+                debug_print(f"Skipping patient {hadm_id} - all output files already exist.")
+                skipped_patients += 1
                 continue
-            else:
-                print(f"Patient {hadm_id} in metadata but files missing - reprocessing")
+        
+        tasks.append(
+            (hadm_id, trajectories, patient_mapping, icu_admission_map, interval_minutes, waveform_base_dir, database, cache_dir)
+        )
+    
+    debug_print(f"Submitting {len(tasks)} tasks to {n_workers} workers.")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+        future_to_hadm = {executor.submit(process_patient_simplified, *task): task[0] for task in tasks}
 
-        patient_id = patient_mapping[hadm_id]
-        icu_admission_time = icu_admission_map[hadm_id]
+        for future in tqdm(concurrent.futures.as_completed(future_to_hadm), total=len(tasks), desc="Processing patients"):
+            hadm_id, patient_ics = future.result()
+            if patient_ics:
+                all_initial_conditions[hadm_id] = patient_ics
 
-        patient_ics = []
-
-        for traj in trajectories:
-            traj_num = traj['trajectory_num']
-
-            # Calculate exact t0 timestamp
-            t0_timestamp = calculate_t0_timestamp(traj, icu_admission_time, interval_minutes)
-
-            print(f"\nProcessing patient {patient_id} (HADM {hadm_id}), trajectory {traj_num}")
-            print(f"  ICU admission: {icu_admission_time}")
-            print(f"  t0 timestamp: {t0_timestamp}")
-
-            # Find appropriate waveform file
-            if waveform_base_dir:
-                patient_path, record_name = find_waveform_file_for_t0_local(
-                    patient_id, t0_timestamp, waveform_base_dir
-                )
-            else:
-                patient_path, record_name = find_waveform_file_for_t0_remote_with_discovery(
-                    patient_id, t0_timestamp, database
-                )
-
-            if patient_path is None or record_name is None:
-                print(f"  No suitable waveform file found")
-                continue
-
-            # Extract IC from waveform
-            ic_values, ic_mask = extract_ic_from_waveform_file(
-                patient_path, record_name, t0_timestamp, database=database
-            )
-
-            if ic_values is None:
-                print(f"  IC extraction failed")
-                continue
-
-            # Create IC tensor
-            physio_values = [
-                ic_values['HR'],
-                ic_values['ABP Mean'],
-                ic_values['CVP'],
-                ic_values.get('SV', 0.0),
-                ic_values.get('R_TPR', 0.0)
-            ]
-            physio_masks = [
-                ic_mask['HR'],
-                ic_mask['ABP Mean'],
-                ic_mask['CVP'],
-                ic_mask.get('SV', 0.0),
-                ic_mask.get('R_TPR', 0.0)
-            ]
-
-            ic_tensor = torch.tensor(physio_values, dtype=torch.float32)
-            ic_mask_tensor = torch.tensor(physio_masks, dtype=torch.float32)
-
-            # Save IC tensor
-            ic_file_path = Path(cache_dir) / f"ic_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
-            torch.save((ic_tensor, ic_mask_tensor), ic_file_path)
-
-            patient_ics.append({
-                'hadm_id': hadm_id,
-                'trajectory_num': traj_num,
-                't0_timestamp': t0_timestamp,
-                'file_path': str(ic_file_path),
-                'ic_values': ic_values,
-                'record_used': f"{patient_path}/{record_name}"
-            })
-
-            total_ics_created += 1
-            print(f"  ✓ Created IC tensor")
-
-        if patient_ics:
-            all_initial_conditions[hadm_id] = patient_ics
-            patients_processed += 1
-
-            # CACHING: Save progress every 10 patients
-            if patients_processed % 10 == 0:
-                ic_metadata = {
-                    'all_initial_conditions': all_initial_conditions,
-                    'total_ics': total_ics_created,
-                    'parameters': ['HR', 'ABP Mean', 'CVP'],
-                    'extraction_method': 'waveform_numerics_simplified',
-                    'patients_processed': patients_processed,
-                    'patients_skipped': patients_skipped
-                }
-
-                with open(metadata_file, "wb") as f:
-                    pickle.dump(ic_metadata, f)
-                print(f"💾 SAVED PROGRESS: {patients_processed} patients processed, {total_ics_created} IC tensors")
-
-    # CACHING: Save final metadata
+    total_ics_created = sum(len(ics) for ics in all_initial_conditions.values())
+    
+    metadata_file = Path(cache_dir) / "ic_metadata.pkl"
+    debug_print(f"Saving final metadata to {metadata_file}...")
     ic_metadata = {
         'all_initial_conditions': all_initial_conditions,
         'total_ics': total_ics_created,
         'parameters': ['HR', 'ABP Mean', 'CVP', 'SV', 'CO'],
-        'extraction_method': 'waveform_numerics_simplified',
-        'patients_processed': patients_processed,
-        'patients_skipped': patients_skipped
+        'extraction_method': 'waveform_numerics_simplified_parallel',
+        'patients_processed': len(all_initial_conditions),
+        'patients_skipped': skipped_patients
     }
 
     with open(metadata_file, "wb") as f:
         pickle.dump(ic_metadata, f)
 
     print(f"\n✅ FINAL RESULTS:")
-    print(f"  New patients processed: {patients_processed}")
-    print(f"  Patients skipped (already done): {patients_skipped}")
+    print(f"  Patients with new ICs created: {len(all_initial_conditions)}")
+    print(f"  Patients skipped (already processed): {skipped_patients}")
     print(f"  Total IC tensors: {total_ics_created}")
     print(f"  Metadata saved to: {metadata_file}")
 
@@ -633,5 +622,6 @@ if __name__ == "__main__":
         relevant_patient_ids_path=relevant_patient_ids_path,
         icustays_path=icustays_path,
         waveform_base_dir=waveform_base_dir,  # None = remote access
-        cache_dir="../../data/mimic3refactor/processed_data/initial_conditions"
+        cache_dir="../../data/mimic3refactor/processed_data/initial_conditions",
+        n_workers=8  # Set the number of parallel workers
     )

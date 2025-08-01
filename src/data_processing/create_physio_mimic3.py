@@ -18,6 +18,16 @@ from tqdm import tqdm
 from scipy.interpolate import interp1d
 import warnings
 from collections import defaultdict
+import concurrent.futures
+
+# --- Debug Setup ---
+DEBUG = os.environ.get('DEBUG', 'False').lower() in ('true', '1', 't')
+
+def debug_print(s):
+    if DEBUG:
+        print(s)
+# --- End Debug Setup ---
+
 
 warnings.filterwarnings('ignore')
 
@@ -504,6 +514,43 @@ def process_patient_waveforms(hadm_id, patient_id, patient_trajectories, patient
     print(f"  Skipped {skipped_multi_record} multi-record trajectories, {skipped_no_record} with no coverage")
     return patient_p_tensors, patient_predictions
 
+def process_patient_waveforms_and_save(
+    hadm_id, patient_id, patient_trajectories, patient_ics, icu_admission_time, interval_minutes, 
+    prediction_minutes, target_interval_seconds, max_interval_seconds, waveform_cache, database, 
+    p_tensor_cache_dir, prediction_target_cache_dir
+):
+    debug_print(f"[Worker PID: {os.getpid()}] Processing patient HADM_ID: {hadm_id}")
+    patient_p_tensors, patient_predictions = process_patient_waveforms(
+        hadm_id, patient_id, patient_trajectories, patient_ics,
+        icu_admission_time, interval_minutes, prediction_minutes,
+        target_interval_seconds, max_interval_seconds,
+        waveform_cache, database
+    )
+
+    p_tensor_info = []
+    for p_tensor in patient_p_tensors:
+        traj_num = p_tensor['trajectory_num']
+        debug_print(f"  [Worker PID: {os.getpid()}] Saving p_tensor for traj {traj_num}")
+        p_file = Path(p_tensor_cache_dir) / f"p_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+        torch.save(p_tensor['tensor_data'], p_file)
+        p_tensor_info.append({
+            'hadm_id': hadm_id, 'trajectory_num': traj_num, 'file_path': str(p_file), 'metadata': p_tensor['metadata']
+        })
+
+    prediction_info = []
+    for prediction in patient_predictions:
+        traj_num = prediction['trajectory_num']
+        debug_print(f"  [Worker PID: {os.getpid()}] Saving prediction_target for traj {traj_num}")
+        pred_file = Path(prediction_target_cache_dir) / f"prediction_target_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+        torch.save(prediction['tensor_data'], pred_file)
+        prediction_info.append({
+            'hadm_id': hadm_id, 'trajectory_num': traj_num, 'file_path': str(pred_file), 'metadata': prediction['metadata']
+        })
+    
+    debug_print(f"[Worker PID: {os.getpid()}] Finished saving for patient {hadm_id}. Returning metadata.")
+    return hadm_id, p_tensor_info, prediction_info
+
+
 
 def create_p_tensor_from_record(hadm_id, traj_num, trajectory_info, time_range,
                                 record_data, icu_admission_time, interval_minutes):
@@ -744,139 +791,81 @@ def create_waveform_tensors_efficient(
         prediction_minutes=25,
         target_interval_seconds=10,
         max_interval_seconds=10,
-        skip_existing=True
+        skip_existing=True,
+        n_workers=4
 ):
-    """
-    Efficiently create P-tensors and prediction targets with minimal remote access
-
-    Key efficiency improvements:
-    - ONE directory listing per patient (instead of per trajectory)
-    - Cache record metadata to avoid repeated header reads
-    - Load each waveform record only once per patient
-    - Process all trajectories for a patient in one batch
-    """
-
-    # Setup
+    debug_print("--- Starting Efficient Waveform Tensor Creation ---")
     if not setup_wfdb_credentials():
         return None, None
 
-    # Create output directories
     Path(p_tensor_cache_dir).mkdir(parents=True, exist_ok=True)
     Path(prediction_target_cache_dir).mkdir(parents=True, exist_ok=True)
 
-    # Load metadata
+    debug_print("Loading metadata...")
     traj_metadata, ic_metadata = load_trajectory_metadata(trajectory_metadata_path, ic_metadata_path)
     patient_mapping = get_patient_mapping(relevant_patient_ids_path)
     icu_admission_map = get_icu_admission_times(icustays_path)
-
     all_trajectories = traj_metadata['all_trajectories']
     interval_minutes = traj_metadata['interval_minutes']
     all_initial_conditions = ic_metadata['all_initial_conditions']
+    debug_print(f"Loaded data for {len(all_initial_conditions)} patients.")
 
-    print(f"Processing {len(all_initial_conditions)} patients with initial conditions")
-    print(f"Prediction window: {prediction_minutes} minutes after t_0")
-    print(f"Target sampling: {target_interval_seconds}s intervals (max {max_interval_seconds}s)")
-    print(f"Efficiency: Batch processing per patient to minimize network calls")
-
-    # Initialize waveform cache and results storage
-    waveform_cache = WaveformRecordCache()
     all_p_tensors = {}
     all_prediction_targets = {}
+    tasks = []
+    skipped_patients = 0
+    waveform_cache = WaveformRecordCache()
 
-    processed_trajectories = 0
-    skipped_trajectories = 0
-    failed_trajectories = 0
-
-    # Process each patient (batch processing)
-    for hadm_id in tqdm(all_initial_conditions.keys(), desc="Processing patients"):
+    debug_print("Preparing tasks for parallel processing...")
+    for hadm_id in all_initial_conditions.keys():
         if hadm_id not in patient_mapping or hadm_id not in icu_admission_map:
             continue
+
+        if skip_existing:
+            all_files_exist = True
+            for ic_info in all_initial_conditions[hadm_id]:
+                traj_num = ic_info['trajectory_num']
+                p_file = Path(p_tensor_cache_dir) / f"p_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+                pred_file = Path(prediction_target_cache_dir) / f"prediction_target_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+                if not (p_file.exists() and pred_file.exists()):
+                    all_files_exist = False
+                    break
+            if all_files_exist:
+                debug_print(f"Skipping patient {hadm_id} - all output files exist.")
+                skipped_patients += 1
+                continue
 
         patient_id = patient_mapping[hadm_id]
         icu_admission_time = icu_admission_map[hadm_id]
         patient_trajectories = all_trajectories.get(hadm_id, [])
         patient_ics = all_initial_conditions[hadm_id]
+        tasks.append(
+            (hadm_id, patient_id, patient_trajectories, patient_ics, icu_admission_time, interval_minutes, 
+             prediction_minutes, target_interval_seconds, max_interval_seconds, waveform_cache, database, 
+             p_tensor_cache_dir, prediction_target_cache_dir)
+        )
 
-        # Check if all files already exist
-        if skip_existing:
-            all_exist = True
-            for ic_info in patient_ics:
-                traj_num = ic_info['trajectory_num']
-                p_file = Path(p_tensor_cache_dir) / f"p_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
-                pred_file = Path(
-                    prediction_target_cache_dir) / f"prediction_target_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+    debug_print(f"Submitting {len(tasks)} tasks to {n_workers} workers.")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+        future_to_hadm = {executor.submit(process_patient_waveforms_and_save, *task): task[0] for task in tasks}
 
-                if not (p_file.exists() and pred_file.exists()):
-                    all_exist = False
-                    break
-
-            if all_exist:
-                print(f"Skipping patient {patient_id} - all files exist")
-                skipped_trajectories += len(patient_ics)
-                continue
-
-        try:
-            # Process all trajectories for this patient efficiently
-            patient_p_tensors, patient_predictions = process_patient_waveforms(
-                hadm_id, patient_id, patient_trajectories, patient_ics,
-                icu_admission_time, interval_minutes, prediction_minutes,
-                target_interval_seconds, max_interval_seconds,
-                waveform_cache, database
-            )
-
-            # Save results
-            p_tensor_info = []
-            prediction_info = []
-
-            for p_tensor in patient_p_tensors:
-                traj_num = p_tensor['trajectory_num']
-                p_file = Path(p_tensor_cache_dir) / f"p_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
-                torch.save(p_tensor['tensor_data'], p_file)
-
-                p_tensor_info.append({
-                    'hadm_id': hadm_id,
-                    'trajectory_num': traj_num,
-                    'file_path': str(p_file),
-                    'metadata': p_tensor['metadata']
-                })
-                processed_trajectories += 1
-
-            for prediction in patient_predictions:
-                traj_num = prediction['trajectory_num']
-                pred_file = Path(
-                    prediction_target_cache_dir) / f"prediction_target_{int(hadm_id)}_traj_{traj_num:03d}.pt"
-                torch.save(prediction['tensor_data'], pred_file)
-
-                prediction_info.append({
-                    'hadm_id': hadm_id,
-                    'trajectory_num': traj_num,
-                    'file_path': str(pred_file),
-                    'metadata': prediction['metadata']
-                })
-
-            # Store in results
+        for future in tqdm(concurrent.futures.as_completed(future_to_hadm), total=len(tasks), desc="Processing patients"):
+            hadm_id, p_tensor_info, prediction_info = future.result()
             if p_tensor_info:
                 all_p_tensors[hadm_id] = p_tensor_info
             if prediction_info:
                 all_prediction_targets[hadm_id] = prediction_info
 
-        except Exception as e:
-            print(f"Error processing patient {patient_id}: {e}")
-            failed_trajectories += len(patient_ics)
-            continue
-
-    # Save metadata
-    # Save metadata
+    debug_print("Aggregating final metadata...")
     p_tensor_metadata = {
         'all_p_tensors': all_p_tensors,
-        'signal_names': ['HR', 'ABP Mean', 'CVP', 'SV', 'R_TPR'],  # 5 signals, no CO
+        'signal_names': ['HR', 'ABP Mean', 'CVP', 'SV', 'R_TPR'],
         'n_signals': 5,
         'interval_minutes': interval_minutes,
-        'total_trajectories': processed_trajectories,
-        'aligned_with_med_trajectories': medication_trajectory_metadata_path,
-        'source': 'waveform_numerics_efficient'
+        'total_trajectories': sum(len(p) for p in all_p_tensors.values()),
+        'aligned_with_med_trajectories': trajectory_metadata_path,
+        'source': 'waveform_numerics_efficient_parallel'
     }
-
     prediction_metadata = {
         'all_prediction_targets': all_prediction_targets,
         'signal_names': ['ABP Mean', 'CVP'],
@@ -885,10 +874,9 @@ def create_waveform_tensors_efficient(
         'target_interval_seconds': target_interval_seconds,
         'max_interval_seconds': max_interval_seconds,
         'total_trajectories': sum(len(preds) for preds in all_prediction_targets.values()),
-        'source': 'waveform_numerics_efficient'
+        'source': 'waveform_numerics_efficient_parallel'
     }
 
-    # Save metadata files
     p_metadata_file = Path(p_tensor_cache_dir) / "p_tensor_metadata.pkl"
     with open(p_metadata_file, "wb") as f:
         pickle.dump(p_tensor_metadata, f)
@@ -898,12 +886,10 @@ def create_waveform_tensors_efficient(
         pickle.dump(prediction_metadata, f)
 
     print(f"\n✅ EFFICIENT PROCESSING COMPLETE:")
-    print(f"  Trajectories processed: {processed_trajectories}")
-    print(f"  Trajectories skipped: {skipped_trajectories}")
-    print(f"  Trajectories failed: {failed_trajectories}")
+    print(f"  New patients processed: {len(all_p_tensors)}")
+    print(f"  Patients skipped: {skipped_patients}")
     print(f"  P-tensors created: {sum(len(pts) for pts in all_p_tensors.values())}")
     print(f"  Prediction targets created: {sum(len(pts) for pts in all_prediction_targets.values())}")
-    print(f"  Network efficiency: ~1-3 calls per patient vs 10-50+ in naive approach")
     print(f"  P-tensor metadata saved to: {p_metadata_file}")
     print(f"  Prediction metadata saved to: {pred_metadata_file}")
 
@@ -929,5 +915,6 @@ if __name__ == "__main__":
         prediction_target_cache_dir="../../data/mimic3refactor/processed_data/waveform_prediction_targets",
         prediction_minutes=25,
         target_interval_seconds=5,
-        max_interval_seconds=10
+        max_interval_seconds=10,
+        n_workers=8
     )
