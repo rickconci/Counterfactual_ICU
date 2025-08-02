@@ -22,5 +22,5 @@ processed_data/
 physionet.org/
 test_res/
 data/
-mimic3refactor/
+data/mimic_3_data/
 OldScripts/

@@ -608,9 +608,9 @@ def create_ic_tensors_simplified(
 # Example usage
 if __name__ == "__main__":
     # Set up paths
-    trajectory_metadata_path = "../../data/mimic3refactor/processed_data/med_tensors/trajectory_metadata.pkl"
-    relevant_patient_ids_path = "../../data/mimic3refactor/processed_data/relevant_patient_ids.csv"
-    icustays_path = "../../data/mimic3refactor/input_data/ICUSTAYS.csv"
+    trajectory_metadata_path = "../../data/mimic_3_data/processed_data/med_tensors/trajectory_metadata.pkl"
+    relevant_patient_ids_path = "../../data/mimic_3_data/processed_data/relevant_patient_ids.csv"
+    icustays_path = "../../data/mimic_3_data/input_data/ICUSTAYS.csv"
 
     # For local files: set path to your local waveform directory
     # For remote access: set waveform_base_dir=None (will browse PhysioNet URLs)
@@ -622,6 +622,6 @@ if __name__ == "__main__":
         relevant_patient_ids_path=relevant_patient_ids_path,
         icustays_path=icustays_path,
         waveform_base_dir=waveform_base_dir,  # None = remote access
-        cache_dir="../../data/mimic3refactor/processed_data/initial_conditions",
+        cache_dir="../../data/mimic_3_data/processed_data/initial_conditions",
         n_workers=8  # Set the number of parallel workers
     )

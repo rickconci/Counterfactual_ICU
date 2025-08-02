@@ -899,10 +899,10 @@ def create_waveform_tensors_efficient(
 # Example usage
 if __name__ == "__main__":
     # Set up paths
-    trajectory_metadata_path = "../../data/mimic3refactor/processed_data/med_tensors/trajectory_metadata.pkl"
-    ic_metadata_path = "../../data/mimic3refactor/processed_data/initial_conditions/initial_conditions_metadata.pkl"
-    relevant_patient_ids_path = "../../data/mimic3refactor/processed_data/relevant_patient_ids.csv"
-    icustays_path = "../../data/mimic3refactor/input_data/ICUSTAYS.csv"
+    trajectory_metadata_path = "../../data/mimic_3_data/processed_data/med_tensors/trajectory_metadata.pkl"
+    ic_metadata_path = "../../data/mimic_3_data/processed_data/initial_conditions/initial_conditions_metadata.pkl"
+    relevant_patient_ids_path = "../../data/mimic_3_data/processed_data/relevant_patient_ids.csv"
+    icustays_path = "../../data/mimic_3_data/input_data/ICUSTAYS.csv"
 
     # Create waveform tensors efficiently
     p_tensors, prediction_targets = create_waveform_tensors_efficient(
@@ -911,8 +911,8 @@ if __name__ == "__main__":
         relevant_patient_ids_path=relevant_patient_ids_path,
         icustays_path=icustays_path,
         waveform_base_dir=None,  # Remote access
-        p_tensor_cache_dir="../../data/mimic3refactor/processed_data/waveform_p_tensors",
-        prediction_target_cache_dir="../../data/mimic3refactor/processed_data/waveform_prediction_targets",
+        p_tensor_cache_dir="../../data/mimic_3_data/processed_data/waveform_p_tensors",
+        prediction_target_cache_dir="../../data/mimic_3_data/processed_data/waveform_prediction_targets",
         prediction_minutes=25,
         target_interval_seconds=5,
         max_interval_seconds=10,

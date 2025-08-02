@@ -28,11 +28,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 # This makes path handling robust, regardless of where the script is executed
 DATA_DIR = PROJECT_ROOT / "data"
 MIMIC_DIR = DATA_DIR / "mimic_3_data"
-#MIMIC_INPUT_DIR = MIMIC_DIR / "input_data"
+MIMIC_INPUT_DIR = MIMIC_DIR / "input_data"
 MIMIC_PROCESSED_DIR = MIMIC_DIR / "processed_data"
 PHYSIONET_INPUT_DIR = PROJECT_ROOT / "physionet.org" / "files" / "mimiciii" / "1.4"
-MIMIC_INPUT_DIR = PHYSIONET_INPUT_DIR
-DEFAULT_OUTPUT_DIR = DATA_DIR / "mimic_3_data"
+#MIMIC_INPUT_DIR = PHYSIONET_INPUT_DIR
+DEFAULT_OUTPUT_DIR = DATA_DIR / "mimic_3_data" / "processed_data"
 
 # Ensure processed data directories exist
 (DEFAULT_OUTPUT_DIR / "med_tensors").mkdir(parents=True, exist_ok=True)
@@ -80,7 +80,7 @@ def parse_args():
     # Data limit parameter (for testing)
     parser.add_argument('--data-limit', type=int, default=None,
                         help='Limit on number of rows to read from CSV files (default: None for unlimited)')
-    parser.add_argument('--patient-limit', type=int, default=10,
+    parser.add_argument('--patient-limit', type=int, default=None,
                         help='Limit number of patients to process for faster testing (default: None)')
 
     # Output directories
@@ -97,6 +97,7 @@ def parse_args():
 
 
 def find_relevant_patients(
+    waveform_patient_ids,
     measurements,
     MAP_id,
     load_path_events=MIMIC_INPUT_DIR / "CHARTEVENTS.csv",
@@ -131,6 +132,7 @@ def find_relevant_patients(
 
         long_stays_query_filtered = (
             long_stays_query.filter(pl.col("LOS") > 1)
+            .filter(pl.col("SUBJECT_ID").is_in(waveform_patient_ids))
             .select("HADM_ID")
             .unique()
         )
@@ -273,8 +275,8 @@ def process_single_patient_physio(
     # 2. Group by time interval and itemid, calculating the mean value at once.
     # This is the core vectorization step, replacing the slow iter_rows loop.
     debug_print(f"  [Physio] Performing grouped aggregation on chart events...")
-    aggregated_df = chart_df_patient.group_by(['time_idx', 'itemid']).agg(
-        pl.mean('value').alias('mean_value')
+    aggregated_df = chart_df_patient.group_by(['time_idx', 'ITEMID']).agg(
+        pl.mean('VALUE').alias('mean_value')
     )
     debug_print(f"  [Physio] Aggregation complete. Result shape: {aggregated_df.shape}")
 
@@ -283,7 +285,7 @@ def process_single_patient_physio(
     debug_print(f"  [Physio] Pivoting data to wide format...")
     pivoted_df = aggregated_df.pivot(
         index='time_idx',
-        columns='itemid',
+        columns='ITEMID',
         values='mean_value'
     )
     debug_print(f"  [Physio] Pivoting complete. Pivoted shape: {pivoted_df.shape}")
@@ -453,7 +455,7 @@ def create_physio_tensors(
         co_itemids,
         trajectory_metadata_path,
         relevant_patients_chartevents_path,
-        time_interval_minutes=5,
+        time_interval_minutes=1,
         icustays_path=PHYSIONET_INPUT_DIR / 'icustays.csv',
         cache_dir=DEFAULT_OUTPUT_DIR / 'p_tensors',
         prediction_target_dir=DEFAULT_OUTPUT_DIR / 'prediction_targets',
@@ -598,13 +600,13 @@ def create_physio_tensors(
     # Update the process_func to include prediction target saving
     process_func = partial(
         process_single_patient_physio,
-        physio_df=physio_df,
+        physio_df=chart_df,
         physio_params=physio_params,
         co_itemids=co_itemids,
         n_intervals=n_intervals,
         interval_minutes=time_interval_minutes,
         cache_dir=cache_dir,
-        save_prediction_targets=True,  # NEW
+        save_prediction_targets=False,  # NEW
         prediction_target_dir=prediction_target_dir  # NEW
     )
 
@@ -1861,6 +1863,14 @@ def main():
 
     debug_print(f"MIMIC-III Processing Configuration: {args}")
 
+    with open('../../data/mimic_3_data/input_data/RECORDS-numerics.txt', 'r') as f:
+        numbers = [int(line.strip().split('/')[1].lstrip('p'))
+                   for line in f
+                   if line.strip() and len(line.strip().split('/')) >= 2
+                   and line.strip().split('/')[1].lstrip('p').isdigit()]
+
+    print(f"\nMIMIC-III Item ID Mappings:")
+
     mimic3_ids = get_mimic3_item_ids()
     debug_print(f"MIMIC-III Item ID Mappings: {mimic3_ids}")
 
@@ -1871,12 +1881,14 @@ def main():
     measurements = [item for sublist in nested_list for item in sublist]
 
     hadm_ids_df = find_relevant_patients(
+        waveform_patient_ids=numbers,
         measurements=measurements,
         MAP_id=[225312, 52, 6702],
         save_path=relevant_patients_chartevents_path,
         data_limit=args.data_limit
     )
     unique_hadm_ids = hadm_ids_df['HADM_ID'].unique().to_list()
+    print(f"UNIQUE HADM_IDS: {len(unique_hadm_ids)}")
 
     # Apply patient limit for testing if specified
     if args.patient_limit is not None and args.patient_limit > 0:
