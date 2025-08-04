@@ -155,7 +155,7 @@ def main(args):
                            #Encoder
                            encoder_input_dim =  data_module.encoder_input_dim, 
                            encoder_hidden_dim = args.encoder_hidden_dim,
-                           expert_latent_dims  = 14, # Fixed by the ODE model
+                           expert_latent_dims  = 14, # Fixed by the ODE model #todo chck that
                            encoder_SDENN_dims = 0 if args.use_encoder == 'none' else args.encoder_SDENN_dims,
 
                            use_2_5std_encoder_minmax = args.use_2_5std_encoder_minmax,
@@ -271,7 +271,7 @@ if __name__ == '__main__':
 
     # Data specific args
     parser.add_argument('--dataset_type', type=str, default='synthetic', choices=['synthetic', 'mimic'], help='Which dataset to use.')
-    parser.add_argument('--data_root', type=str, default='../data/processed_data', help='Root directory for MIMIC preprocessed data.')
+    parser.add_argument('--data_root', type=str, default='../data/mimic_3_data/processed_data', help='Root directory for MIMIC preprocessed data.')
     parser.add_argument('--icu_stays_path', type=str, default='data/input_data/icustays.csv', help='Path to icustays.csv file.')
     parser.add_argument('--static_hidden_dim', type=int, default=16, help='Hidden dimension for the static encoder MLP.')
     parser.add_argument('--fusion_hidden_dim', type=int, default=32, help='Hidden dimension for the fusion MLP.')

@@ -263,7 +263,7 @@ def process_single_patient_physio(
     Vectorized version for high performance.
     """
     debug_print(f"  [Physio] Processing patient {hadm_id} with vectorized logic.")
-    
+
     # 1. Filter the in-memory DataFrame for the specific patient
     chart_df_patient = physio_df.filter(pl.col('HADM_ID') == hadm_id)
     if chart_df_patient.height == 0:
@@ -314,11 +314,11 @@ def process_single_patient_physio(
             # Get values and identify where they are not null
             col_values = pivoted_df[itemid_str].to_numpy()
             valid_mask = ~np.isnan(col_values)
-            
+
             # Use the boolean mask to get the indices and values
             valid_indices = time_indices_in_pivot[valid_mask]
             valid_values = col_values[valid_mask]
-            
+
             # Place the valid values and masks into the final arrays at the correct time indices
             values_array[valid_indices, i] = valid_values
             mask_array[valid_indices, i] = 1.0
@@ -345,7 +345,7 @@ def process_single_patient_physio(
     debug_print(f"  [Physio] Performing vectorized calculations for derived parameters (SV/CO, R_TPR)...")
     if hr_idx != -1 and sv_idx != -1:
         hr_present_mask = (mask_array[:, hr_idx] > 0) & (values_array[:, hr_idx] > 0)
-        
+
         # Vectorized calculation for SV from CO
         sv_calc_mask = hr_present_mask & (co_mask_array > 0) & (mask_array[:, sv_idx] == 0) & (co_values_array > 0)
         if np.any(sv_calc_mask):
@@ -367,7 +367,7 @@ def process_single_patient_physio(
             map_vals = values_array[rtpr_calc_mask, map_idx]
             cvp_vals = values_array[rtpr_calc_mask, cvp_idx]
             co_vals = co_values_array[rtpr_calc_mask]
-            
+
             values_array[rtpr_calc_mask, r_tpr_idx] = (map_vals - cvp_vals) / co_vals
             mask_array[rtpr_calc_mask, r_tpr_idx] = 1.0
             debug_print(f"    - Calculated {np.sum(rtpr_calc_mask)} R_TPR values.")
@@ -491,7 +491,7 @@ def create_physio_tensors(
         # Use the n_intervals from medication metadata which was already calculated correctly
         n_intervals = med_trajectory_data['n_intervals']
         debug_print(f"Using variable trajectory windows up to {n_intervals} intervals.")
-    
+
     debug_print("Loading ICU stays data...")
     icustays_df = pl.read_csv(icustays_path)
     if icustays_df.schema['INTIME'] != pl.Datetime:
@@ -948,7 +948,7 @@ def process_single_patient_medications(
     values_array = np.zeros((n_intervals, n_medications), dtype=np.float32)
     crystalloid_sum_idx = len(medication_info)
     t0_trigger_idx = len(medication_info) + 1
-    
+
     # Populate arrays from the active_rates_df
     med_idx_map = {info['itemid']: i for i, info in enumerate(medication_info)}
     for itemid_str in active_rates_df.columns:
@@ -962,7 +962,7 @@ def process_single_patient_medications(
     crystalloid_indices = [med_idx_map[m['itemid']] for m in medication_info if m['medication_type'] == 'crystalloid' and m['itemid'] in med_idx_map]
     if crystalloid_indices:
         values_array[:, crystalloid_sum_idx] = np.round(np.sum(values_array[:, crystalloid_indices], axis=1))
-    
+
     # Vectorized t0 trigger calculation
     vasopressor_indices = [med_idx_map[m['itemid']] for m in medication_info if m['medication_type'] == 'vasopressor' and m['itemid'] in med_idx_map]
     if vasopressor_indices:
@@ -974,11 +974,11 @@ def process_single_patient_medications(
 
     crystalloid_sum = values_array[:, crystalloid_sum_idx]
     crystalloid_triggers = (np.abs(crystalloid_sum[1:] - crystalloid_sum[:-1]) > 20) & (crystalloid_sum[1:] > 50)
-    
+
     t0_array = np.zeros(n_intervals, dtype=np.float32)
     t0_array[1:] = np.where(vasopressor_triggers, 1, np.where(crystalloid_triggers, 1, 0))
     values_array[:, t0_trigger_idx] = t0_array
-    
+
     mask_array = (values_array > 1e-6).astype(np.float32)
     mask_array[:, t0_trigger_idx] = 1.0 # t0 is always "measured"
 
@@ -988,7 +988,7 @@ def process_single_patient_medications(
     rel_time_array = np.arange(n_intervals) * interval_minutes / 60.0
     abs_time_array = rel_time_array.copy()
     trajectories = extract_trajectories_from_patient(values_array, mask_array, abs_time_array, rel_time_array, t0_trigger_idx, trajectory_before_minutes, trajectory_after_minutes, interval_minutes)
-    
+
     trajectory_info = []
     for traj_num, (start_idx, end_idx) in enumerate(trajectories):
         file_path = save_trajectory_tensor(values_array, mask_array, abs_time_array, rel_time_array, start_idx, end_idx, hadm_id, traj_num, cache_dir)
@@ -1262,7 +1262,7 @@ def save_patient_physio_as_csv_with_rtpr(
     values_array = np.zeros((n_intervals, n_params), dtype=np.float32)
     mask_array = np.zeros((n_intervals, n_params), dtype=np.float32)
     count_array = np.zeros((n_intervals, n_params), dtype=np.int32)
-    
+
     map_idx = cvp_idx = r_tpr_idx = hr_idx = sv_idx = None
     for idx, p in enumerate(physio_params):
         if p['param_type'] == 'MAP': map_idx = idx
@@ -1270,7 +1270,7 @@ def save_patient_physio_as_csv_with_rtpr(
         elif p['param_type'] == 'R_TPR': r_tpr_idx = idx
         elif p['param_type'] == 'HR': hr_idx = idx
         elif p['param_type'] == 'SV': sv_idx = idx
-        
+
     co_values_array = np.zeros(n_intervals, dtype=np.float32)
     co_mask_array = np.zeros(n_intervals, dtype=np.float32)
     co_count_array = np.zeros(n_intervals, dtype=np.int32)
@@ -1303,7 +1303,7 @@ def save_patient_physio_as_csv_with_rtpr(
                     current_sum = co_values_array[time_idx] * co_count_array[time_idx]
                     co_count_array[time_idx] += 1
                     co_values_array[time_idx] = (current_sum + row['value']) / co_count_array[time_idx]
-    
+
     if hr_idx is not None and sv_idx is not None:
         for t in range(n_intervals):
             if mask_array[t, hr_idx] > 0 and values_array[t, hr_idx] > 0:
@@ -1320,21 +1320,21 @@ def save_patient_physio_as_csv_with_rtpr(
             if mask_array[t, map_idx] == 1 and mask_array[t, cvp_idx] == 1 and co_mask_array[t] == 1 and co_values_array[t] > 0:
                 values_array[t, r_tpr_idx] = (values_array[t, map_idx] - values_array[t, cvp_idx]) / co_values_array[t]
                 mask_array[t, r_tpr_idx] = 1.0
-    
+
     col_names = [p['param_name'] for p in physio_params]
     values_df = pd.DataFrame(values_array, columns=col_names)
     time_hours = np.arange(n_intervals) * interval_minutes / 60.0
     values_df.insert(0, 'time_hours', time_hours)
     values_df.to_csv(patient_dir / 'physio_values.csv', index=False)
-    
+
     mask_df = pd.DataFrame(mask_array, columns=col_names)
     mask_df.insert(0, 'time_hours', time_hours)
     mask_df.to_csv(patient_dir / 'physio_mask.csv', index=False)
-    
+
     co_df = pd.DataFrame({'co_values': co_values_array, 'co_mask': co_mask_array})
     co_df.insert(0, 'time_hours', time_hours)
     co_df.to_csv(patient_dir / 'co_values.csv', index=False)
-    
+
     print(f"Saved physio inspection CSVs for patient {hadm_id} to {patient_dir}")
 
 
@@ -1348,10 +1348,10 @@ def save_prediction_target_debug_csv(hadm_id, prediction_target_info, med_trajec
         traj_num = traj_info['trajectory_num']
         p_out_len = traj_info['length']
         t0_time = med_traj['end_time_hours'] * 60 # minutes
-        
+
         file_path = traj_info['file_path']
         pred_values, pred_mask, abs_time, _, _ = torch.load(file_path)
-        
+
         df = pd.DataFrame({
             'trajectory_num': traj_num,
             'time_from_t0_mins': (abs_time - abs_time[0]) / 60,
@@ -1362,7 +1362,7 @@ def save_prediction_target_debug_csv(hadm_id, prediction_target_info, med_trajec
             't0_time_mins_from_admission': t0_time,
         })
         all_traj_df.append(df)
-        
+
     if all_traj_df:
         final_df = pd.concat(all_traj_df)
         final_df.to_csv(patient_dir / f'prediction_targets_debug_{hadm_id}.csv', index=False)
@@ -1391,7 +1391,7 @@ def create_medication_tensors(
     los_df = pl.read_csv(icustays_path)
     if 'LOS' not in los_df.columns:
         raise ValueError(f"Column 'LOS' not found in {icustays_path}. Available columns: {los_df.columns}")
-    
+
     if trajectory_before_minutes is not None:
         total_window_minutes = trajectory_before_minutes + trajectory_after_minutes
         n_intervals = int(np.ceil(total_window_minutes / interval_minutes))
@@ -1650,7 +1650,7 @@ def save_trajectory_tensor(
 
     # Construct the final file path using the robust pathlib object
     file_path = cache_dir_path / f"med_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
-    
+
     torch.save(
         (values_tensor, mask_tensor, abs_time_tensor, rel_time_tensor, length),
         file_path
@@ -1688,7 +1688,7 @@ def prepare_medication_data(med_df, icustays_path, all_med_ids, all_hadm_ids, in
     icustays_df = pl.read_csv(icustays_path)
     if icustays_df.schema['INTIME'] != pl.Datetime:
         icustays_df = icustays_df.with_columns(pl.col('INTIME').str.to_datetime())
-    
+
     med_df = med_df.join(
         icustays_df.select(['HADM_ID', 'INTIME']).rename({'HADM_ID': 'hadm_id'}),
         on='hadm_id',
@@ -1706,7 +1706,7 @@ def prepare_medication_data(med_df, icustays_path, all_med_ids, all_hadm_ids, in
 
     # Filter out pre-admission events
     med_df = med_df.filter(pl.col('start_minutes') >= 0)
-    
+
     debug_print("Medication data preparation complete.")
     return med_df
 
@@ -1967,7 +1967,7 @@ def main():
         print("Skipping baseline tensor creation.")
 
     print(f"\n=== Processing Complete ===")
-    print(f"Total patients with trajectories: {len(medication_trajectories)}")
+   # print(f"Total patients with trajectories: {len(medication_trajectories)}")
     print(f"Output saved to: {output_dir}")
 
 

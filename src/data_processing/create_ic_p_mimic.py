@@ -296,6 +296,35 @@ class WaveformRecordCache:
             return None
 
 
+def find_signal_index(record_signal_names, target_signal):
+    """Find signal index with flexible name matching"""
+    # Create mapping for common variations
+    signal_variations = {
+        'ABP Mean': ['ABP Mean', 'ABPMean', 'ABP_Mean', 'ABP MEAN', 'ABPMEAN'],
+        'HR': ['HR', 'Heart Rate', 'HEART_RATE', 'HeartRate'],
+        'CVP': ['CVP', 'Central Venous Pressure', 'CVP_Mean'],
+        'SV': ['SV', 'Stroke Volume', 'STROKE_VOLUME'],
+        'CO': ['CO', 'Cardiac Output', 'CARDIAC_OUTPUT']
+    }
+
+    # Get all possible names for this target signal
+    possible_names = signal_variations.get(target_signal, [target_signal])
+
+    # Try to find any of the variations
+    for name in possible_names:
+        try:
+            return record_signal_names.index(name)
+        except ValueError:
+            continue
+
+    # If no exact match, try partial matching
+    for i, record_signal in enumerate(record_signal_names):
+        for possible_name in possible_names:
+            if possible_name.lower().replace(' ', '').replace('_', '') in record_signal.lower().replace(' ','').replace('_',''):
+                return i
+
+    raise ValueError(f"Signal {target_signal} not found")
+
 
 
 def extract_signals_from_record(record_data, start_time, end_time, target_signals):
@@ -326,7 +355,7 @@ def extract_signals_from_record(record_data, start_time, end_time, target_signal
 
     for signal_name in target_signals:
         try:
-            signal_index = record.sig_name.index(signal_name)
+            signal_index = find_signal_index(record.sig_name, signal_name)
             signal_values = record.p_signal[start_sample:end_sample, signal_index]
 
             # Create time array for this signal

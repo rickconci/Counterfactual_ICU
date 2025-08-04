@@ -17,7 +17,7 @@ class MIMICDataset(Dataset):
         self.baseline_tensor_dir = os.path.join(data_root, 'baseline_tensors') # New
         
         # Load metadata
-        ic_metadata_path = os.path.join(self.ic_tensor_dir, 'initial_conditions_metadata.pkl')
+        ic_metadata_path = os.path.join(self.ic_tensor_dir, 'ic_metadata.pkl')
         if not os.path.exists(ic_metadata_path):
             raise FileNotFoundError(f"Initial conditions metadata not found at {ic_metadata_path}. Please run preprocessing first.")
         with open(ic_metadata_path, 'rb') as f:
@@ -102,7 +102,6 @@ class MIMICDataset(Dataset):
         full_fact_traj = torch.cat([p_in_values, p_out_padded], dim=0)
         t_full = torch.cat([p_in_rel_time, p_out_rel_time])
 
-        # TODO pass the ic_mask too
 
         return {
             "X": p_in_values,
@@ -178,6 +177,7 @@ class MIMICDataModule(L.LightningDataModule):
     @staticmethod
     def collate_fn(batch):
         # Define the expected max_len (should match the model's max_len parameter)
+        # TODO this needs to be fixed
         MAX_LEN = 215  # or get this from somewhere consistent
 
         pad_keys = ["X", "X_mask", "Y_fact", "Y_cf", "t_X", "t_Y", "t_full", "full_fact_traj", "full_CF_traj",
@@ -201,7 +201,9 @@ class MIMICDataModule(L.LightningDataModule):
                     valid_len = len(t_Y)
             else:
                 valid_len = 1
-
+            # we fixed the predictions to all be of same length when using MIMIC-III, so if that does not hold we raise an Exception
+            if valid_len != 299:
+                raise ValueError("Unexpected prediction length")
             valid_lengths.append(valid_len)
 
         collated['valid_lengths'] = torch.tensor(valid_lengths, dtype=torch.long)

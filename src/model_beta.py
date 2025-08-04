@@ -1220,7 +1220,7 @@ class Hybrid_VAE_SDE(LightningModule):
         batch_size = X.shape[0]
 
         # Use the full time grid - we'll handle variable lengths in forward_latent
-        ts = time_post[0, :]  # Assuming all sequences share the same time grid
+        ts = time_post[0, :]  # Assuming all sequences share the same time gridn (A given in our MIMIC-III setup)
 
 
         # TODO: Remove this when using real init states
@@ -1229,10 +1229,10 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
-                print(f"X shape: {X.shape}. Should be [23 x 215 x 5]")
+                print(f"X shape: {X.shape}. Should be [23 x MAX_LEN x 5]")
                 # Raindrop expects src shape: [seq_len, batch_size, features]
                 X_t = X.permute(1, 0, 2)
-                print(f"Time pre shape: {time_pre.shape}. Should be [23x125]")
+                print(f"Time pre shape: {time_pre.shape}. Should be [23xMAX_LEN]")
                 time_pre_t = time_pre.permute(1, 0)
                 print(f"X_Mask shape: {X.shape}. Should be [23 x 215 x 5]")
                 mask_t = X_mask.permute(1, 0, 2)
