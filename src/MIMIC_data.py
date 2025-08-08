@@ -83,10 +83,12 @@ class MIMICDataset(Dataset):
         med_tensor_in, _, _, _, _ = torch.load(m_path)
         
         p_out_path = os.path.join(self.target_tensor_dir, f"prediction_target_{hadm_id}_traj_{traj_num:03d}.pt")
-        p_out_values, _, p_out_abs_time, p_out_rel_time, _ = torch.load(p_out_path)
+        p_out_values, _, p_out_rel_time, _ = torch.load(p_out_path)
 
-        # The time for Y should be relative to t0
-        t_Y = p_out_rel_time - p_out_rel_time[0] if len(p_out_rel_time) > 0 else p_out_rel_time
+        # The time for Y should be relative to t0: commented out because MIMIC-iii pred tensors start uniformly at t_0 +5s
+        #t_Y = p_out_rel_time - p_out_rel_time[0] if len(p_out_rel_time) > 0 else p_out_rel_time
+        t_Y = p_out_rel_time
+
 
         # --- New: Load static features from pre-made tensor ---
         baseline_path = os.path.join(self.baseline_tensor_dir, f"baseline_{hadm_id}.pt")
@@ -95,9 +97,12 @@ class MIMICDataset(Dataset):
 
         # The full trajectory for evaluation/plotting is p_in and p_out concatenated
         # Pad p_out_values with zeros for the missing 3 features
+        print(f"P in shape: {p_in_values.shape}")
+        print(f"P out shape: {p_out_values.shape}")
+        #changed dim here for MIMIC-III (higher diversity of itemids in MIMIC-III leads to more physio params
         p_out_padded = torch.cat([
             p_out_values,
-            torch.zeros(p_out_values.shape[0], 3)  # or torch.full((p_out_values.shape[0], 3), float('nan'))
+            torch.zeros(p_out_values.shape[0], 10)  # or torch.full((p_out_values.shape[0], 3), float('nan'))
         ], dim=1)
         full_fact_traj = torch.cat([p_in_values, p_out_padded], dim=0)
         t_full = torch.cat([p_in_rel_time, p_out_rel_time])

@@ -462,7 +462,8 @@ def create_physio_tensors(
         n_workers=4,
         max_co_age_minutes=10,
         co_guess=4.0,
-        debug_patient_id=20214994
+        debug_patient_id=20214994,
+        physio_offset_intervals = 1
 ):
     """
     Create physiological measurement tensors aligned with medication trajectories.
@@ -623,9 +624,12 @@ def create_physio_tensors(
                 if not med_trajectories:
                     continue
 
-                # Extract trajectory boundaries
-                trajectory_boundaries = [(traj['start_idx'], traj['end_idx'])
-                                         for traj in med_trajectories]
+                # Extract trajectory boundaries with offset for physio
+                trajectory_boundaries = []
+                for traj in med_trajectories:
+                    start_idx = traj['start_idx']
+                    end_idx = max(start_idx + 1, traj['end_idx'] - physio_offset_intervals)
+                    trajectory_boundaries.append((start_idx, end_idx))
 
                 admission_time = stay_admission_map.get(hadm_id)
 
@@ -655,8 +659,12 @@ def create_physio_tensors(
                     if int(hadm_id) == debug_patient_id:
                         # Need to retrieve the trajectory boundaries again
                         med_trajectories = all_med_trajectories.get(hadm_id, [])
-                        trajectory_boundaries = [(traj['start_idx'], traj['end_idx'])
-                                                 for traj in med_trajectories]
+                        # Extract trajectory boundaries with offset for physio
+                        trajectory_boundaries = []
+                        for traj in med_trajectories:
+                            start_idx = traj['start_idx']
+                            end_idx = max(start_idx + 1, traj['end_idx'] - physio_offset_intervals)
+                            trajectory_boundaries.append((start_idx, end_idx))
                         admission_time = stay_admission_map.get(hadm_id)
 
                         if admission_time is not None:
@@ -693,8 +701,12 @@ def create_physio_tensors(
             if not med_trajectories:
                 continue
 
-            trajectory_boundaries = [(traj['start_idx'], traj['end_idx'])
-                                     for traj in med_trajectories]
+            # MODIFIED: Extract trajectory boundaries with offset for physio
+            trajectory_boundaries = []
+            for traj in med_trajectories:
+                start_idx = traj['start_idx']
+                end_idx = max(start_idx + 1, traj['end_idx'] - physio_offset_intervals)
+                trajectory_boundaries.append((start_idx, end_idx))
 
             admission_time = stay_admission_map.get(hadm_id)
 
@@ -1318,7 +1330,13 @@ def save_patient_physio_as_csv_with_rtpr(
     if all([r_tpr_idx, map_idx, cvp_idx]):
         for t in range(n_intervals):
             if mask_array[t, map_idx] == 1 and mask_array[t, cvp_idx] == 1 and co_mask_array[t] == 1 and co_values_array[t] > 0:
-                values_array[t, r_tpr_idx] = (values_array[t, map_idx] - values_array[t, cvp_idx]) / co_values_array[t]
+                rtpr_estimate = (values_array[t, map_idx] - values_array[t, cvp_idx]) / co_values_array[t]
+                if rtpr_estimate > 0:
+                    values_array[t, r_tpr_idx] = rtpr_estimate
+                    ic_mask['R_TPR'] = 1.0
+                else:
+                    values_array[t, r_tpr_idx] = 0
+                    ic_mask['R_TPR'] = 0.0
                 mask_array[t, r_tpr_idx] = 1.0
 
     col_names = [p['param_name'] for p in physio_params]

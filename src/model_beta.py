@@ -219,8 +219,8 @@ class Hybrid_VAE_SDE(LightningModule):
                                 debug=self.debug) # <<< Pass debug flag (if MLPSimple is modified) >>>
 
         # Initialization trick from Glow.
-        self.SDEnet.output_layer[0].weight.data.fill_(0.)
-        self.SDEnet.output_layer[0].bias.data.fill_(0.)
+        #self.SDEnet.output_layer[0].weight.data.fill_(0.)
+        #self.SDEnet.output_layer[0].bias.data.fill_(0.)
 
         ### DECODER
         self.decoder_output_dims = decoder_output_dims
@@ -242,7 +242,7 @@ class Hybrid_VAE_SDE(LightningModule):
         self.physio_ranges = {
             'p_a': (50.0, 180.0), 'p_v': (0.20, 100.0), 's_reflex': (0.0, 1.0),
             'sv': (40.0, 120.0), 'r_tpr_mod': (0.0, 10), 'f_hr_max': (1.0, 4.0),
-            'f_hr_min': (0.1, 1.0), 'r_tpr_max': (1.5, 2.5), 'r_tpr_min': (0.1, 1.5),
+            'f_hr_min': (8, 11), 'r_tpr_max': (18, 20), 'r_tpr_min': (0.1, 1.5),
             'ca': (1.0, 5.0), 'cv': (90.0, 120.0), 'k_width': (0.01, 0.5),
             'p_aset': (50.0, 90.0), 'tau': (15, 25)
         }
@@ -366,6 +366,9 @@ class Hybrid_VAE_SDE(LightningModule):
         #print('SDE_NN_input shape', SDE_NN_input.shape)
         #print('SDE_NN_input example', SDE_NN_input[0,:])
         SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
+        #print(SDE_NN_output_latents)
+        #print(self.SDE_input_state)
+        #breakpoint()
         #print('SDE_NN_output_latents example', SDE_NN_output_latents[0, :])
         has_nonzero = SDE_NN_output_latents.ne(0.).any()
         #print('SDE_NN Has non-0 OUTPUT??', has_nonzero)
@@ -384,6 +387,8 @@ class Hybrid_VAE_SDE(LightningModule):
         # TODO temporatily delete NaNs for testing
         if torch.isnan(y).any():
             print(f"WARNING: NaN detected in f() input at t={t.item()}")
+            print(y[0])
+            breakpoint()
             nan_mask = torch.isnan(y)
             #print(f"NaN locations: {torch.where(nan_mask)}")
             # Replace NaN with safe values to prevent propagation
@@ -408,6 +413,8 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if t.item() >= time_to_treatment: # this will always be the case when working with mimics
             dt_i_ext_SDE = self.apply_SDE_fun(t, y) * self.SDE_control_weighting
+            #print(f"dt i ext sd: {dt_i_ext_SDE}")
+            #breakpoint()
             dt_i_ext_SDE_1 = dt_i_ext_SDE[:, 0].unsqueeze(1)
             dt_i_ext_SDE_2 = dt_i_ext_SDE[:, 1].unsqueeze(1)
         else:
@@ -684,7 +691,7 @@ class Hybrid_VAE_SDE(LightningModule):
                 print(f"[DEBUG] forward_latent: valid_lengths={valid_lengths}")
 
         # FIXME limited steps for debugging
-        ts = ts[:17]
+        #ts = ts[:17]
 
         batch_size = init_latents.shape[0]
         print(f"init latents shape: {init_latents.shape}. Expected 23 x 7 x 18")
@@ -760,7 +767,7 @@ class Hybrid_VAE_SDE(LightningModule):
             y0=aug_y0,
             ts=ts,
             method='euler',
-            dt=0.005,
+            dt=0.001,
             adaptive=True,
             rtol=1e-2,
             atol=1e-2,
@@ -1061,7 +1068,7 @@ class Hybrid_VAE_SDE(LightningModule):
         print(f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]")"""
 
         # Create mask for loss computation
-        Y = Y[:, :17]
+        #Y = Y[:, :17]
         seq_len = Y.shape[1]
         time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
 
@@ -1224,8 +1231,8 @@ class Hybrid_VAE_SDE(LightningModule):
 
 
         # TODO: Remove this when using real init states
-        init_states_safe = self._get_safe_init_states(init_states)
-        init_states = init_states_safe
+        #init_states_safe = self._get_safe_init_states(init_states)
+        #init_states = init_states_safe
 
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
@@ -1267,7 +1274,6 @@ class Hybrid_VAE_SDE(LightningModule):
                 print(f"  Patients with NaN: {nan_patients.tolist()}")
                 print(f"  Patient 9 fused_rep: {fused_rep[9]}")
             print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
-            breakpoint()
 
             # ode latent head outputs 14 (expert dimensions)
             predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
@@ -1314,7 +1320,7 @@ class Hybrid_VAE_SDE(LightningModule):
         print(f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]")
 
         # Create mask for loss computation
-        Y = Y[:, :17]
+        #Y = Y[:, :17]
         seq_len = Y.shape[1]
         time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
 
@@ -1376,8 +1382,8 @@ class Hybrid_VAE_SDE(LightningModule):
 
 
         # TODO: Remove this when using real init states
-        init_states_safe = self._get_safe_init_states(init_states)
-        init_states = init_states_safe
+        #init_states_safe = self._get_safe_init_states(init_states)
+        #init_states = init_states_safe
 
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
@@ -1442,7 +1448,7 @@ class Hybrid_VAE_SDE(LightningModule):
         print(f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]")
 
         # Create mask for loss computation
-        Y = Y[:, :17]
+        #Y = Y[:, :17]
         seq_len = Y.shape[1]
         time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
 

@@ -148,6 +148,7 @@ class Raindrop_v2(nn.Module):
         self.encoder.weight.data.uniform_(-initrange, initrange)
         if self.static:
             self.emb.weight.data.uniform_(-initrange, initrange)
+        #self.R_u.data.uniform_(-0.1,0.1)
         glorot(self.R_u)
 
     def forward(self, src, static, times, lengths):
@@ -169,6 +170,12 @@ class Raindrop_v2(nn.Module):
             times = times.to(torch.float32)
         if lengths.dtype == torch.float64:
             lengths = lengths.to(torch.float32)
+
+        if torch.isnan(src).any():
+            debug_print(f"src contains NaN: {torch.isnan(src).any()}")
+            debug_print(f"src contains Inf: {torch.isinf(src).any()}")
+            debug_print(f"times contains NaN: {torch.isnan(times).any()}")
+            breakpoint()
             
         # Ensure model parameters are also Float32
         for param in self.parameters():
@@ -190,8 +197,12 @@ class Raindrop_v2(nn.Module):
         src = torch.repeat_interleave(src, self.d_ob, dim=-1)
         debug_print(f"[Raindrop_v2] After repeat_interleave, src shape: {src.shape}")
         debug_print(f"  src snippet after repeat:\n{src[:2, 0, :4]}")
-        
+        debug_print(f" R_U matrix: {self.R_u}")
+        breakpoint()
         h = F.relu(src*self.R_u)
+        if torch.isnan(h).any():
+            debug_print(f" R_U matrix: {self.R_u}")
+            breakpoint()
         debug_print(f"[Raindrop_v2] After R_u multiplication, h shape: {h.shape}")
         debug_print(f"  h snippet:\n{h[:2, 0, :4]}")
         

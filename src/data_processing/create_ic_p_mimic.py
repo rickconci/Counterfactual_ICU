@@ -105,8 +105,8 @@ def get_icu_admission_times(icustays_path):
 
 def calculate_t0_timestamp(trajectory_info, icu_admission_time, interval_minutes):
     """Calculate exact t0 timestamp from trajectory metadata"""
-    # t0 is at the end of the trajectory (end_idx - 1)
-    t0_interval_idx = trajectory_info['end_idx'] - 1
+    # t0 is at the end of the trajectory (end_idx - 1), we take 1min before because that is when our p_tensors end
+    t0_interval_idx = trajectory_info['end_idx'] - 2
 
     # Convert interval index to minutes from admission
     t0_minutes_from_admission = t0_interval_idx * interval_minutes
@@ -522,8 +522,13 @@ def extract_ic_and_create_predictions_with_clean_separation(hadm_id, traj_num, t
     # Calculate R_TPR
     if (ic_mask.get('ABP Mean', 0) > 0 and ic_mask.get('CVP', 0) > 0 and
             ic_mask.get('CO', 0) > 0 and ic_values.get('CO', 0) > 0):
-        ic_values['R_TPR'] = (ic_values['ABP Mean'] - ic_values['CVP']) / ic_values['CO']
-        ic_mask['R_TPR'] = 1.0
+        rtpr_estimate = (ic_values['ABP Mean'] - ic_values['CVP']) / ic_values['CO']
+        if rtpr_estimate > 0:
+            ic_values['R_TPR'] = rtpr_estimate
+            ic_mask['R_TPR'] = 1.0
+        else:
+            ic_values['R_TPR'] = 0
+            ic_mask['R_TPR'] = 0.0
         print(f"      ✓ IC R_TPR: {ic_values['R_TPR']:.2f} (calculated)")
     else:
         ic_values['R_TPR'] = 0.0
