@@ -94,6 +94,24 @@ def normalise_expert_data(y):
     return SDE_NN_norm_inputs
 
 
+def get_last_valid_timestep_fast(X_mask):
+    has_any_data = (X_mask.sum(dim=-1) > 0)  # [batch, time]
+
+    # Create position indices [0, 1, 2, ..., time-1]
+    positions = torch.arange(X_mask.shape[1], device=X_mask.device).unsqueeze(0)
+
+    # Mask invalid positions as -1, keep valid positions
+    masked_positions = torch.where(has_any_data, positions, -1)
+
+    # Find the maximum position (last valid timestep) for each batch
+    last_valid_indices, _ = masked_positions.max(dim=1)
+
+    # Convert to lengths (+1) and handle no-data cases
+    lengths = torch.clamp(last_valid_indices + 1, min=0)
+
+    return lengths
+
+
 def sigmoid_scale( z0, use_2_5std_encoder_minmax):
         #print('unnormalising the data and scaling it back to its appropriate values ')
         batch_size = z0.shape[0]

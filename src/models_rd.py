@@ -143,13 +143,17 @@ class Raindrop_v2(nn.Module):
         debug_print(f"Raindrop_v2 initialized with: d_inp={d_inp}, d_model={d_model}, d_ob={self.d_ob}, d_final={d_final}")
         debug_print(f"sensor_wise_mask={sensor_wise_mask}, static={static}")
 
+
+
     def init_weights(self):
-        initrange = 1e-10
+        initrange = 1e-5
         self.encoder.weight.data.uniform_(-initrange, initrange)
         if self.static:
             self.emb.weight.data.uniform_(-initrange, initrange)
         #self.R_u.data.uniform_(-0.1,0.1)
         glorot(self.R_u)
+       # with torch.no_grad():
+        #    self.R_u.data.clamp_(-0.2, 0.2)
 
     def forward(self, src, static, times, lengths):
         """Input to the model:
@@ -175,7 +179,7 @@ class Raindrop_v2(nn.Module):
             debug_print(f"src contains NaN: {torch.isnan(src).any()}")
             debug_print(f"src contains Inf: {torch.isinf(src).any()}")
             debug_print(f"times contains NaN: {torch.isnan(times).any()}")
-            breakpoint()
+            #breakpoint()
             
         # Ensure model parameters are also Float32
         for param in self.parameters():
@@ -196,13 +200,14 @@ class Raindrop_v2(nn.Module):
 
         src = torch.repeat_interleave(src, self.d_ob, dim=-1)
         debug_print(f"[Raindrop_v2] After repeat_interleave, src shape: {src.shape}")
-        debug_print(f"  src snippet after repeat:\n{src[:2, 0, :4]}")
+        debug_print(f"  src snippet after repeat:\n{src[0]}")
+        debug_print(f"Does src contain NaN? {torch.isnan(src).any()}")
         debug_print(f" R_U matrix: {self.R_u}")
-        breakpoint()
+        #breakpoint()
         h = F.relu(src*self.R_u)
         if torch.isnan(h).any():
             debug_print(f" R_U matrix: {self.R_u}")
-            breakpoint()
+            #breakpoint()
         debug_print(f"[Raindrop_v2] After R_u multiplication, h shape: {h.shape}")
         debug_print(f"  h snippet:\n{h[:2, 0, :4]}")
         
@@ -219,10 +224,17 @@ class Raindrop_v2(nn.Module):
 
         #Create a boolean mask indicating padding positions in the time dimension  - used to mask out padding tokens in the transformer encoder
         # Get the device of src to ensure consistent device usage
+        print(f"[MASK DEBUG] Original mask creation:")
+        print(f"  maxlen: {maxlen}, batch_size: {batch_size}")
+        print(f"  lengths: {lengths}")
+        print(f"  lengths shape: {lengths.shape}")
         mask = torch.arange(maxlen, device=device)[None, :] >= (lengths[:, None])
         mask = mask.squeeze(1)
+        print(f"[MASK DEBUG] After squeeze:")
+        print(f"  Expected shape for transformer: [batch_size, seq_len] = [{batch_size}, {maxlen}]")
         debug_print(f"[Raindrop_v2] Mask shape: {mask.shape}")
         debug_print(f"  mask snippet for batch 0: {mask[0, :10]}")
+        breakpoint()
 
         step1 = True
         x = h

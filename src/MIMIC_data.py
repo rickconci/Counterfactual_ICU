@@ -102,7 +102,7 @@ class MIMICDataset(Dataset):
         #changed dim here for MIMIC-III (higher diversity of itemids in MIMIC-III leads to more physio params
         p_out_padded = torch.cat([
             p_out_values,
-            torch.zeros(p_out_values.shape[0], 10)  # or torch.full((p_out_values.shape[0], 3), float('nan'))
+            torch.zeros(p_out_values.shape[0], 11)  # or torch.full((p_out_values.shape[0], 3), float('nan'))
         ], dim=1)
         full_fact_traj = torch.cat([p_in_values, p_out_padded], dim=0)
         t_full = torch.cat([p_in_rel_time, p_out_rel_time])

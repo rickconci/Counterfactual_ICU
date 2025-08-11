@@ -457,7 +457,7 @@ def extract_ic_and_create_predictions_with_clean_separation(hadm_id, traj_num, t
     t0_offset_seconds = (t0_timestamp - record_start).total_seconds()
 
     # Define signal categories
-    required_ic_signals = ['HR', 'ABP Mean', 'CVP']
+    required_ic_signals = ['ABP Mean', 'CVP']
     optional_ic_signals = ['SV', 'CO']
 
     ic_values = {}
@@ -837,12 +837,19 @@ def process_patient_and_save(
         traj_num = ic_result['trajectory_num']
         debug_print(f"  [Worker PID: {os.getpid()}] Saving IC tensor for traj {traj_num}")
         physio_values = [
-            ic_result['ic_values']['HR'], ic_result['ic_values']['ABP Mean'], ic_result['ic_values']['CVP'],
-            ic_result['ic_values'].get('SV', 0.0), ic_result['ic_values'].get('R_TPR', 0.0)
+            ic_result['ic_values']['ABP Mean'],  # p_a
+            ic_result['ic_values']['CVP'],  # p_v
+            0.5,  # s_reflex (baroreflex sensitivity - normal baseline)
+            ic_result['ic_values'].get('SV', 70.0),  # sv (default ~70ml if missing)
+            0.0  # r_tpr_mod (TPR modifier starts at 0)
         ]
+
         physio_masks = [
-            ic_result['ic_mask']['HR'], ic_result['ic_mask']['ABP Mean'], ic_result['ic_mask']['CVP'],
-            ic_result['ic_mask'].get('SV', 0.0), ic_result['ic_mask'].get('R_TPR', 0.0)
+            ic_result['ic_mask']['ABP Mean'],  # p_a mask
+            ic_result['ic_mask']['CVP'],  # p_v mask
+            0,  # s_reflex mask (never available)
+            ic_result['ic_mask'].get('SV', 0.0),  # sv mask
+            0  # r_tpr_mod mask (never available)
         ]
         ic_tensor = torch.tensor(physio_values, dtype=torch.float32)
         ic_mask_tensor = torch.tensor(physio_masks, dtype=torch.float32)
@@ -910,7 +917,7 @@ def create_integrated_waveform_tensors(
     waveform_cache = WaveformRecordCache()
 
     debug_print("Preparing tasks for parallel processing...")
-    for hadm_id in all_trajectories.keys():
+    for hadm_id in list(all_trajectories.keys())[:200]:
         if hadm_id not in patient_mapping or hadm_id not in icu_admission_map:
             continue
 

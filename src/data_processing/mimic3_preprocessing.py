@@ -203,7 +203,7 @@ def get_mimic3_item_ids():
     return {
         # Physiological measurements (CHARTEVENTS)
         'hr': [211, 220045],  # Heart Rate
-        'map': [52, 6702, 443, 6926],  # Mean Arterial Pressure
+        'map': [52, 6702, 443, 6926, 225312],  # Mean Arterial Pressure
         'cvp': [113, 220074, 1103],  # Central Venous Pressure
         'sv': [662, 228374],  # Stroke Volume (if available)
         'co': [224842, 44920, 44970, 41946, 40909,228369, 220088],  # Cardiac Output related

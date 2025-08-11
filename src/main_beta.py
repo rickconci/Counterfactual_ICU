@@ -239,7 +239,7 @@ def main(args):
         logger=wandb_logger,
         log_every_n_steps=6,
         callbacks=callbacks,
-        gradient_clip_val=1.0,  # Start with 1.0, adjust if needed
+        gradient_clip_val=0.1,  # Start with 1.0, adjust if needed
         gradient_clip_algorithm="norm"
         #fast_dev_run = True,
         #overfit_batches = 1

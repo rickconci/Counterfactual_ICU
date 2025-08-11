@@ -30,7 +30,7 @@ from CV_data_beta import create_cv_data
 from models_rd import Raindrop_v2
 
 from utils_beta import CV_params, CV_params_divisors,  _stable_division, LinearScheduler, MLPSimple, CV_params_prior_mu, CV_params_prior_sigma, CV_params_max_min_2_5STD, CV_params_max_min_2STD, sigmoid_scale, normalize_latent_output, sigmoid
-from utils_beta import select_tensor_by_index_list_advanced, scale_unnormalised_experts, normalise_expert_data
+from utils_beta import select_tensor_by_index_list_advanced, scale_unnormalised_experts, normalise_expert_data, get_last_valid_timestep_fast
 from plotting_beta import plot_trajectories_simple, plot_factuals_counterfactuals, plot_SDENN_output, plot_grouped_mse
 
 
@@ -365,7 +365,17 @@ class Hybrid_VAE_SDE(LightningModule):
 
         #print('SDE_NN_input shape', SDE_NN_input.shape)
         #print('SDE_NN_input example', SDE_NN_input[0,:])
+        if torch.isnan(SDE_NN_input).any():
+            print("SDE_NN_input contains NaN!")
+            breakpoint()
+        for name, param in self.SDEnet.named_parameters():
+            if torch.isnan(param).any():
+                print(f"[ERROR] NaN weights in {name}!")
+                breakpoint()
         SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
+        if torch.isnan(SDE_NN_output_latents).any():
+            print("SDE_NN_output contains NaN!")
+            breakpoint()
         #print(SDE_NN_output_latents)
         #print(self.SDE_input_state)
         #breakpoint()
@@ -398,6 +408,17 @@ class Hybrid_VAE_SDE(LightningModule):
         i_ext_2 = y[:, 1].unsqueeze(1)
         p_a = y[:, 2].unsqueeze(1)
         p_v = y[:, 3].unsqueeze(1)
+        p_a = torch.clamp(p_a, min=40.0, max=200.0)  # MAP: 40-200 mmHg
+        p_v = torch.clamp(p_v, min=0.0, max=30.0)
+
+        # TODO: REMOVE FOR PROD
+        problematic_mask = (p_a <= p_v)
+        if problematic_mask.any():
+            print(f"[SAFETY] t={t.item():.3f}: Fixing {problematic_mask.sum().item()} cases where MAP <= CVP")
+            print(
+                f"  Before: p_a range [{p_a.min().item():.1f}, {p_a.max().item():.1f}], p_v range [{p_v.min().item():.1f}, {p_v.max().item():.1f}]")
+            p_v = torch.where(problematic_mask, torch.tensor(10.0, device=p_v.device), p_v)
+            print(f"  After: p_v clamped to 10 where needed")
         s_reflex = y[:, 4].unsqueeze(1)
         sv = y[:, 5].unsqueeze(1)
         r_tpr_mod = y[:, 6].unsqueeze(1)
@@ -413,7 +434,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if t.item() >= time_to_treatment: # this will always be the case when working with mimics
             dt_i_ext_SDE = self.apply_SDE_fun(t, y) * self.SDE_control_weighting
-            #print(f"dt i ext sd: {dt_i_ext_SDE}")
+            print(f"dt i ext sd max: {torch.max(dt_i_ext_SDE)}")
             #breakpoint()
             dt_i_ext_SDE_1 = dt_i_ext_SDE[:, 0].unsqueeze(1)
             dt_i_ext_SDE_2 = dt_i_ext_SDE[:, 1].unsqueeze(1)
@@ -690,8 +711,7 @@ class Hybrid_VAE_SDE(LightningModule):
             if valid_lengths is not None:
                 print(f"[DEBUG] forward_latent: valid_lengths={valid_lengths}")
 
-        # FIXME limited steps for debugging
-        #ts = ts[:17]
+
 
         batch_size = init_latents.shape[0]
         print(f"init latents shape: {init_latents.shape}. Expected 23 x 7 x 18")
@@ -709,7 +729,7 @@ class Hybrid_VAE_SDE(LightningModule):
         # Add valid_time to augmented state
         if valid_lengths is not None:
             # TODO change this to actual length
-            valid_times = ts[torch.clamp(valid_lengths - 1, min=0, max=16)]
+            valid_times = ts[torch.clamp(valid_lengths - 1, min=0, max=214)]
             print(valid_times)
             valid_times_expanded = valid_times.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
             print(f"Valid times expanded shape: {valid_times_expanded.shape}. Expected: [23, 7, 1]")
@@ -725,6 +745,8 @@ class Hybrid_VAE_SDE(LightningModule):
             Tx_expanded, time_to_tx_expanded, valid_times_expanded
         ], dim=-1)
         print(f"aug_y0 shape: {aug_y0.shape}. Expected 23 x 7 x 24") # 24 = i_ext (2) + init_latents (18) + 1 each for rest
+        print(f"Aug_y0: {aug_y0[0]}")
+        #breakpoint()
 
         # Reshape for SDE integration
         dim_aug = aug_y0.shape[-1] # 24
@@ -736,23 +758,6 @@ class Hybrid_VAE_SDE(LightningModule):
         print(f"  Contains Inf: {torch.isinf(aug_y0).any()}")
         print(f"  Min/Max: {aug_y0.min().item()}/{aug_y0.max().item()}")
 
-        # TODO remove this for production
-        if torch.isnan(aug_y0).any():
-            print(f"[ERROR] NaN in aug_y0 before SDE integration!")
-            nan_locations = torch.where(torch.isnan(aug_y0))
-            print(f"NaN at positions: {nan_locations}")
-            # Print some examples
-            for i in range(min(5, len(nan_locations[0]))):
-                row, col = nan_locations[0][i], nan_locations[1][i]
-                print(f"  aug_y0[{row}, {col}] = NaN")
-            batch_size = init_latents.shape[0]
-            time_len = len(ts)
-            latent_dim = self.expert_latent_dims
-
-            return (torch.zeros(batch_size, self.num_samples, time_len, latent_dim, device=init_latents.device),
-                    torch.zeros(batch_size, device=init_latents.device),
-                    torch.zeros(batch_size, self.num_samples, time_len, self.SDEnet_out_dims,
-                                device=init_latents.device))
 
         # Check for extreme values that might cause numerical issues
         if aug_y0.max().item() > 1e6 or aug_y0.min().item() < -1e6:
@@ -787,6 +792,9 @@ class Hybrid_VAE_SDE(LightningModule):
         logqp_path = aug_ys[:, :, -1, -4]  # Note: -4 now because valid_time is at -1
 
         print(f"Latent out: {latent_out.shape}. Expect [23 x 7 x 17 x 14]")
+        #FIXME clamping for NaN debugging. Not rigorous, should clamp derivs instead
+        #latent_out = torch.clamp(latent_out, min=10, max=200)  # Generous but not crazy bounds
+
         return latent_out, logqp_path, i_ext_path
 
     def forward_dec(self, latent_out):
@@ -874,6 +882,10 @@ class Hybrid_VAE_SDE(LightningModule):
         print(f"[DEBUG] Hybrid_VAE_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}")
         # Compute log probability
         logpy = distributions.Normal(loc=predicted_traj, scale=self.log_lik_output_scale).log_prob(true_traj_expanded)
+        print(f"Logpy: {logpy[0]}")
+        print(f"True traj expanded: {true_traj_expanded[0]}")
+        print(f"Predicted traj: {predicted_traj[0]}")
+        #breakpoint()
 
         print(f"Mask shape: {mask.shape}. Expected: [23 x 17]")
         print(mask[0])
@@ -985,10 +997,11 @@ class Hybrid_VAE_SDE(LightningModule):
                 mask_t = X_mask.permute(1, 0, 2)
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
                 print(f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]")
-                lengths = X_mask.sum(dim=1)[:, 0]
+                lengths = get_last_valid_timestep_fast(X_mask)
+                print(f"[FIXED LENGTHS] New lengths: {lengths}")
                 # temporal encoder is raindrop
-                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,
-                                                                 lengths=lengths)
+                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,lengths=lengths)
+                #temporal_embedding = torch.zeros(X.shape[0], 76, device=X.device, dtype=torch.float32)
                 print(f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]")
                 logqp0 = 0
             else:  # GRU Encoder
@@ -1106,63 +1119,6 @@ class Hybrid_VAE_SDE(LightningModule):
         Prepares the initial state for the SDE by combining the interpolated initial
         conditions with the encoder's two-headed output.
         """
-
-        batch_indices_with_nan = []
-        if torch.isnan(predicted_ode_latents).any():
-            nan_batches = torch.where(torch.isnan(predicted_ode_latents))[0].unique()
-            batch_indices_with_nan.extend(nan_batches.tolist())
-            print(f"[ERROR] NaN in predicted_ode_latents for patients: {nan_batches.tolist()}")
-
-        if torch.isnan(neural_embedding).any():
-            nan_batches = torch.where(torch.isnan(neural_embedding))[0].unique()
-            batch_indices_with_nan.extend(nan_batches.tolist())
-            print(f"[ERROR] NaN in neural_embedding for patients: {nan_batches.tolist()}")
-
-        if torch.isnan(init_states).any():
-            nan_batches = torch.where(torch.isnan(init_states))[0].unique()
-            batch_indices_with_nan.extend(nan_batches.tolist())
-            print(f"[ERROR] NaN in init_states for patients: {nan_batches.tolist()}")
-
-        # If we find NaN, replace with safe values for those patients
-        if batch_indices_with_nan:
-            unique_patients = list(set(batch_indices_with_nan))
-            print(f"[WARNING] Replacing NaN values for patients: {unique_patients}")
-
-            for patient_idx in unique_patients:
-                if torch.isnan(predicted_ode_latents[patient_idx]).any():
-                    predicted_ode_latents[patient_idx] = torch.clamp(predicted_ode_latents[patient_idx], min=0.1,
-                                                                     max=100.0)
-                    predicted_ode_latents[patient_idx] = torch.nan_to_num(predicted_ode_latents[patient_idx], nan=50.0)
-
-                if torch.isnan(neural_embedding[patient_idx]).any():
-                    neural_embedding[patient_idx] = torch.nan_to_num(neural_embedding[patient_idx], nan=0.0)
-
-                if torch.isnan(init_states[patient_idx]).any():
-                    init_states[patient_idx] = torch.nan_to_num(init_states[patient_idx], nan=1.0)
-
-        if self.debug:
-            print(f"[DEBUG] _prepare_sde_initial_state:")
-            print(f"  predicted_ode_latents contains NaN: {torch.isnan(predicted_ode_latents).any()}")
-            print(f"  neural_embedding contains NaN: {torch.isnan(neural_embedding).any()}")
-            print(f"  init_states contains NaN: {torch.isnan(init_states).any()}")
-            print(f"  ic_mask contains NaN: {torch.isnan(ic_mask).any()}")
-
-            # Check each component for NaN
-        if torch.isnan(predicted_ode_latents).any():
-            print("[ERROR] NaN in predicted_ode_latents!")
-            nan_locs = torch.where(torch.isnan(predicted_ode_latents))
-            print(f"NaN locations in predicted_ode_latents: {nan_locs}")
-
-        if torch.isnan(neural_embedding).any():
-            print("[ERROR] NaN in neural_embedding!")
-            nan_locs = torch.where(torch.isnan(neural_embedding))
-            print(f"NaN locations in neural_embedding: {nan_locs}")
-
-        if torch.isnan(init_states).any():
-            print("[ERROR] NaN in init_states!")
-            nan_locs = torch.where(torch.isnan(init_states))
-            print(f"NaN locations in init_states: {nan_locs}")
-
         # Number of variables provided by the IC tensor
         num_ic_vars = init_states.shape[-1]
 
@@ -1208,6 +1164,23 @@ class Hybrid_VAE_SDE(LightningModule):
             nan_locs = torch.where(torch.isnan(z1_for_sde))
             print(f"NaN locations in z1_for_sde: {nan_locs}")
 
+        p_a_ic = z1_for_sde[:, :, 0]  # First expert variable
+        p_v_ic = z1_for_sde[:, :, 1]  # Second expert variable
+
+        # TODO REMOVE FOR PROD
+        problematic_mask = (p_a_ic <= p_v_ic)
+        if problematic_mask.any():
+            n_problems = problematic_mask.sum().item()
+            print(f"[IC SAFETY] Fixing {n_problems} initial conditions where MAP <= CVP")
+            print(
+                f"  Before: p_a range [{p_a_ic.min().item():.1f}, {p_a_ic.max().item():.1f}], p_v range [{p_v_ic.min().item():.1f}, {p_v_ic.max().item():.1f}]")
+
+            # Set CVP = 10 where MAP <= CVP
+            z1_for_sde[:, :, 1] = torch.where(problematic_mask, torch.tensor(10.0, device=z1_for_sde.device),
+                                              z1_for_sde[:, :, 1])
+
+            print(f"  After: CVP set to 10 where needed")
+
         return z1_for_sde
 
     def validation_step(self, batch, batch_idx):
@@ -1245,11 +1218,17 @@ class Hybrid_VAE_SDE(LightningModule):
                 mask_t = X_mask.permute(1, 0, 2)
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
                 print(f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]")
-                lengths = X_mask.sum(dim=1)[:, 0]
+                lengths = get_last_valid_timestep_fast(X_mask)
+                if len(torch.where(lengths == 0)):
+                    print(X_mask[0])
+                    breakpoint()
                 # temporal encoder is raindrop
-                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,
-                                                                 lengths=lengths)
-                print(f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]")
+                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,lengths=lengths)
+                #print(f"temporal embedding shape: {temporal_embedding.shape}")
+
+                #breakpoint()
+                #temporal_embedding = torch.zeros(X.shape[0], 76, device = X.device, dtype = torch.float32)
+                #print(f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]")
                 logqp0 = 0
             else:  # GRU Encoder
                 X_for_encoder = self._prepare_encoder_input(X, init_states)
@@ -1262,7 +1241,7 @@ class Hybrid_VAE_SDE(LightningModule):
             print(f"[DEBUG] fused_embedding stats before fusion_mlp:")
             print(f"  Contains NaN: {torch.isnan(fused_embedding).any()}")
             print(f"  Min/Max: {fused_embedding.min().item()}/{fused_embedding.max().item()}")
-            print(f"  Patient 9 values: {fused_embedding[9, :5]}")
+            #print(f"  Patient 9 values: {fused_embedding[9, :5]}")
 
             fused_rep = self.fusion_mlp(fused_embedding)
 
@@ -1272,7 +1251,7 @@ class Hybrid_VAE_SDE(LightningModule):
             if torch.isnan(fused_rep).any():
                 nan_patients = torch.where(torch.isnan(fused_rep))[0].unique()
                 print(f"  Patients with NaN: {nan_patients.tolist()}")
-                print(f"  Patient 9 fused_rep: {fused_rep[9]}")
+                #print(f"  Patient 9 fused_rep: {fused_rep[9]}")
             print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
 
             # ode latent head outputs 14 (expert dimensions)
@@ -1396,10 +1375,12 @@ class Hybrid_VAE_SDE(LightningModule):
                 mask_t = X_mask.permute(1, 0, 2)
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
                 print(f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]")
-                lengths = X_mask.sum(dim=1)[:, 0]
+                lengths = get_last_valid_timestep_fast(X_mask)
+
                 # temporal encoder is raindrop
-                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,
-                                                                 lengths=lengths)
+                temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,lengths=lengths)
+                #temporal_embedding = torch.zeros(X.shape[0], 76,  device=X.device, dtype=torch.float32)
+
                 print(f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]")
                 logqp0 = 0
             else:  # GRU Encoder
