@@ -234,7 +234,6 @@ class Raindrop_v2(nn.Module):
         print(f"  Expected shape for transformer: [batch_size, seq_len] = [{batch_size}, {maxlen}]")
         debug_print(f"[Raindrop_v2] Mask shape: {mask.shape}")
         debug_print(f"  mask snippet for batch 0: {mask[0, :10]}")
-        breakpoint()
 
         step1 = True
         x = h

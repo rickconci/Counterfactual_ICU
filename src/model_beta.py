@@ -998,6 +998,8 @@ class Hybrid_VAE_SDE(LightningModule):
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
                 print(f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]")
                 lengths = get_last_valid_timestep_fast(X_mask)
+                # TODO THiS IS A DEBUgGIng HACK
+                lengths = torch.ones_like(lengths)
                 print(f"[FIXED LENGTHS] New lengths: {lengths}")
                 # temporal encoder is raindrop
                 temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,lengths=lengths)
@@ -1219,9 +1221,8 @@ class Hybrid_VAE_SDE(LightningModule):
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
                 print(f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]")
                 lengths = get_last_valid_timestep_fast(X_mask)
-                if len(torch.where(lengths == 0)):
-                    print(X_mask[0])
-                    breakpoint()
+                # TODO THIS IS A DEBUGGING HACK
+                lengths = torch.ones_like(lengths)
                 # temporal encoder is raindrop
                 temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,lengths=lengths)
                 #print(f"temporal embedding shape: {temporal_embedding.shape}")
@@ -1376,6 +1377,8 @@ class Hybrid_VAE_SDE(LightningModule):
                 X_with_mask = torch.cat([X_t, mask_t], dim=2)
                 print(f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]")
                 lengths = get_last_valid_timestep_fast(X_mask)
+                # TODO THiS IS A DEBUgGIng HACK
+                lengths = torch.ones_like(lengths)
 
                 # temporal encoder is raindrop
                 temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,lengths=lengths)
