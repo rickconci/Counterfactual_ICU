@@ -146,7 +146,7 @@ class Raindrop_v2(nn.Module):
 
 
     def init_weights(self):
-        initrange = 1e-5
+        initrange = 1e-10
         self.encoder.weight.data.uniform_(-initrange, initrange)
         if self.static:
             self.emb.weight.data.uniform_(-initrange, initrange)

@@ -394,15 +394,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
 
         batch_size = y.shape[0]
-        # TODO temporatily delete NaNs for testing
-        if torch.isnan(y).any():
-            print(f"WARNING: NaN detected in f() input at t={t.item()}")
-            print(y[0])
-            breakpoint()
-            nan_mask = torch.isnan(y)
-            #print(f"NaN locations: {torch.where(nan_mask)}")
-            # Replace NaN with safe values to prevent propagation
-            y = torch.nan_to_num(y, nan=0.0)
+
         # y now contains: [i_ext (2), expert_latents (14), neural_embedding (4)]
         i_ext_1 = y[:, 0].unsqueeze(1)
         i_ext_2 = y[:, 1].unsqueeze(1)
@@ -417,7 +409,7 @@ class Hybrid_VAE_SDE(LightningModule):
             print(f"[SAFETY] t={t.item():.3f}: Fixing {problematic_mask.sum().item()} cases where MAP <= CVP")
             print(
                 f"  Before: p_a range [{p_a.min().item():.1f}, {p_a.max().item():.1f}], p_v range [{p_v.min().item():.1f}, {p_v.max().item():.1f}]")
-            p_v = torch.where(problematic_mask, torch.tensor(10.0, device=p_v.device), p_v)
+            #p_v = torch.where(problematic_mask, torch.tensor(10.0, device=p_v.device), p_v)
             print(f"  After: p_v clamped to 10 where needed")
         s_reflex = y[:, 4].unsqueeze(1)
         sv = y[:, 5].unsqueeze(1)
@@ -1178,7 +1170,7 @@ class Hybrid_VAE_SDE(LightningModule):
                 f"  Before: p_a range [{p_a_ic.min().item():.1f}, {p_a_ic.max().item():.1f}], p_v range [{p_v_ic.min().item():.1f}, {p_v_ic.max().item():.1f}]")
 
             # Set CVP = 10 where MAP <= CVP
-            z1_for_sde[:, :, 1] = torch.where(problematic_mask, torch.tensor(10.0, device=z1_for_sde.device),
+            z1_for_sde[:, :, 1] = torch.where(problematic_mask, z1_for_sde[:,:,0]-1,
                                               z1_for_sde[:, :, 1])
 
             print(f"  After: CVP set to 10 where needed")
@@ -1224,6 +1216,7 @@ class Hybrid_VAE_SDE(LightningModule):
                 # TODO THIS IS A DEBUGGING HACK
                 lengths = torch.ones_like(lengths)
                 # temporal encoder is raindrop
+                print(f"static shape: {static_features.shape}")
                 temporal_embedding, _, _ = self.temporal_encoder(X_with_mask, static=None, times=time_pre_t,lengths=lengths)
                 #print(f"temporal embedding shape: {temporal_embedding.shape}")
 
@@ -1360,10 +1353,6 @@ class Hybrid_VAE_SDE(LightningModule):
         # Use the full time grid - we'll handle variable lengths in forward_latent
         ts = time_post[0, :]  # Assuming all sequences share the same time grid
 
-
-        # TODO: Remove this when using real init states
-        #init_states_safe = self._get_safe_init_states(init_states)
-        #init_states = init_states_safe
 
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
