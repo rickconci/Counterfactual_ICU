@@ -30,7 +30,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 MIMIC_DIR = DATA_DIR / "mimic_3_data"
 MIMIC_INPUT_DIR = MIMIC_DIR / "input_data"
 MIMIC_PROCESSED_DIR = MIMIC_DIR / "processed_data"
-PHYSIONET_INPUT_DIR = PROJECT_ROOT / "physionet.org" / "files" / "mimiciii" / "1.4"
+PHYSIONET_INPUT_DIR =MIMIC_INPUT_DIR
 #MIMIC_INPUT_DIR = PHYSIONET_INPUT_DIR
 DEFAULT_OUTPUT_DIR = DATA_DIR / "mimic_3_data" / "processed_data"
 
@@ -108,90 +108,100 @@ def find_relevant_patients(
     """
     Finds all potentially relevant patients by filtering on those that have had a blood pressure event and
     that have stayed in the ICU for over 24h.
-    Args:
-        measurements: List of measurement IDs to extract
-        MAP_id: Measurement ID for mean arterial pressure
-        load_path_events: path to original dataset containing all events
-        load_path_stays: path to dataset containing meta-information on ICU stay
-        save_path: path to save relevant patients
-        data_limit: Maximum number of rows to read from CSV
-
-    Returns:
-            dataset containing all occurrences of the treatment to be used to filter patients
+    This optimized version performs two targeted scans on CHARTEVENTS.csv to improve performance
+    and reduce memory usage compared to reading the entire file multiple times.
     """
     if not os.path.exists(save_path):
-        long_stays_query = pl.scan_csv(load_path_stays)
-        chartevents_schema_overrides = {
-            'VALUE': pl.Utf8,  # Read as string first, then filter/convert
-            'VALUENUM': pl.Float64  # If this column exists
-        }
-        treated_patients_query = pl.scan_csv(load_path_events, schema_overrides=chartevents_schema_overrides)
-        if data_limit is not None:
-            long_stays_query = long_stays_query.limit(data_limit)
-            treated_patients_query = treated_patients_query.limit(data_limit)
+        print("Optimized patient filtering started. This may take a while on the first run...")
 
-        long_stays_query_filtered = (
-            long_stays_query.filter(pl.col("LOS") > 1)
+        # Step 1: Get HADM_IDs with long stays from the smaller ICUSTAYS.csv file.
+        # This is fast and creates an initial filter for patients.
+        print("Step 1/4: Identifying patients with ICU stays > 24 hours...")
+        long_stays_ids_query = (
+            pl.scan_csv(load_path_stays)
+            .filter(pl.col("LOS") > 1)
             .filter(pl.col("SUBJECT_ID").is_in(waveform_patient_ids))
             .select("HADM_ID")
             .unique()
         )
+        if data_limit is not None:
+             # Applying a limit here might not be representative, but for debugging.
+            long_stays_ids_query = long_stays_ids_query.limit(int(data_limit / 100)) # Heuristic limit
 
-        # 2. Join the lazy queries and then apply the rest of the filters.
-        treated_patients = (
-            treated_patients_query.join(
-                long_stays_query_filtered, on="HADM_ID", how="inner"
-            )
+        long_stays_ids = long_stays_ids_query.collect()['HADM_ID']
+
+        if long_stays_ids.is_empty():
+            print("Warning: No patients found with ICU stays > 24 hours and waveform data. Result will be empty.")
+            # Write an empty parquet file to avoid re-running this
+            pl.DataFrame().write_parquet(save_path)
+            return pl.DataFrame()
+        print(f"Found {len(long_stays_ids)} patients with long ICU stays.")
+
+        chartevents_schema_overrides = {
+            'VALUE': pl.Utf8,
+            'VALUENUM': pl.Float64
+        }
+        
+        # Step 2: First scan of CHARTEVENTS to find which of these patients had a hypotensive event.
+        # This scan is efficient because it pre-filters by patient IDs and only for MAP item IDs.
+        print("Step 2/4: Scanning for hypotensive events (MAP < 70)...")
+        chartevents_scan = pl.scan_csv(load_path_events, schema_overrides=chartevents_schema_overrides)
+        if data_limit is not None:
+            chartevents_scan = chartevents_scan.limit(data_limit)
+
+        final_patient_ids_df = (
+            chartevents_scan
+            .join(long_stays_ids, on='HADM_ID', how='semi')
+            #.filter(pl.col('HADM_ID').is_in(long_stays_ids))
             .filter(
                 (pl.col("ITEMID").is_in(MAP_id))
                 & (pl.col("VALUE") != "Not Given")
                 & (pl.col("VALUE").cast(pl.Float64, strict=False) < 70)
             )
+            .select('HADM_ID')
+            .unique()
             .collect()
         )
+        final_patient_ids = final_patient_ids_df['HADM_ID']
 
-        treated_patients_all_values = read_large_csv_with_polars(load_path_events, treated_patients, measurements,
-                                                                 data_limit=data_limit,
-                                                                 schema_overrides=chartevents_schema_overrides)
+        if final_patient_ids.is_empty():
+            print("Warning: No patients with hypotensive events found. Result will be empty.")
+            pl.DataFrame().write_parquet(save_path)
+            return pl.DataFrame()
+        print(f"Found {len(final_patient_ids)} patients who experienced hypotension.")
+
+        # Step 3: Second scan of CHARTEVENTS to get all specified measurements for the final list of patients.
+        print("Step 3/4: Collecting all relevant measurements for these patients...")
+        # Re-initialize the scan for clarity and to ensure no prior state is carried over.
+        chartevents_scan_final = pl.scan_csv(load_path_events, schema_overrides=chartevents_schema_overrides)
+        if data_limit is not None:
+            chartevents_scan_final = chartevents_scan_final.limit(data_limit)
+
+        treated_patients_all_values = (
+            chartevents_scan_final
+            #.filter(pl.col('HADM_ID').is_in(final_patient_ids))
+            .join(final_patient_ids, on='HADM_ID', how='semi')
+            .filter(pl.col('ITEMID').is_in(measurements)) 
+            .collect(streaming=True) # Use streaming for potentially better memory performance
+        )
+
+        # Step 4: Save the resulting dataset to a parquet file for fast loading next time.
+        print(f"Step 4/4: Saving {treated_patients_all_values.height} events to {save_path}...")
         treated_patients_all_values.write_parquet(save_path)
         print(f"Saved new dataset of patient values to {save_path}")
     else:
-        print(f"Loading dataset from {save_path}")
+        print(f"Loading pre-filtered patient dataset from {save_path}")
         treated_patients_all_values = pl.read_parquet(save_path)
 
     return treated_patients_all_values
 
-def read_large_csv_with_polars(load_path, ids_df, measurements, id_column='HADM_ID', item_column='ITEMID',
-                                   data_limit=None, schema_overrides=None):
-        """
-        Function to get all measurements from patients that have had the treatment
-        Args:
-            load_path: The path to the dataset of all patient measurements
-            ids_df: df containing the ID's of patients with the treatment
-            measurements: All IDs of measurements necessary for modelling
-            id_column: The column to merge the dataset
-            item_column: The column containing measurement IDs
-            data_limit: Maximum number of rows to read
-
-        Returns: df with the treated patient's events
-
-        """
-
-        valid_ids = ids_df[id_column].unique().to_list()
-
-        query = pl.scan_csv(load_path, schema_overrides=schema_overrides)
-
-        if data_limit is not None:
-            query = query.limit(data_limit)
-        result = (
-            query.filter(pl.col(id_column).is_in(valid_ids))
-            .filter(pl.col(item_column).is_in(measurements))
-            .collect()
-        )
-
-        return result
-
-
+def read_large_csv_with_polars(*args, **kwargs):
+    # This function is deprecated and has been replaced by the optimized logic
+    # in find_relevant_patients. It is left here to avoid breaking any
+    # potential external calls, but it should not be used.
+    raise DeprecationWarning(
+        "read_large_csv_with_polars is deprecated and should not be used."
+    )
 
 def get_mimic3_item_ids():
     """
@@ -245,6 +255,7 @@ def get_mimic3_item_ids():
             30307 # Dopamine
         ]
     }
+
 def process_single_patient_physio(
         hadm_id,
         physio_df, # Pass the entire DataFrame
@@ -1881,7 +1892,7 @@ def main():
 
     debug_print(f"MIMIC-III Processing Configuration: {args}")
 
-    with open('../../data/mimic_3_data/input_data/RECORDS-numerics.txt', 'r') as f:
+    with open(MIMIC_INPUT_DIR / 'RECORDS-numerics.txt', 'r') as f:
         numbers = [int(line.strip().split('/')[1].lstrip('p'))
                    for line in f
                    if line.strip() and len(line.strip().split('/')) >= 2
