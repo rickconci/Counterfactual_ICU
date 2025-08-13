@@ -217,6 +217,18 @@ def get_mimic3_item_ids():
             30161, # .3% normal saline
             30159,  # D5 Ringers Lactate
             30160,  # D5 normal saline
+            225158, #NaCl 0.9
+            225159, #NaCl 0.45
+            225161, #NaCl 3
+            220954, # Saline 0.9
+            220953, # Ringers
+            220955, # Ringers
+            220956,  # Ringers Acetate (NOT LACTATE)
+            220958, #Saline (alias)
+            220959,  # Saline (alias)
+            220960,  # Saline (alias)
+            220961,  # Saline (alias)
+            220962  # Saline (alias)
         ],
         'vasopressors': [
             221906,  # Norepinephrine (Levophed)

@@ -839,8 +839,8 @@ def process_patient_and_save(
         physio_values = [
             ic_result['ic_values']['ABP Mean'],  # p_a
             ic_result['ic_values']['CVP'],  # p_v
-            0.5,  # s_reflex (baroreflex sensitivity - normal baseline)
-            ic_result['ic_values'].get('SV', 70.0),  # sv (default ~70ml if missing)
+            0,  # s_reflex (baroreflex sensitivity - normal baseline)
+            ic_result['ic_values'].get('SV', 0),  # sv
             0.0  # r_tpr_mod (TPR modifier starts at 0)
         ]
 
