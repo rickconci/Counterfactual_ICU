@@ -1,9 +1,6 @@
 name: pyg_fresh
 channels:
   - pytorch
-name: pyg_fresh
-channels:
-  - pytorch
   - pyg
   - conda-forge
   - nodefaults
