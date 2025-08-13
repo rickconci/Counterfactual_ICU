@@ -213,13 +213,14 @@ def get_mimic3_item_ids():
     return {
         # Physiological measurements (CHARTEVENTS)
         'hr': [211, 220045],  # Heart Rate
-        'map': [52, 6702, 443, 6926, 225312],  # Mean Arterial Pressure
-        'cvp': [113, 220074, 1103],  # Central Venous Pressure
-        'sv': [662, 228374],  # Stroke Volume (if available)
-        'co': [224842, 44920, 44970, 41946, 40909,228369, 220088],  # Cardiac Output related
+        'map': [52,220052, 6702, 225312, 6399, 2294, 2674],  # Mean Arterial Pressure
+        'cvp': [113, 220074, 1103, 716],  # Central Venous Pressure: unclear: 226852
+        'sv': [662, 228374, 227547],  # Stroke Volume (if available). Unclear: 2276
+        'co': [40452, 40909, 41440, 41946, 44920, 44970, 224842, 227543, 228369, 220088],
 
         # Medications (INPUTEVENTS_MV and INPUTEVENTS_CV)
         'crystalloids': [
+
             30018,  # NaCl 0.9%
             30020,  # NaCl 0.45%
             30021, # Ringers Lactate
@@ -233,12 +234,50 @@ def get_mimic3_item_ids():
             220954, # Saline 0.9
             220953, # Ringers
             220955, # Ringers
-            220956,  # Ringers Acetate (NOT LACTATE)
             220958, #Saline (alias)
             220959,  # Saline (alias)
             220960,  # Saline (alias)
             220961,  # Saline (alias)
-            220962  # Saline (alias)
+            220962,  # Saline (alias)
+            227522, # Bolus KCL'
+            227521, # Bolus KCL'
+            42528, # Crystalloid FARR
+            30316,
+            30316,  # .25 NS +1:1 Heparin
+            30315,  # .25 NS+0.5:1 Heparin
+            30176,  # .25% Normal Saline
+            30212,  # .25NS flush
+            30161,  # .3% normal Saline
+            43406,  # .45 NS
+            30020,  # .45% Normal Saline
+            43588,  # .45%NS FLUSH
+            2404,  # .45%ns
+            42241,  # .45NS & 1 AMP BICARB
+            30321,  # .45NS + .5:1 Heparin
+            30186,  # .45NS + 1:1 Heparin
+            44439,  # .45NS BOLUS
+            30211,  # .45NS flush
+            42244,  # .45ns + 1 amp bicarb
+            42206,  # .45ns w/ 20kcl
+            43825,  # .5:1 NS REPLETION
+            46091,  # .5BM/.5Neocate 24 PG
+            46092,  # .5BM/.5Neocate 24 PO
+            43663,  # .9% NS flush
+            30018,  # .9% Normal Saline
+            45286,  # .9%NS w/30mml NaPhos
+            30381,  # .9NS + 0.5:1 heparin
+            30185,  # .9NS + 1:1 Heparin
+            44491,  # .9NS bolus
+            30210,  # .9NS flush
+            46670,  # 0.45% + 60 MEQ KCL
+            30353,  # 0.45% Normal Saline
+            46669,  # 0.45%NS +40meq kcl
+            46668,  # 0.45%ns + 20 meq kcl
+            44330,  # 0.45NSS
+            43810,  # 0.5:1 U/O REPLETION
+            30352,  # 0.9% Normal Saline
+            46355,  # 0.9%NS with 40KCL
+
         ],
         'vasopressors': [
             221906,  # Norepinephrine (Levophed)
@@ -264,7 +303,9 @@ def get_mimic3_item_ids():
             5805, # Dopamine
             5329, # Dopamine
             30043, # Dopamine
-            30307 # Dopamine
+            30307, # Dopamine
+            6752  # Phenylephrine'
+
         ]
     }
 
