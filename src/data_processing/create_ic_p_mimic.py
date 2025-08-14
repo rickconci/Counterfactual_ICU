@@ -713,39 +713,132 @@ def extract_ic_and_create_predictions_with_clean_separation(hadm_id, traj_num, t
     }
 
 
+def save_full_trajectory_data(
+        hadm_id, record_data, all_patient_t0s, icu_admission_time, full_trajectory_dir,
+        resample_interval_seconds=10
+):
+    """
+    Saves the complete, resampled waveform data for a single waveform record,
+    annotating it with all relevant t0 timestamps.
+
+    Args:
+        hadm_id (int): The hospital admission ID.
+        record_data (dict): The loaded waveform record data.
+        all_patient_t0s (list): A list of all t0 datetime objects for this patient.
+        icu_admission_time (datetime): The patient's ICU admission time.
+        full_trajectory_dir (str or Path): Directory to save the full trajectory file.
+        resample_interval_seconds (int): The interval in seconds for resampling.
+    """
+    if record_data is None:
+        return
+
+    record = record_data['record']
+    record_info = record_data['info']
+    all_signals = record.sig_name
+    record_start = record_info['start_time']
+    record_end = record_info['end_time']
+
+    # Extract all signals from the entire record
+    signals_data = extract_signals_from_record(
+        record_data, record_start, record_end, all_signals
+    )
+
+    if not signals_data:
+        print(f"      [Full Traj] No signals data found for record {record_info['record_name']}")
+        return
+
+    # Create a unified time grid for the entire record duration
+    duration_seconds = record_info['duration_seconds']
+    n_points = int(duration_seconds / resample_interval_seconds)
+    target_times_seconds = np.arange(n_points) * resample_interval_seconds
+
+    # Interpolate all signals to this grid
+    interpolated_signals = interpolate_signals_to_grid(signals_data, target_times_seconds)
+
+    if not interpolated_signals:
+        print(f"      [Full Traj] Interpolation failed for record {record_info['record_name']}")
+        return
+
+    # Create a DataFrame
+    df_data = {'time_seconds': target_times_seconds}
+    for signal_name, values in interpolated_signals.items():
+        df_data[signal_name] = values
+
+    df = pd.DataFrame(df_data)
+
+    # Find which of the patient's t0s fall within this record's timeframe
+    t0s_in_record = [t0 for t0 in all_patient_t0s if record_start <= t0 <= record_end]
+
+    # Add rich metadata to the DataFrame for context
+    df['record_name'] = record_info['record_name']
+    df['record_start_time'] = record_info['start_time']
+    df['record_end_time'] = record_info['end_time']
+    df['hadm_id'] = hadm_id
+    df['icu_admission_time'] = icu_admission_time
+    # Store the list of t0s in the column. Each cell will contain the same list.
+    df['t0_timestamps'] = [t0s_in_record] * len(df)
+
+    # Save to parquet
+    output_file = Path(full_trajectory_dir) / f"full_waveform_{int(hadm_id)}_{record_info['record_name']}.parquet"
+    df.to_parquet(output_file, index=False)
+    print(f"      [Full Traj] Saved full waveform record to {output_file} with {len(t0s_in_record)} t0s.")
+
+
 def process_patient_integrated_clean_separation(hadm_id, patient_id, patient_trajectories, icu_admission_time,
                                                 interval_minutes, prediction_minutes, target_interval_seconds,
-                                                waveform_cache, database='mimic3wdb-matched', min_points_per_minute=12):
+                                                waveform_cache, database='mimic3wdb-matched', min_points_per_minute=12,
+                                                save_full_trajectory=False, full_trajectory_dir=None):
     """
-    Integrated processing with clean temporal separation: IC closest to t₀, predictions after
-    No overlap between IC and prediction timepoints
+    Processes a patient's data.
+    1. If enabled, saves ALL discovered waveform records for the patient.
+    2. Generates t0-centric initial conditions and prediction targets.
     """
+    print(f"\nProcessing patient {patient_id} (HADM {hadm_id})")
 
-    print(f"\nProcessing patient {patient_id} (HADM {hadm_id}) - {len(patient_trajectories)} trajectories")
-
-    # Step 1: Discover all waveform records for this patient (ONE network call)
+    # Step 1: Discover all waveform records for this patient
     patient_records = waveform_cache.discover_patient_records(patient_id, database=database)
-
     if not patient_records:
         print(f"  No waveform records found for patient {patient_id}")
         return [], []
 
-    print(f"  Processing {len(patient_trajectories)} trajectories with {len(patient_records)} available records")
+    # Step 2: Save all full waveform trajectories if requested
+    if save_full_trajectory and full_trajectory_dir:
+        print(f"  Saving all {len(patient_records)} discovered waveform records...")
+        
+        all_t0_timestamps = [
+            calculate_t0_timestamp(t, icu_admission_time, interval_minutes)
+            for t in patient_trajectories
+        ]
 
+        for record_info in patient_records:
+            output_file = Path(full_trajectory_dir) / f"full_waveform_{int(hadm_id)}_{record_info['record_name']}.parquet"
+            if not output_file.exists():
+                print(f"    [Full Traj] Saving new record {record_info['record_name']}.")
+                record_data = waveform_cache.load_record_data(record_info, database)
+                if record_data:
+                    save_full_trajectory_data(
+                        hadm_id=hadm_id,
+                        record_data=record_data,
+                        all_patient_t0s=all_t0_timestamps,
+                        icu_admission_time=icu_admission_time,
+                        full_trajectory_dir=full_trajectory_dir,
+                        resample_interval_seconds=target_interval_seconds
+                    )
+            else:
+                debug_print(f"    [Full Traj] Record {record_info['record_name']} already exists. Skipping.")
+
+    # Step 3: Generate IC and Prediction Targets (t0-centric)
+    print(f"  Generating ICs and Prediction Targets for {len(patient_trajectories)} t0-based trajectories...")
     patient_ics = []
     patient_predictions = []
     processed_count = 0
     skipped_count = 0
 
-    # Step 2: Process each trajectory
     for traj in patient_trajectories:
         traj_num = traj['trajectory_num']
-
         try:
-            # Calculate t_0 timestamp
             t0_timestamp = calculate_t0_timestamp(traj, icu_admission_time, interval_minutes)
-
-            # Find records that overlap with our extended window (t₀-30s to t₀+25min)
+            
             window_start = t0_timestamp - timedelta(seconds=30)
             window_end = t0_timestamp + timedelta(minutes=prediction_minutes)
 
@@ -753,31 +846,23 @@ def process_patient_integrated_clean_separation(hadm_id, patient_id, patient_tra
                 patient_id, window_start, window_end
             )
 
-            # SKIP if no records overlap with our window
             if not overlapping_records:
-                print(f"    ✗ Skipping trajectory {traj_num} - no records overlap with window")
+                print(f"    ✗ Skipping t0-trajectory {traj_num} - no records overlap with window")
                 skipped_count += 1
                 continue
 
-            # SKIP if window spans multiple records (for consistency)
             if len(overlapping_records) > 1:
-                print(f"    ✗ Skipping trajectory {traj_num} - window spans {len(overlapping_records)} records")
+                print(f"    ✗ Skipping t0-trajectory {traj_num} - window spans {len(overlapping_records)} records")
                 skipped_count += 1
                 continue
 
-            # Use the single overlapping record
             record = overlapping_records[0]
-            print(f"    ✓ Processing trajectory {traj_num} at t_0={t0_timestamp}")
-            print(f"      Using record: {record['record_name']}")
-
-            # Load record data
             record_data = waveform_cache.load_record_data(record, database)
             if record_data is None:
-                print(f"    ✗ Failed to load record data for trajectory {traj_num}")
+                print(f"    ✗ Failed to load record data for t0-trajectory {traj_num}")
                 skipped_count += 1
                 continue
-
-            # Extract IC and create prediction targets with clean separation
+            
             result = extract_ic_and_create_predictions_with_clean_separation(
                 hadm_id, traj_num, t0_timestamp, record_data,
                 prediction_minutes, target_interval_seconds,
@@ -785,7 +870,6 @@ def process_patient_integrated_clean_separation(hadm_id, patient_id, patient_tra
             )
 
             if result:
-                # Split the result into IC and prediction components
                 ic_result = {
                     'hadm_id': result['hadm_id'],
                     'trajectory_num': result['trajectory_num'],
@@ -794,47 +878,51 @@ def process_patient_integrated_clean_separation(hadm_id, patient_id, patient_tra
                     'ic_mask': result['ic_mask'],
                     'record_used': result['record_used']
                 }
-
                 prediction_result = {
                     'hadm_id': result['hadm_id'],
                     'trajectory_num': result['trajectory_num'],
                     'tensor_data': result['tensor_data'],
                     'metadata': result['metadata']
                 }
-
                 patient_ics.append(ic_result)
                 patient_predictions.append(prediction_result)
-
-                print(f"      ✓ Clean separation: IC + prediction targets created for trajectory {traj_num}")
                 processed_count += 1
             else:
-                print(f"      ✗ Clean separation processing failed for trajectory {traj_num}")
                 skipped_count += 1
 
         except Exception as e:
-            print(f"    Error processing trajectory {traj_num}: {e}")
+            print(f"    Error processing t0-trajectory {traj_num}: {e}")
             skipped_count += 1
             continue
 
     print(f"  Created {len(patient_ics)} IC tensors and {len(patient_predictions)} prediction targets")
-    print(f"  Processed: {processed_count}, Skipped: {skipped_count}")
     return patient_ics, patient_predictions
+
 
 def process_patient_and_save(
         hadm_id, patient_id, patient_trajectories, icu_admission_time, interval_minutes,
         prediction_minutes, target_interval_seconds, waveform_cache, database, ic_cache_dir, prediction_cache_dir,
-        min_points_per_minute=12
+        min_points_per_minute=12, save_full_trajectory=False, full_trajectory_dir=None, skip_existing=True
 ):
     debug_print(f"[Worker PID: {os.getpid()}] Processing patient HADM_ID: {hadm_id}")
     patient_ics, patient_predictions = process_patient_integrated_clean_separation(
         hadm_id, patient_id, patient_trajectories, icu_admission_time,
         interval_minutes, prediction_minutes, target_interval_seconds,
-        waveform_cache, database, min_points_per_minute
+        waveform_cache, database, min_points_per_minute,
+        save_full_trajectory=save_full_trajectory,
+        full_trajectory_dir=full_trajectory_dir
     )
 
     ic_info = []
     for ic_result in patient_ics:
         traj_num = ic_result['trajectory_num']
+        ic_file = Path(ic_cache_dir) / f"ic_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+
+        # Granular skipping: only write file if it doesn't exist
+        if skip_existing and ic_file.exists():
+            debug_print(f"  [Worker PID: {os.getpid()}] Skipping existing IC tensor for traj {traj_num}")
+            continue
+
         debug_print(f"  [Worker PID: {os.getpid()}] Saving IC tensor for traj {traj_num}")
         physio_values = [
             ic_result['ic_values']['ABP Mean'],  # p_a
@@ -853,7 +941,6 @@ def process_patient_and_save(
         ]
         ic_tensor = torch.tensor(physio_values, dtype=torch.float32)
         ic_mask_tensor = torch.tensor(physio_masks, dtype=torch.float32)
-        ic_file = Path(ic_cache_dir) / f"ic_tensor_{int(hadm_id)}_traj_{traj_num:03d}.pt"
         torch.save((ic_tensor, ic_mask_tensor), ic_file)
         ic_info.append({
             'hadm_id': hadm_id, 'trajectory_num': traj_num, 't0_timestamp': ic_result['t0_timestamp'],
@@ -863,8 +950,14 @@ def process_patient_and_save(
     prediction_info = []
     for prediction in patient_predictions:
         traj_num = prediction['trajectory_num']
-        debug_print(f"  [Worker PID: {os.getpid()}] Saving prediction tensor for traj {traj_num}")
         pred_file = Path(prediction_cache_dir) / f"prediction_target_{int(hadm_id)}_traj_{traj_num:03d}.pt"
+
+        # Granular skipping: only write file if it doesn't exist
+        if skip_existing and pred_file.exists():
+            debug_print(f"  [Worker PID: {os.getpid()}] Skipping existing prediction tensor for traj {traj_num}")
+            continue
+
+        debug_print(f"  [Worker PID: {os.getpid()}] Saving prediction tensor for traj {traj_num}")
         torch.save(prediction['tensor_data'], pred_file)
         prediction_info.append({
             'hadm_id': hadm_id, 'trajectory_num': traj_num, 'file_path': str(pred_file),
@@ -882,12 +975,14 @@ def create_integrated_waveform_tensors(
         waveform_base_dir=None,
         ic_cache_dir='initial_conditions_waveform',
         prediction_cache_dir='waveform_prediction_targets',
+        full_trajectory_dir='full_trajectories',
         database='mimic3wdb-matched',
         prediction_minutes=25,
         target_interval_seconds=10,
         min_points_per_minute=12,
         skip_existing=True,
-        n_workers=4
+        n_workers=4,
+        save_full_trajectory=False,
 ):
     debug_print("--- Starting Integrated Waveform Tensor Creation with IC-Anchored Validation ---")
     if not setup_wfdb_credentials():
@@ -895,6 +990,8 @@ def create_integrated_waveform_tensors(
 
     Path(ic_cache_dir).mkdir(parents=True, exist_ok=True)
     Path(prediction_cache_dir).mkdir(parents=True, exist_ok=True)
+    if save_full_trajectory:
+        Path(full_trajectory_dir).mkdir(parents=True, exist_ok=True)
 
     debug_print(f"Loading trajectory metadata from: {trajectory_metadata_path}")
     traj_metadata, _ = load_trajectory_metadata(trajectory_metadata_path)
@@ -917,11 +1014,12 @@ def create_integrated_waveform_tensors(
     waveform_cache = WaveformRecordCache()
 
     debug_print("Preparing tasks for parallel processing...")
-    for hadm_id in list(all_trajectories.keys())[:200]:
+    for hadm_id in list(all_trajectories.keys())[:200]:  # TODO: remove this limit
         if hadm_id not in patient_mapping or hadm_id not in icu_admission_map:
             continue
 
-        if skip_existing:
+        # If not saving full trajectories, we can use the faster patient-level skip.
+        if skip_existing and not save_full_trajectory:
             all_files_exist = True
             for traj in all_trajectories[hadm_id]:
                 traj_num = traj['trajectory_num']
@@ -931,17 +1029,19 @@ def create_integrated_waveform_tensors(
                     all_files_exist = False
                     break
             if all_files_exist:
-                debug_print(f"Skipping patient {hadm_id} - all output files exist.")
+                debug_print(f"Skipping patient {hadm_id} - all IC/prediction files exist (fast path).")
                 skipped_patients += 1
                 continue
 
+        # When saving full trajectories, we delegate skipping to the worker to handle
+        # the more complex, file-level de-duplication logic.
         patient_id = patient_mapping[hadm_id]
         icu_admission_time = icu_admission_map[hadm_id]
         patient_trajectories = all_trajectories[hadm_id]
         tasks.append(
             (hadm_id, patient_id, patient_trajectories, icu_admission_time, interval_minutes,
              prediction_minutes, target_interval_seconds, waveform_cache, database, ic_cache_dir, prediction_cache_dir,
-             min_points_per_minute)
+             min_points_per_minute, save_full_trajectory, full_trajectory_dir, skip_existing)
         )
 
     debug_print(f"Submitting {len(tasks)} tasks to {n_workers} workers.")
@@ -1009,6 +1109,7 @@ if __name__ == "__main__":
     icustays_path = DATA_DIR /"mimic_3_data"/"input_data" / "ICUSTAYS.csv"
     ic_cache_dir = DEFAULT_OUTPUT_DIR / "processed_data"/ "initial_conditions"
     prediction_cache_dir = DEFAULT_OUTPUT_DIR / "processed_data"/"prediction_targets"
+    full_trajectory_dir = DEFAULT_OUTPUT_DIR / "processed_data" / "full_trajectories"
 
     # Create integrated waveform tensors with IC-anchored validation
     ic_results, prediction_results = create_integrated_waveform_tensors(
@@ -1018,8 +1119,10 @@ if __name__ == "__main__":
         waveform_base_dir=None,  # Remote access
         ic_cache_dir=ic_cache_dir,
         prediction_cache_dir=prediction_cache_dir,
+        full_trajectory_dir=full_trajectory_dir,
         prediction_minutes=25,
-        target_interval_seconds=5,
+        target_interval_seconds=10,
         min_points_per_minute=6,
-        n_workers=8
+        n_workers=6,
+        save_full_trajectory=True
     )

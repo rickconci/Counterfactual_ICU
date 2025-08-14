@@ -24,3 +24,5 @@ test_res/
 data/
 data/mimic_3_data/
 OldScripts/
+outputs/
+outputs_cluster_types/
