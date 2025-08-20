@@ -47,7 +47,7 @@ class Hybrid_VAE_SDE(LightningModule):
                  #Encoder
                  encoder_input_dim, encoder_hidden_dim, encoder_SDENN_dims,expert_latent_dims,
                  encoder_num_layers, variational_encoder, encoder_w_time, encoder_reverse_time,
-                 use_2_5std_encoder_minmax, 
+                 use_2_5std_encoder_minmax, n_medications,
                  # New static fusion params
                  static_input_dim, static_hidden_dim, fusion_hidden_dim,
                  #SDE params
@@ -106,7 +106,6 @@ class Hybrid_VAE_SDE(LightningModule):
             # TODO not quite sure if this is still right
             d_ob = max(int(encoder_hidden_dim / encoder_input_dim), 2)
             temporal_embedding_dim = encoder_input_dim * d_ob + 16  # d_model + d_pe
-            # TODO make static true and give complete adj matrix
             self.temporal_encoder = Raindrop_v2(
                 d_inp=encoder_input_dim,
                 d_model=encoder_hidden_dim, 
@@ -115,7 +114,7 @@ class Hybrid_VAE_SDE(LightningModule):
                 nhid=128,
                 global_structure=torch.ones(encoder_input_dim, encoder_input_dim), #pass a complete adj matrix
                 nlayers=encoder_num_layers,
-                static=True,
+                static=False,
                 debug=self.debug
             )
         elif use_encoder != 'none':
@@ -197,11 +196,17 @@ class Hybrid_VAE_SDE(LightningModule):
         self.SDEnet_out_dims = SDEnet_out_dims
         self.SDE_control_weighting = SDE_control_weighting
 
-        # TODO make this a param
-        self.ic_consistency_weight = 0.1
 
         net_input_dims = self.encoder_output_dim if SDE_input_state == 'full' else self.encoder_output_dim - len(encoder_input_dim)
-        net_input_dims = net_input_dims + 2 if include_time else net_input_dims 
+        net_input_dims = net_input_dims + 2 if include_time else net_input_dims
+
+        if self.use_encoder != 'none':
+            self.ic_consistency_weight = 0.1
+            net_input_dims = net_input_dims + n_medications
+        else:
+            self.ic_consistency_weight = 0
+            net_input_dims = self.expert_latent_dims + n_medications
+            net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         activations = {
             'relu': nn.ReLU(),
@@ -209,7 +214,9 @@ class Hybrid_VAE_SDE(LightningModule):
             'none': None
         }
         final_activation_real = activations[final_activation.lower()]
-        
+
+
+        # TODO change net input dims to be 14 + number of meds if there is no encoder, else encoder dim + 14 + meds
         self.SDEnet = MLPSimple(input_dim = net_input_dims, 
                                 output_dim = SDEnet_out_dims, 
                                 hidden_dim = SDEnet_hidden_dim, 
@@ -633,6 +640,45 @@ class Hybrid_VAE_SDE(LightningModule):
 
         return safe_init
 
+    def _prepare_no_encoder_initial_state(self, init_states, ic_mask):
+        """
+        Prepares safe initial conditions for the no-encoder case.
+        - For first 5 IC values: use init_states if ic_mask=1, else sample from physio bounds
+        - For remaining positions (6-14): always sample from physio bounds
+        """
+        batch_size = init_states.shape[0]
+        num_ic_vars = init_states.shape[-1]  # Should be 5
+
+        # Initialize tensor for all 14 expert variables
+        safe_expert_states = torch.zeros(batch_size, self.expert_latent_dims, device=init_states.device)
+
+        # Sample from physiological ranges for all positions
+        # Generate random values between min and max for each variable
+        random_vals = torch.rand(batch_size, self.expert_latent_dims, device=init_states.device)
+        sampled_states = self.physio_min_vals + random_vals * (self.physio_max_vals - self.physio_min_vals)
+
+        # Start with sampled values for all positions
+        safe_expert_states = sampled_states
+
+        # For the first num_ic_vars (should be 5), use actual values where ic_mask=1
+        for i in range(min(num_ic_vars, self.expert_latent_dims)):
+            safe_expert_states[:, i] = torch.where(
+                ic_mask[:, i] == 1,
+                init_states[:, i],  # Use actual measured value
+                safe_expert_states[:, i]  # Keep sampled value
+            )
+
+        if self.debug:
+            print(f"[DEBUG] _prepare_no_encoder_initial_state:")
+            print(f"  batch_size: {batch_size}")
+            print(f"  safe_expert_states shape: {safe_expert_states.shape}")
+            print(f"  Used actual IC values: {ic_mask.sum().item()}/{ic_mask.numel()} positions")
+            print(f"  Sample values for patient 0: {safe_expert_states[0, :5]}")
+            print(f"  Physio bounds - min: {self.physio_min_vals[:5]}")
+            print(f"  Physio bounds - max: {self.physio_max_vals[:5]}")
+
+        return safe_expert_states
+
 
     def prior_diext_dt(self,t):
         factor = -2 * (t - 5) / 5
@@ -702,8 +748,8 @@ class Hybrid_VAE_SDE(LightningModule):
             i_ext, init_latents, log_path,
             Tx_expanded, time_to_tx_expanded, valid_times_expanded
         ], dim=-1)
-        print(f"aug_y0 shape: {aug_y0.shape}. Expected 23 x 7 x 24") # 24 = i_ext (2) + init_latents (18) + 1 each for rest
-        print(f"Aug_y0: {aug_y0[0]}")
+        print(f"aug_y0 shape: {aug_y0.shape}. Expected 23 x 7 x 20") # 18 = i_ext (2) + init_latents (14) + 1 each for rest
+        #print(f"Aug_y0: {aug_y0[0]}")
         #breakpoint()
 
         # Reshape for SDE integration
@@ -940,10 +986,6 @@ class Hybrid_VAE_SDE(LightningModule):
         ts = time_post[0, :]  # Assuming all sequences share the same time grid
 
 
-        # TODO: Remove this when using real init states
-        #init_states_safe = self._get_safe_init_states(init_states)
-        #init_states = init_states_safe
-
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
                 print(f"X shape: {X.shape}. Should be [23 x 215 x 5]")
@@ -985,20 +1027,22 @@ class Hybrid_VAE_SDE(LightningModule):
             # neural embedding head outputs: 4
             neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
             print(f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]")
+            z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
+
+            # Add IC consistency loss (only where we have real data)
+            ic_consistency_loss = self.compute_ic_consistency_loss(
+                predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
+                init_states=init_states,  # The real IC values
+                ic_mask=ic_mask  # The mask indicating where we have real data
+            )
 
         else:  # No encoder
-            X_for_encoder = self._prepare_encoder_input(X, init_states)
-            z1_encoder, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
-            predicted_ode_latents = z1_encoder[:, :, :self.expert_latent_dims]
-            neural_embedding = z1_encoder[:, :, self.expert_latent_dims:]
+            initial_condition = self._prepare_no_encoder_initial_state(init_states, ic_mask)
+            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
+            logqp0 = 0
+            ic_consistency_loss = 0
 
-        # Prepare the SDE initial state
-        z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
 
-        if torch.isnan(z1_for_sde).any():
-            print(f"[ERROR] NaN in z1_for_sde at batch {batch_idx}")
-            print(f"NaN locations: {torch.where(torch.isnan(z1_for_sde))}")
-            return torch.tensor(0.0, requires_grad=True, device=self.device)
 
             # Run SDE
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
@@ -1009,36 +1053,10 @@ class Hybrid_VAE_SDE(LightningModule):
             valid_lengths=valid_lengths
         )
 
-        # 2. Check SDE output for NaN
-        if torch.isnan(latent_traj).any():
-            print(f"[ERROR] NaN in latent_traj after SDE integration at batch {batch_idx}")
-            print(f"NaN locations: {torch.where(torch.isnan(latent_traj))}")
-            return torch.tensor(0.0, requires_grad=True, device=self.device)
 
         # Decode
         decoded_traj = self.forward_dec(latent_traj)
 
-        # 3. Check decoded output for NaN
-        if torch.isnan(decoded_traj).any():
-            print(f"[ERROR] NaN in decoded_traj after decoding at batch {batch_idx}")
-            print(f"NaN locations: {torch.where(torch.isnan(decoded_traj))}")
-            return torch.tensor(0.0, requires_grad=True, device=self.device)
-
-        """
-
-        # Run SDE with variable lengths
-        latent_traj, logqp_path, i_ext_path = self.forward_latent(
-            init_latents=z1_for_sde,
-            ts=ts,
-            Tx=T,
-            time_to_tx=torch.zeros(batch_size).to(self.device),
-            valid_lengths=valid_lengths
-        )
-
-        # Decode
-        print(f"Latent traj shape: {latent_traj.shape}")
-        decoded_traj = self.forward_dec(latent_traj)
-        print(f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]")"""
 
         # Create mask for loss computation
         #Y = Y[:, :17]
@@ -1054,12 +1072,6 @@ class Hybrid_VAE_SDE(LightningModule):
             mask=time_mask
         )
 
-        # Add IC consistency loss (only where we have real data)
-        ic_consistency_loss = self.compute_ic_consistency_loss(
-            predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
-            init_states=init_states,  # The real IC values
-            ic_mask=ic_mask  # The mask indicating where we have real data
-        )
 
         # Combine losses
         total_loss = loss + self.ic_consistency_weight * ic_consistency_loss
@@ -1124,22 +1136,6 @@ class Hybrid_VAE_SDE(LightningModule):
             nan_locs = torch.where(torch.isnan(z1_for_sde))
             print(f"NaN locations in z1_for_sde: {nan_locs}")
 
-        p_a_ic = z1_for_sde[:, :, 0]  # First expert variable
-        p_v_ic = z1_for_sde[:, :, 1]  # Second expert variable
-
-        # TODO REMOVE FOR PROD
-        problematic_mask = (p_a_ic <= p_v_ic)
-        if problematic_mask.any():
-            n_problems = problematic_mask.sum().item()
-            print(f"[IC SAFETY] Fixing {n_problems} initial conditions where MAP <= CVP")
-            print(
-                f"  Before: p_a range [{p_a_ic.min().item():.1f}, {p_a_ic.max().item():.1f}], p_v range [{p_v_ic.min().item():.1f}, {p_v_ic.max().item():.1f}]")
-
-            # Set CVP = 10 where MAP <= CVP
-            z1_for_sde[:, :, 1] = torch.where(problematic_mask, z1_for_sde[:,:,0]-1,
-                                              z1_for_sde[:, :, 1])
-
-            print(f"  After: CVP set to 10 where needed")
 
         return z1_for_sde
 
@@ -1161,11 +1157,6 @@ class Hybrid_VAE_SDE(LightningModule):
 
         # Use the full time grid - we'll handle variable lengths in forward_latent
         ts = time_post[0, :]  # Assuming all sequences share the same time gridn (A given in our MIMIC-III setup)
-
-
-        # TODO: Remove this when using real init states
-        #init_states_safe = self._get_safe_init_states(init_states)
-        #init_states = init_states_safe
 
         if self.use_encoder != 'none':
             if self.use_encoder == 'raindrop':
@@ -1223,6 +1214,8 @@ class Hybrid_VAE_SDE(LightningModule):
 
             # neural embedding head outputs: 4
             neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            # Prepare the SDE initial state
+            z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
             print(f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]")
 
             print(f"[DEBUG] fused_rep contains NaN: {torch.isnan(fused_rep).any()}")
@@ -1234,15 +1227,18 @@ class Hybrid_VAE_SDE(LightningModule):
             # After the neural embedding head:
             if torch.isnan(neural_embedding).any():
                 print("[ERROR] NaN in neural embedding head output!")
+                # Add IC consistency loss (only where we have real data)
+            ic_consistency_loss = self.compute_ic_consistency_loss(
+                    predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
+                    init_states=init_states,  # The real IC values
+                    ic_mask=ic_mask  # The mask indicating where we have real data
+                )
 
         else:  # No encoder
-            X_for_encoder = self._prepare_encoder_input(X, init_states)
-            z1_encoder, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
-            predicted_ode_latents = z1_encoder[:, :, :self.expert_latent_dims]
-            neural_embedding = z1_encoder[:, :, self.expert_latent_dims:]
-
-        # Prepare the SDE initial state
-        z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
+            initial_condition = self._prepare_no_encoder_initial_state(init_states, ic_mask)
+            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
+            logqp0 = 0
+            ic_consistency_loss = 0
 
         # Run SDE with variable lengths
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
@@ -1270,13 +1266,6 @@ class Hybrid_VAE_SDE(LightningModule):
             true_traj=Y,
             logqp=total_logqp,
             mask=time_mask
-        )
-
-        # Add IC consistency loss (only where we have real data)
-        ic_consistency_loss = self.compute_ic_consistency_loss(
-            predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
-            init_states=init_states,  # The real IC values
-            ic_mask=ic_mask  # The mask indicating where we have real data
         )
 
         # Combine losses
@@ -1363,14 +1352,21 @@ class Hybrid_VAE_SDE(LightningModule):
             neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
             print(f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]")
 
-        else:  # No encoder
-            X_for_encoder = self._prepare_encoder_input(X, init_states)
-            z1_encoder, z1_logvar, logqp0 = self.forward_enc(X_for_encoder, time_pre)
-            predicted_ode_latents = z1_encoder[:, :, :self.expert_latent_dims]
-            neural_embedding = z1_encoder[:, :, self.expert_latent_dims:]
+            # Add IC consistency loss (only where we have real data)
+            ic_consistency_loss = self.compute_ic_consistency_loss(
+                predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
+                init_states=init_states,  # The real IC values
+                ic_mask=ic_mask  # The mask indicating where we have real data
+            )
+            z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
 
-        # Prepare the SDE initial state
-        z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
+        else:  # No encoder
+            initial_condition = self._prepare_no_encoder_initial_state(init_states, ic_mask)
+            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
+            logqp0 = 0
+            ic_consistency_loss = 0
+
+
 
         # Run SDE with variable lengths
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
@@ -1398,13 +1394,6 @@ class Hybrid_VAE_SDE(LightningModule):
             true_traj=Y,
             logqp=total_logqp,
             mask=time_mask
-        )
-
-        # Add IC consistency loss (only where we have real data)
-        ic_consistency_loss = self.compute_ic_consistency_loss(
-            predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
-            init_states=init_states,  # The real IC values
-            ic_mask=ic_mask  # The mask indicating where we have real data
         )
 
         # Combine losses
