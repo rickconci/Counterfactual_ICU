@@ -166,7 +166,7 @@ def find_relevant_patients(
 
         if final_patient_ids.is_empty():
             print("Warning: No patients with hypotensive events found. Result will be empty.")
-            pl.DataFrame().write_parquet(save_path)
+            pl.DataFrame().write_parquet( )
             return pl.DataFrame()
         print(f"Found {len(final_patient_ids)} patients who experienced hypotension.")
 
