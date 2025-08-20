@@ -642,4 +642,106 @@ def get_phecode_statistics(batch_data, idx_key='next_idx_padded', len_key='next_
         'max_codes': max_codes
     }
 
+def zenker_derivatives(y, device):
+
+    print(f"Y shape: {y.shape}. Expect 161 x 24")
+
+    batch_size = y.shape[0]
+
+    # y now contains: [i_ext (2), expert_latents (14), neural_embedding (4)]
+    i_ext_1 = y[:, 0].unsqueeze(1)
+    i_ext_2 = y[:, 1].unsqueeze(1)
+    p_a = y[:, 2].unsqueeze(1)
+    p_v = y[:, 3].unsqueeze(1)
+    p_a = torch.clamp(p_a, min=40.0, max=200.0)  # MAP: 40-200 mmHg
+    p_v = torch.clamp(p_v, min=0.0, max=39.0)
+
+    s_reflex = y[:, 4].unsqueeze(1)
+    sv = y[:, 5].unsqueeze(1)
+    r_tpr_mod = y[:, 6].unsqueeze(1)
+    f_hr_max = y[:, 7].unsqueeze(1)
+    f_hr_min = y[:, 8].unsqueeze(1)
+    r_tpr_max = y[:, 9].unsqueeze(1)
+    r_tpr_min = y[:, 10].unsqueeze(1)
+    c_a = y[:, 11].unsqueeze(1)
+    c_v = y[:, 12].unsqueeze(1)
+    k_width = y[:, 13].unsqueeze(1)
+    p_aset = y[:, 14].unsqueeze(1)
+    tau = y[:, 15].unsqueeze(1)
+
+
+    f_hr = fhr(s_reflex,f_hr_max,f_hr_min)
+    r_tpr = rtpr(s_reflex,r_tpr_max,r_tpr_min, r_tpr_mod)
+
+    dpa_dt = dpa(p_a, p_v, r_tpr, sv, f_hr, c_a)
+    dpv_dt = dpv(dpa_dt, c_a, c_v)
+    ds_dt = dsdt(tau, k_width, p_a, p_aset, s_reflex)
+
+    # TODO fix this
+    dsv_dt = torch.zeros([batch_size, 1], device=device)
+
+    # Fixed parameters don't change
+    dt_r_tpr_mod = torch.zeros([batch_size, 1]).to(device)
+    dt_f_hr_max = torch.zeros([batch_size, 1]).to(device)
+    dt_f_hr_min = torch.zeros([batch_size, 1]).to(device)
+    dt_r_tpr_max = torch.zeros([batch_size, 1]).to(device)
+    dt_r_tpr_min = torch.zeros([batch_size, 1]).to(device)
+    dt_ca = torch.zeros([batch_size, 1]).to(device)
+    dt_cv = torch.zeros([batch_size, 1]).to(device)
+    dt_k_width = torch.zeros([batch_size, 1]).to(device)
+    dt_p_aset = torch.zeros([batch_size, 1]).to(device)
+    dt_tau = torch.zeros([batch_size, 1]).to(device)
+
+    # For expert latents (all 14 dims in the correct order)
+    dt_expert = torch.cat([
+        dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min,  # Next 3 (indices 6-8)
+        dt_r_tpr_max, dt_r_tpr_min,  # Next 2 (indices 9-10)
+        dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau
+    ], dim=-1)
+
+    return dpa_dt, dpv_dt, ds_dt, dsv_dt, dt_expert, dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min, dt_r_tpr_max, dt_r_tpr_min, dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau
+
+
+def fhr(s_reflex, f_hr_max, f_hr_min):
+    return s_reflex * (f_hr_max - f_hr_min) + f_hr_min
+
+def rtpr(s_reflex, r_tpr_max, r_tpr_min, r_tpr_mod):
+    return s_reflex * (r_tpr_max - r_tpr_min) + r_tpr_min + r_tpr_mod
+
+def dpa(p_a, p_v, r_tpr, sv, f_hr, c_a):
+    """
+    Computes the derivative of the arterial pressure
+    Args:
+        p_a:
+        p_v:
+        r_tpr:
+        sv:
+        f_hr:
+
+    Returns: dpa_dt, the derivative of the arterial pressure
+    """
+    return (1 / (c_a * 100))*(((p_a-p_v)/r_tpr) - sv*f_hr)
+
+def dpv(dpa_dt, c_a, c_v):
+    """
+    Computes the venous pressure
+    Args:
+        dpa_dt:
+        c_a:
+        c_v:
+
+    Returns:
+
+    """
+    # TODO note to self: we do not include ANY control here and assume this will be handled during the forward latent step (dependent on which model)
+    return (1/(c_v*10))*(-c_a*dpa_dt)
+
+def dsdt(tau, k_width, p_a, p_aset, s_reflex):
+
+    return (1. / tau) * (1. - 1. / (1 + torch.exp(-k_width * (p_a - p_aset))) - s_reflex)
+
+
+
+
+
 
