@@ -9,29 +9,32 @@ from typing import Dict, List, Tuple, Optional
 import os
 
 
-def load_and_prepare_data(parquet_path: str) -> pd.DataFrame:
+def load_and_prepare_data(parquet_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load the mv_filtered_10min.parquet file and prepare it for processing.
+    Returns both the full dataset and the filtered dataset for trajectory identification.
     """
     print(f"Loading data from {parquet_path}...")
-    df = pd.read_parquet(parquet_path)
-
-    # Filter out rows where action_cluster_id is NaN
-    df = df.dropna(subset=['action_cluster_id'])
+    df_full = pd.read_parquet(parquet_path)
 
     # Ensure start_time is datetime
-    if not pd.api.types.is_datetime64_any_dtype(df['start_time']):
-        df['start_time'] = pd.to_datetime(df['start_time'])
+    if not pd.api.types.is_datetime64_any_dtype(df_full['start_time']):
+        df_full['start_time'] = pd.to_datetime(df_full['start_time'])
 
-    print(f"Loaded {len(df)} rows after filtering NaN action_cluster_id")
-    print(f"Unique hadm_ids: {df['hadm_id'].nunique()}")
-    print(f"Unique action_cluster_ids: {df['action_cluster_id'].nunique()}")
-    print(f"Unique item_labels: {df['item_label'].nunique()}")
+    print(f"Loaded {len(df_full)} total medication rows")
+    print(f"Unique hadm_ids: {df_full['hadm_id'].nunique()}")
+    print(f"Unique item_labels: {df_full['item_label'].nunique()}")
 
-    return df
+    # Create filtered dataset for trajectory identification (only non-NaN action_cluster_id)
+    df_triggers = df_full.dropna(subset=['action_cluster_id'])
+
+    print(f"Rows with action_cluster_id (for trajectory identification): {len(df_triggers)}")
+    print(f"Unique action_cluster_ids: {df_triggers['action_cluster_id'].nunique()}")
+
+    return df_full, df_triggers
 
 
-def identify_trajectories(df: pd.DataFrame, trajectory_duration_minutes: int = 20) -> Dict:
+def identify_trajectories(df_full: pd.DataFrame, df_triggers: pd.DataFrame, trajectory_duration_minutes: int = 20) -> Dict:
     """
     Group by hadm_id and action_cluster_id to identify trajectories.
     Each trajectory lasts 20 minutes OR until the start of the next action_cluster_id.
@@ -41,7 +44,7 @@ def identify_trajectories(df: pd.DataFrame, trajectory_duration_minutes: int = 2
     trajectories = {}
 
     # First, get all action_cluster_ids per hadm_id with their t0 times
-    action_starts = df.groupby(['hadm_id', 'action_cluster_id'])['start_time'].min().reset_index()
+    action_starts = df_triggers.groupby(['hadm_id', 'action_cluster_id'])['start_time'].min().reset_index()
     action_starts.columns = ['hadm_id', 'action_cluster_id', 't0_time']
 
     # Sort by hadm_id and t0_time to find next action starts
@@ -70,7 +73,7 @@ def identify_trajectories(df: pd.DataFrame, trajectory_duration_minutes: int = 2
                 trajectory_end_time = end_time_20min
 
             # Get all data for this patient within the trajectory window
-            patient_data = df[df['hadm_id'] == hadm_id].copy()
+            patient_data = df_full[df_full['hadm_id'] == hadm_id].copy()
             trajectory_data = patient_data[
                 (patient_data['end_time'] > t0_time) &  # Still ongoing at/after t0
                 (patient_data['start_time'] < trajectory_end_time)  # Starts before trajectory ends
@@ -257,13 +260,13 @@ def create_med_tensors_from_parquet(
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Load and prepare data
-    df = load_and_prepare_data(parquet_path)
+    df_full, df_triggers = load_and_prepare_data(parquet_path)
 
-    # Step 2: Identify trajectories
-    trajectories = identify_trajectories(df)
+    # Step 2: Identify trajectories using trigger data, but get all meds from full data
+    trajectories = identify_trajectories(df_full, df_triggers)
 
-    # Step 3: Get unique item labels (medications)
-    unique_item_labels = sorted(df['item_label'].unique().tolist())
+    # Step 3: Get unique item labels from FULL dataset (all medications)
+    unique_item_labels = sorted(df_full['item_label'].unique().tolist())
     print(f"Found {len(unique_item_labels)} unique item labels:")
     for i, label in enumerate(unique_item_labels):
         print(f"  {i}: {label}")

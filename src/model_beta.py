@@ -202,10 +202,12 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if self.use_encoder != 'none':
             self.ic_consistency_weight = 0.1
-            net_input_dims = net_input_dims + n_medications
+            # each medication has rate and last administration info
+            net_input_dims = net_input_dims + n_medications * 2
         else:
             self.ic_consistency_weight = 0
-            net_input_dims = self.expert_latent_dims + n_medications
+            # each medication has rate and last administration info
+            net_input_dims = self.expert_latent_dims + n_medications * 2
             net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         activations = {
@@ -333,7 +335,50 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if self.debug: print(f"[DEBUG] Hybrid_VAE_SDE forward_enc: Returning z1_shape={z1.shape}, z1_logvar_type={type(z1_logvar)}, logqp0_type={type(logqp0)}")
         return z1, z1_logvar, logqp0
-    
+
+    def get_medication_context(self, t, expanded_batch_size):
+        """
+        For each medication, return [last_rate, recency_weight] at time t
+        """
+        # Map expanded batch indices back to original batch indices
+        original_batch_size = self.current_med_values.shape[0]
+        print(f"Current med values shape: {self.current_med_values.shape}")
+
+        valid_indices = (self.current_med_time <= t.item())  # Only past/current times
+
+        med_context = []
+
+        for expanded_idx in range(expanded_batch_size):
+            # Map back to original batch index
+            batch_idx = expanded_idx % original_batch_size
+            batch_context = []
+
+            for med_idx in range(self.current_med_values.shape[-1]):  # For each medication
+                # Find last valid rate for this med in this batch
+                med_mask_batch = self.current_med_mask[batch_idx, :, med_idx]  # (time,)
+                med_values_batch = self.current_med_values[batch_idx, :, med_idx]  # (time,)
+
+
+                # Find last valid measurement ≤ t
+                valid_mask = valid_indices[batch_idx] & (med_mask_batch > 0)
+
+                if torch.any(valid_mask):
+                    last_valid_idx = torch.where(valid_mask)[0][-1]  # Last valid index
+                    last_rate = med_values_batch[last_valid_idx].item()
+                    time_since = t.item() - self.current_med_time[batch_idx, last_valid_idx].item()
+                    recency_weight = 1.0 / max(time_since, 1.0)
+                else:
+                    # No valid measurement found
+                    last_rate = 0.0
+                    recency_weight = 0.0
+
+                batch_context.extend([last_rate, recency_weight])
+
+            med_context.append(batch_context)
+
+        return torch.tensor(med_context, device=self.device, dtype=torch.float32)
+
+
     def apply_SDE_fun(self, t, y):
         """
         Normalise data and add time information (if the appropriate options have been set).
@@ -384,6 +429,16 @@ class Hybrid_VAE_SDE(LightningModule):
             if torch.isnan(param).any():
                 print(f"[ERROR] NaN weights in {name}!")
                 breakpoint()
+
+        batch_size = y.shape[0]
+        # Add medication context
+        med_context = self.get_medication_context(t, batch_size)  # (batch, 2*n_meds)
+
+        # Augment SDE input
+        SDE_NN_input = torch.cat([SDE_NN_input, med_context], dim=-1)
+        print(f"SDE_NN_input shape: {SDE_NN_input.shape}")
+        print(f"Med context shape: {med_context.shape}")
+
         SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
         if torch.isnan(SDE_NN_output_latents).any():
             print("SDE_NN_output contains NaN!")
@@ -705,7 +760,9 @@ class Hybrid_VAE_SDE(LightningModule):
         #print('derivatives', derivatives.shape)
         return derivatives
 
-    def forward_latent(self, init_latents, ts, Tx, time_to_tx, valid_lengths=None):
+    def forward_latent(self, init_latents, ts, Tx, time_to_tx, valid_lengths=None,
+                       med_traj_values=None, med_traj_mask=None, med_traj_time=None):
+
         """
         Forward through SDE with batch-compatible variable length support.
         """
@@ -714,6 +771,11 @@ class Hybrid_VAE_SDE(LightningModule):
             print(f"[DEBUG] forward_latent: init_latents_shape={init_latents.shape}")
             if valid_lengths is not None:
                 print(f"[DEBUG] forward_latent: valid_lengths={valid_lengths}")
+
+        # Store for use in apply_SDE_fun
+        self.current_med_values = med_traj_values  # (batch, time, n_meds)
+        self.current_med_mask = med_traj_mask  # (batch, time, n_meds)
+        self.current_med_time = med_traj_time  # (batch, time)
 
 
 
@@ -973,7 +1035,11 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if self.dataset == "mimic":
             # Unpack with valid_lengths
-            X, X_mask, Y, T, Y_cf, p, init_states, ic_mask, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths, meds_in, static_features = batch
+            (X, X_mask, Y, T, Y_cf, p, init_states, ic_mask,
+            time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths,
+            med_trajectory_values, med_trajectory_mask, med_trajectory_time,
+            meds_context_values, meds_context_mask, meds_context_time,
+            static_features) = batch
         else:
             # Synthetic data path
             X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
@@ -1043,17 +1109,16 @@ class Hybrid_VAE_SDE(LightningModule):
             logqp0 = 0
             ic_consistency_loss = 0
 
-
-
-            # Run SDE
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
-            init_latents=z1_for_sde,
-            ts=ts,
-            Tx=T,
-            time_to_tx=torch.zeros(batch_size).to(self.device),
-            valid_lengths=valid_lengths
-        )
-
+                init_latents=z1_for_sde,
+                ts=ts,
+                Tx=T,
+                time_to_tx=torch.zeros(batch_size).to(self.device),
+                valid_lengths=valid_lengths,
+                med_traj_values=med_trajectory_values,
+                med_traj_mask=med_trajectory_mask,
+                med_traj_time=med_trajectory_time
+            )
 
         # Decode
         decoded_traj = self.forward_dec(latent_traj)
@@ -1146,7 +1211,11 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if self.dataset == "mimic":
             # Unpack with valid_lengths
-            X, X_mask, Y, T, Y_cf, p, init_states, ic_mask, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths, meds_in, static_features = batch
+            (X, X_mask, Y, T, Y_cf, p, init_states, ic_mask,
+             time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths,
+             med_trajectory_values, med_trajectory_mask, med_trajectory_time,
+             meds_context_values, meds_context_mask, meds_context_time,
+             static_features) = batch
         else:
             # Synthetic data path
             X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
@@ -1247,7 +1316,10 @@ class Hybrid_VAE_SDE(LightningModule):
             ts=ts,
             Tx=T,
             time_to_tx=torch.zeros(batch_size).to(self.device),
-            valid_lengths=valid_lengths
+            valid_lengths=valid_lengths,
+            med_traj_values=med_trajectory_values,
+            med_traj_mask=med_trajectory_mask,
+            med_traj_time=med_trajectory_time
         )
 
         # Decode
@@ -1296,7 +1368,11 @@ class Hybrid_VAE_SDE(LightningModule):
 
         if self.dataset == "mimic":
             # Unpack with valid_lengths
-            X, X_mask, Y, T, Y_cf, p, init_states, ic_mask, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths, meds_in, static_features = batch
+            (X, X_mask, Y, T, Y_cf, p, init_states, ic_mask,
+             time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj, valid_lengths,
+             med_trajectory_values, med_trajectory_mask, med_trajectory_time,
+             meds_context_values, meds_context_mask, meds_context_time,
+             static_features) = batch
         else:
             # Synthetic data path
             X, Y, T, Y_cf, p, init_states, time_pre, time_post, time_FULL, full_fact_traj, full_cf_traj = batch
@@ -1367,15 +1443,15 @@ class Hybrid_VAE_SDE(LightningModule):
             logqp0 = 0
             ic_consistency_loss = 0
 
-
-
-        # Run SDE with variable lengths
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
             ts=ts,
             Tx=T,
             time_to_tx=torch.zeros(batch_size).to(self.device),
-            valid_lengths=valid_lengths
+            valid_lengths=valid_lengths,
+            med_traj_values=med_trajectory_values,
+            med_traj_mask=med_trajectory_mask,
+            med_traj_time=med_trajectory_time
         )
 
         # Decode

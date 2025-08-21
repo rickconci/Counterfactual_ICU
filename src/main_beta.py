@@ -157,7 +157,7 @@ def main(args):
                            encoder_hidden_dim = args.encoder_hidden_dim,
                            expert_latent_dims  = 14, # Fixed by the ODE model #todo check that
                            encoder_SDENN_dims = 0 if args.use_encoder == 'none' else args.encoder_SDENN_dims,
-                           n_medications=22,
+                           n_medications=20, # TODO fix this with new meds tensors
 
                            use_2_5std_encoder_minmax = args.use_2_5std_encoder_minmax,
                            encoder_num_layers = args.encoder_num_layers,
