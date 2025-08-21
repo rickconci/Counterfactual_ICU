@@ -895,6 +895,7 @@ class Hybrid_VAE_SDE(LightningModule):
         print(mask[0])
 
         if mask is not None:
+            # TODO ALSO MASK FOR MISSING MEASUREMENTS
             # mask shape: [batch, time]
             # Expand mask to match logpy dimensions
             mask_expanded = mask.unsqueeze(1).unsqueeze(-1)  # [batch, 1, time, 1]

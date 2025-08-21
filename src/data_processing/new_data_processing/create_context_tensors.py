@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple, Optional
 import os
 
 
+
 def create_context_tensors(
         waveforms_parquet_path: str,
         med_tensors_metadata_path: str,
@@ -19,17 +20,7 @@ def create_context_tensors(
 ) -> Dict:
     """
     Create context tensors for the hour before each t₀.
-
-    Args:
-        waveforms_parquet_path: Path to combined_waveforms.cleaned.parquet
-        med_tensors_metadata_path: Path to med tensors metadata.pkl
-        med_data_parquet_path: Path to mv_filtered_10min.parquet
-        output_dir: Directory to save context tensors
-        context_duration_minutes: Duration of context window before t₀ (default: 60)
-        context_interval_minutes: Time interval for context aggregation (default: 10)
-
-    Returns:
-        Dictionary with metadata about created context tensors
+    Modified to always save tensors, even if they're all zeros.
     """
 
     # Calculate context parameters
@@ -66,63 +57,57 @@ def create_context_tensors(
     physio_context_metadata = {}
     meds_context_metadata = {}
 
-    skipped_physio = 0
-    skipped_meds = 0
-
+    # Changed: No more skipping - all tensors are created
     for traj_key, traj_info in tqdm(trajectories.items(), desc="Creating context tensors"):
 
-        # Create physio context tensor
-        physio_result = create_physio_context_tensor(
+        # Create physio context tensor (always returns tensors now)
+        physio_values, physio_mask = create_physio_context_tensor(
             traj_key, traj_info, waveforms_df,
             n_context_intervals, context_interval_minutes
         )
 
-        if physio_result is not None:
-            physio_values, physio_mask = physio_result
-            physio_filepath = save_context_tensor(
-                traj_key, physio_values, physio_mask,
-                n_context_intervals, context_interval_minutes,
-                physio_context_dir, "physio_context"
-            )
+        # Always save physio context tensor
+        physio_filepath = save_context_tensor(
+            traj_key, physio_values, physio_mask,
+            n_context_intervals, context_interval_minutes,
+            physio_context_dir, "physio_context"
+        )
 
-            physio_context_metadata[traj_key] = {
-                'hadm_id': traj_info['hadm_id'],
-                'action_cluster_id': traj_info['action_cluster_id'],
-                't0_time': traj_info['t0_time'],
-                'file_path': physio_filepath,
-                'n_intervals': n_context_intervals,
-                'interval_minutes': context_interval_minutes,
-                'total_measurements': int(torch.sum(physio_mask > 0).item())
-            }
-        else:
-            skipped_physio += 1
+        physio_context_metadata[traj_key] = {
+            'hadm_id': traj_info['hadm_id'],
+            'action_cluster_id': traj_info['action_cluster_id'],
+            't0_time': traj_info['t0_time'],
+            'file_path': physio_filepath,
+            'n_intervals': n_context_intervals,
+            'interval_minutes': context_interval_minutes,
+            'total_measurements': int(torch.sum(physio_mask > 0).item()),
+            'has_data': bool(torch.sum(physio_mask > 0).item() > 0)  # Track if tensor has actual data
+        }
 
-        # Create meds context tensor
-        meds_result = create_meds_context_tensor(
+        # Create meds context tensor (always returns tensors now)
+        meds_values, meds_mask = create_meds_context_tensor(
             traj_key, traj_info, med_df,
             n_context_intervals, context_interval_minutes,
             med_metadata['item_labels']
         )
 
-        if meds_result is not None:
-            meds_values, meds_mask = meds_result
-            meds_filepath = save_context_tensor(
-                traj_key, meds_values, meds_mask,
-                n_context_intervals, context_interval_minutes,
-                meds_context_dir, "meds_context"
-            )
+        # Always save meds context tensor
+        meds_filepath = save_context_tensor(
+            traj_key, meds_values, meds_mask,
+            n_context_intervals, context_interval_minutes,
+            meds_context_dir, "meds_context"
+        )
 
-            meds_context_metadata[traj_key] = {
-                'hadm_id': traj_info['hadm_id'],
-                'action_cluster_id': traj_info['action_cluster_id'],
-                't0_time': traj_info['t0_time'],
-                'file_path': meds_filepath,
-                'n_intervals': n_context_intervals,
-                'interval_minutes': context_interval_minutes,
-                'total_measurements': int(torch.sum(meds_mask > 0).item())
-            }
-        else:
-            skipped_meds += 1
+        meds_context_metadata[traj_key] = {
+            'hadm_id': traj_info['hadm_id'],
+            'action_cluster_id': traj_info['action_cluster_id'],
+            't0_time': traj_info['t0_time'],
+            'file_path': meds_filepath,
+            'n_intervals': n_context_intervals,
+            'interval_minutes': context_interval_minutes,
+            'total_measurements': int(torch.sum(meds_mask > 0).item()),
+            'has_data': bool(torch.sum(meds_mask > 0).item() > 0)  # Track if tensor has actual data
+        }
 
     # Save metadata
     context_metadata = {
@@ -132,10 +117,10 @@ def create_context_tensors(
         'context_interval_minutes': context_interval_minutes,
         'context_duration_minutes': context_duration_minutes,
         'total_trajectories': len(trajectories),
-        'physio_tensors_created': len(physio_context_metadata),
-        'meds_tensors_created': len(meds_context_metadata),
-        'physio_tensors_skipped': skipped_physio,
-        'meds_tensors_skipped': skipped_meds,
+        'physio_tensors_created': len(physio_context_metadata),  # Now always equals total_trajectories
+        'meds_tensors_created': len(meds_context_metadata),      # Now always equals total_trajectories
+        'physio_tensors_with_data': sum(1 for m in physio_context_metadata.values() if m['has_data']),  # New: count non-zero tensors
+        'meds_tensors_with_data': sum(1 for m in meds_context_metadata.values() if m['has_data']),      # New: count non-zero tensors
         'created_at': datetime.now().isoformat(),
         'source_trajectories': med_tensors_metadata_path
     }
@@ -147,12 +132,10 @@ def create_context_tensors(
     # Print summary
     print(f"\n=== Context Tensors Summary ===")
     print(f"Total trajectories: {len(trajectories)}")
-    print(f"Physio context tensors created: {len(physio_context_metadata)}")
-    print(f"Meds context tensors created: {len(meds_context_metadata)}")
-    print(f"Physio tensors skipped: {skipped_physio}")
-    print(f"Meds tensors skipped: {skipped_meds}")
-    print(f"Physio success rate: {len(physio_context_metadata) / len(trajectories) * 100:.1f}%")
-    print(f"Meds success rate: {len(meds_context_metadata) / len(trajectories) * 100:.1f}%")
+    print(f"Physio context tensors created: {len(physio_context_metadata)} (100%)")
+    print(f"Meds context tensors created: {len(meds_context_metadata)} (100%)")
+    print(f"Physio tensors with data: {sum(1 for m in physio_context_metadata.values() if m['has_data'])}")
+    print(f"Meds tensors with data: {sum(1 for m in meds_context_metadata.values() if m['has_data'])}")
 
     print(f"\nFiles saved to: {output_path}")
     print(f"Metadata saved to: {metadata_file}")
@@ -213,13 +196,13 @@ def create_physio_context_tensor(
         waveforms_df: pd.DataFrame,
         n_intervals: int,
         interval_minutes: int
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor]:  # Changed: Always returns tensors, never None
     """
     Create physiological context tensor for the hour before t₀.
+    Always returns tensors, even if all zeros.
 
     Returns:
-        tuple: (physio_values, physio_mask) if data available
-        None: if insufficient data
+        tuple: (physio_values, physio_mask) - always returns, may be all zeros
     """
     hadm_id = traj_info['hadm_id']
     t0_time = pd.to_datetime(traj_info['t0_time'])
@@ -227,6 +210,13 @@ def create_physio_context_tensor(
     # Define context window: 1 hour before t₀
     context_start_time = t0_time - pd.Timedelta(minutes=interval_minutes * n_intervals)
     context_end_time = t0_time
+
+    # Initialize arrays: [ABP MEAN, NBP MEAN, CVP, HR, RESP]
+    physio_measurements = ['ABP MEAN', 'NBP MEAN', 'CVP', 'HR', 'RESP']
+    n_measurements = len(physio_measurements)
+
+    values_array = np.zeros((n_intervals, n_measurements), dtype=np.float32)
+    mask_array = np.zeros((n_intervals, n_measurements), dtype=np.float32)
 
     # Get patient waveforms data in context window
     patient_waveforms = waveforms_df[
@@ -236,8 +226,8 @@ def create_physio_context_tensor(
         ].copy()
 
     if len(patient_waveforms) == 0:
-        print(f"    No physio data in context window for {traj_key}")
-        return None
+        print(f"    No physio data in context window for {traj_key} - saving zero tensor")
+        return torch.from_numpy(values_array), torch.from_numpy(mask_array)  # Return zeros instead of None
 
     # Calculate time indices for context window
     patient_waveforms['time_from_context_start'] = (
@@ -246,13 +236,6 @@ def create_physio_context_tensor(
     patient_waveforms['context_interval_idx'] = (
             patient_waveforms['time_from_context_start'] // (interval_minutes * 60)
     ).astype(int)
-
-    # Initialize arrays: [ABP MEAN, NBP MEAN, CVP, HR, RESP]
-    physio_measurements = ['ABP MEAN', 'NBP MEAN', 'CVP', 'HR', 'RESP']
-    n_measurements = len(physio_measurements)
-
-    values_array = np.zeros((n_intervals, n_measurements), dtype=np.float32)
-    mask_array = np.zeros((n_intervals, n_measurements), dtype=np.float32)
 
     # Process each measurement type
     for meas_idx, measurement in enumerate(physio_measurements):
@@ -278,12 +261,12 @@ def create_physio_context_tensor(
                     values_array[interval_idx, meas_idx] = mean_value
                     mask_array[interval_idx, meas_idx] = 1.0
 
-    # Check if we have any data
-    if np.sum(mask_array) == 0:
-        print(f"    No valid physio measurements for {traj_key}")
-        return None
-
-    print(f"    Physio context: {int(np.sum(mask_array))} total measurements across {n_measurements} types")
+    # Always return tensors (even if all zeros)
+    total_measurements = int(np.sum(mask_array))
+    if total_measurements == 0:
+        print(f"    No valid physio measurements for {traj_key} - saving zero tensor")
+    else:
+        print(f"    Physio context: {total_measurements} total measurements across {n_measurements} types")
 
     return torch.from_numpy(values_array), torch.from_numpy(mask_array)
 
@@ -295,14 +278,13 @@ def create_meds_context_tensor(
         n_intervals: int,
         interval_minutes: int,
         item_labels: List[str]
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor]:  # Changed: Always returns tensors, never None
     """
     Create medication context tensor for the hour before t₀.
-    Uses same infusion logic as main med tensors but at 10-minute resolution.
+    Always returns tensors, even if all zeros.
 
     Returns:
-        tuple: (meds_values, meds_mask) if data available
-        None: if insufficient data
+        tuple: (meds_values, meds_mask) - always returns, may be all zeros
     """
     hadm_id = traj_info['hadm_id']
     t0_time = pd.to_datetime(traj_info['t0_time'])
@@ -311,24 +293,6 @@ def create_meds_context_tensor(
     context_start_time = t0_time - pd.Timedelta(minutes=interval_minutes * n_intervals)
     context_end_time = t0_time
 
-    # Get patient medication data
-    patient_meds = med_df[med_df['hadm_id'] == hadm_id].copy()
-
-    if len(patient_meds) == 0:
-        print(f"    No medication data for patient {hadm_id}")
-        return None
-
-    # Filter to infusions that overlap with context window
-    # Include infusions where: end_time > context_start AND start_time < context_end
-    relevant_infusions = patient_meds[
-        (patient_meds['end_time'] > context_start_time) &
-        (patient_meds['start_time'] < context_end_time)
-        ].copy()
-
-    if len(relevant_infusions) == 0:
-        print(f"    No medication infusions in context window for {traj_key}")
-        return None
-
     # Initialize arrays
     n_medications = len(item_labels)
     values_array = np.zeros((n_intervals, n_medications), dtype=np.float32)
@@ -336,6 +300,23 @@ def create_meds_context_tensor(
 
     # Create item_label to index mapping
     item_to_idx = {item: idx for idx, item in enumerate(item_labels)}
+
+    # Get patient medication data
+    patient_meds = med_df[med_df['hadm_id'] == hadm_id].copy()
+
+    if len(patient_meds) == 0:
+        print(f"    No medication data for patient {hadm_id} - saving zero tensor")
+        return torch.from_numpy(values_array), torch.from_numpy(mask_array)  # Return zeros instead of None
+
+    # Filter to infusions that overlap with context window
+    relevant_infusions = patient_meds[
+        (patient_meds['end_time'] > context_start_time) &
+        (patient_meds['start_time'] < context_end_time)
+        ].copy()
+
+    if len(relevant_infusions) == 0:
+        print(f"    No medication infusions in context window for {traj_key} - saving zero tensor")
+        return torch.from_numpy(values_array), torch.from_numpy(mask_array)  # Return zeros instead of None
 
     # Process each medication type separately (to handle overlaps correctly)
     for item_label in item_labels:
@@ -378,12 +359,12 @@ def create_meds_context_tensor(
                     values_array[time_idx, item_idx] = rate_value
                     mask_array[time_idx, item_idx] = 1.0
 
-    # Check if we have any data
-    if np.sum(mask_array) == 0:
-        print(f"    No valid medication data in context window for {traj_key}")
-        return None
-
-    print(f"    Meds context: {int(np.sum(mask_array))} total medication intervals")
+    # Always return tensors (even if all zeros)
+    total_medications = int(np.sum(mask_array))
+    if total_medications == 0:
+        print(f"    No valid medication data in context window for {traj_key} - saving zero tensor")
+    else:
+        print(f"    Meds context: {total_medications} total medication intervals")
 
     return torch.from_numpy(values_array), torch.from_numpy(mask_array)
 

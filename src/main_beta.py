@@ -131,7 +131,7 @@ def main(args):
         data_module.setup() # Need to call this to get dims
 
     elif args.dataset_type == 'mimic':
-        data_module = MIMICDataModule(data_root=args.data_root, 
+        data_module = MIMICDataModule(data_root=args.data_root,
                                       icu_stays_path=args.icu_stays_path, 
                                       batch_size=args.batch_size, 
                                       num_workers=0,
@@ -155,9 +155,9 @@ def main(args):
                            #Encoder
                            encoder_input_dim =  data_module.encoder_input_dim, 
                            encoder_hidden_dim = args.encoder_hidden_dim,
-                           expert_latent_dims  = 14, # Fixed by the ODE model #todo chck that
+                           expert_latent_dims  = 14, # Fixed by the ODE model #todo check that
                            encoder_SDENN_dims = 0 if args.use_encoder == 'none' else args.encoder_SDENN_dims,
-                           n_medications=0,
+                           n_medications=22,
 
                            use_2_5std_encoder_minmax = args.use_2_5std_encoder_minmax,
                            encoder_num_layers = args.encoder_num_layers,
