@@ -10,7 +10,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 class MIMICDataset(Dataset):
     def __init__(self, data_root, icu_stays_path, split='train', train_ratio=0.7, val_ratio=0.15,
-                 random_state=42):
+                 random_state=42, max_samples = None):
         self.data_root = data_root
         self.m_tensor_dir = os.path.join(data_root, 'med_tensors_output')
         self.ic_tensor_dir = os.path.join(data_root, 'physio_tensors_output/ic_tensors')
@@ -21,6 +21,7 @@ class MIMICDataset(Dataset):
         self.meds_context_dir = os.path.join(self.context_tensors_dir, 'meds_context')
         self.p_tensor_dir = os.path.join(self.context_tensors_dir, 'physio_context')
         self.baseline_tensor_dir = os.path.join(self.context_tensors_dir, 'baseline_tensors')
+        self.max_samples = max_samples
 
         physio_metadata_path = os.path.join(data_root, 'physio_tensors_output/physio_tensors_metadata.pkl')
 
@@ -122,6 +123,9 @@ class MIMICDataset(Dataset):
 
         # Filter trajectories to only include those from the selected hadm_ids
         self.samples = [traj for traj in all_trajectories if traj['hadm_id'] in split_hadm_ids]
+        if self.max_samples is not None:
+            self.samples = self.samples[:int(max_samples)]
+            print(f"[DEBUG] Limited to {len(self.samples)} samples for testing")
 
         print(f"Split '{split}': {len(split_hadm_ids)} patients, {len(self.samples)} trajectories")
         print(f"Target trajectory split: {target_train}/{target_val}/{target_test}")
@@ -214,6 +218,7 @@ class MIMICDataset(Dataset):
             "X": p_in_values,
             "X_mask": p_in_mask,
             "Y_fact": p_out_values,
+            "Y_fact_mask": p_out_mask,
             "T": torch.tensor(1.0),
             "Y_cf": torch.zeros_like(p_out_values),
             "p": torch.tensor(0.0),
@@ -229,7 +234,7 @@ class MIMICDataset(Dataset):
             # NEW: Medication tensors only (physio context replaces existing p_tensors)
             "med_trajectory_values": med_traj_values,  # Main trajectory meds (t₀ forward)
             "med_trajectory_mask": med_traj_mask,
-            "med_trajectory_time": med_traj_time_hr,
+            "med_trajectory_time": med_traj_time_sec,
             "meds_context_values": context_meds_values,  # Context meds (hour before t₀)
             "meds_context_mask": context_meds_mask,
             "meds_context_time": context_meds_time_hr,
@@ -237,7 +242,7 @@ class MIMICDataset(Dataset):
 
 
 class MIMICDataModule(L.LightningDataModule):
-    def __init__(self, data_root, icu_stays_path, batch_size=32, num_workers=1, random_state=42):
+    def __init__(self, data_root, icu_stays_path, batch_size=32, num_workers=1, random_state=42, max_samples = None):
         super().__init__()
         self.data_root = data_root
         self.icu_stays_path = icu_stays_path
@@ -247,13 +252,14 @@ class MIMICDataModule(L.LightningDataModule):
         self.expert_latent_dim = None
         self.random_state = random_state
         self.static_input_dim = None
+        self.max_samples = max_samples
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
             self.train_dataset = MIMICDataset(self.data_root, self.icu_stays_path,
-                                              split='train', random_state=self.random_state)
+                                              split='train', random_state=self.random_state, max_samples=self.max_samples)
             self.val_dataset = MIMICDataset(self.data_root, self.icu_stays_path, split='val',
-                                            random_state=self.random_state)
+                                            random_state=self.random_state, max_samples=self.max_samples)
 
             # Get static dim from metadata
             baseline_metadata_path = os.path.join(self.data_root, 'baseline_tensors', 'baseline_metadata.pkl')
@@ -269,7 +275,7 @@ class MIMICDataModule(L.LightningDataModule):
 
         if stage == 'test' or stage is None:
             self.test_dataset = MIMICDataset(self.data_root, self.icu_stays_path,
-                                             split='test', random_state=self.random_state)
+                                             split='test', random_state=self.random_state, max_samples=self.max_samples)
             if len(self.test_dataset) > 0 and self.encoder_input_dim is None:
                 sample0 = self.test_dataset[0]
                 self.encoder_input_dim = sample0['X'].shape[-1]
@@ -297,10 +303,10 @@ class MIMICDataModule(L.LightningDataModule):
     @staticmethod
     def collate_fn(batch):
         # TODO fix this (eventually)
-        MAX_LEN = 215
+        MAX_LEN = 120
 
         # Updated pad keys to include new medication tensors
-        pad_keys = ["X", "X_mask", "Y_fact", "Y_cf", "t_X", "t_Y", "t_full", "full_fact_traj", "full_CF_traj",
+        pad_keys = ["X", "X_mask", "Y_fact","Y_fact_mask", "Y_cf", "t_X", "t_Y", "t_full", "full_fact_traj", "full_CF_traj",
                     "med_trajectory_values", "med_trajectory_mask", "med_trajectory_time"]
 
         # Context tensors have fixed size (6 intervals), so they don't need padding
@@ -383,7 +389,7 @@ class MIMICDataModule(L.LightningDataModule):
                     padded_sequences.append(padded_seq)
                 collated[key] = torch.stack(padded_sequences)
 
-            elif key in ["Y_fact", "Y_cf", "t_full", "full_fact_traj", "full_CF_traj"]:  # Target sequences
+            elif key in ["Y_fact", "Y_fact_mask", "Y_cf", "t_full", "full_fact_traj", "full_CF_traj"]:  # Target sequences
                 # Pad these to MAX_LEN as well
                 padded_sequences = []
                 for seq in sequences:
@@ -407,7 +413,7 @@ class MIMICDataModule(L.LightningDataModule):
 
         # Return in the order expected by your model
         ordered_keys = [
-            'X', 'X_mask', 'Y_fact', 'T', 'Y_cf', 'p', 'init_state', 'ic_mask',
+            'X', 'X_mask', 'Y_fact', "Y_fact_mask",'T', 'Y_cf', 'p', 'init_state', 'ic_mask',
             't_X', 't_Y', 't_full', 'full_fact_traj', 'full_CF_traj',
             'valid_lengths'
         ]

@@ -135,7 +135,8 @@ def main(args):
                                       icu_stays_path=args.icu_stays_path, 
                                       batch_size=args.batch_size, 
                                       num_workers=0,
-                                      random_state=args.seed)
+                                      random_state=args.seed,
+                                      max_samples=args.max_samples)
         data_module.setup()
         unique_dir_name = f"MIMIC_DATA_seed={args.seed}" # Simplified name for now
 
@@ -240,7 +241,7 @@ def main(args):
         logger=wandb_logger,
         log_every_n_steps=6,
         callbacks=callbacks,
-        gradient_clip_val=0.1,  # Start with 1.0, adjust if needed
+        gradient_clip_val=1,  # Start with 1.0, adjust if needed
         gradient_clip_algorithm="norm"
         #fast_dev_run = True,
         #overfit_batches = 1
@@ -339,6 +340,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=128, help='Training batch size')
     parser.add_argument('--max_epochs', type=int, default=200, help='Maximum number of epochs to train')
     parser.add_argument('--accelerator', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
+    parser.add_argument('--max_samples', type=str, default=None, help='Max dataset length (None for production)')
 
     
     args = parser.parse_args()

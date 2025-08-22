@@ -644,8 +644,6 @@ def get_phecode_statistics(batch_data, idx_key='next_idx_padded', len_key='next_
 
 def zenker_derivatives(y, device):
 
-    print(f"Y shape: {y.shape}. Expect 161 x 24")
-
     batch_size = y.shape[0]
 
     # y now contains: [i_ext (2), expert_latents (14), neural_embedding (4)]
@@ -653,8 +651,6 @@ def zenker_derivatives(y, device):
     i_ext_2 = y[:, 1].unsqueeze(1)
     p_a = y[:, 2].unsqueeze(1)
     p_v = y[:, 3].unsqueeze(1)
-    p_a = torch.clamp(p_a, min=40.0, max=200.0)  # MAP: 40-200 mmHg
-    p_v = torch.clamp(p_v, min=0.0, max=39.0)
 
     s_reflex = y[:, 4].unsqueeze(1)
     sv = y[:, 5].unsqueeze(1)
