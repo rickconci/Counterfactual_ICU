@@ -20,6 +20,7 @@ from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
 #from CV_data_6_new import create_load_save_data, CVDataModule_final
 from CV_data_beta import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
 from MIMIC_data import MIMICDataModule
+from mimic_eval import evaluate_model_simple
 
 from model_beta import Hybrid_VAE_SDE
 from utils_beta import process_input
@@ -257,6 +258,11 @@ def main(args):
     if DEBUG: print(f"[DEBUG] main_beta.py: Trainer initialized. Starting fit...")
     trainer.fit(model, data_module)
     if DEBUG: print(f"[DEBUG] main_beta.py: Trainer fit completed.")
+    # At the end of main(), after trainer.fit():
+    if args.run_eval:
+            print("Running evaluation on test set...")
+            test_results = trainer.test(model, data_module)
+            print(f"Test results: {test_results}")
     
     #test_results_IID = trainer.test(ckpt_path='last', dataloaders = cv_data_module_IID.test_dataloader())
     #test_results_OOD = trainer.test(ckpt_path='last', dataloaders = cv_data_module_OOD.test_dataloader())
@@ -330,7 +336,7 @@ if __name__ == '__main__':
     parser.add_argument('--variational_sampling', type=bool, default=False, help='If NOT using encoder, to learn a variational q distribution for the unobserved dims)')
 
 
-    parser.add_argument('--final_activation', type=str, default='none', choices=['relu', 'none'], help='Which nonlinearity to add as a final layer to the NN!')
+    parser.add_argument('--final_activation', type=str, default='none', choices=['relu', 'none', 'tanh'], help='Which nonlinearity to add as a final layer to the NN!')
     parser.add_argument('--normalise_for_SDENN', type=bool, default=True, help='Whether to normalise data when handing it to the SDE NN or just scale it )')
     parser.add_argument('--SDEnet_out_dims', type=int, default=2, help='Num output dims for SDE NN  ')
     parser.add_argument("--output_scale",type=float,default = 0.1, help = "Standard Deviation when computing GaussianNegLL between Y_true and Y_hat")
@@ -351,6 +357,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_epochs', type=int, default=200, help='Maximum number of epochs to train')
     parser.add_argument('--accelerator', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
     parser.add_argument('--max_samples', type=str, default=None, help='Max dataset length (None for production)')
+    parser.add_argument('--run_eval', action='store_true', help='Run evaluation after training')
 
     
     args = parser.parse_args()

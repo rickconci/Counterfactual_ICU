@@ -1508,17 +1508,34 @@ class Hybrid_VAE_SDE(LightningModule):
         self.log('test_KL', kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         with torch.no_grad():
-                # MSE only on valid portions
-                mse_per_sample = ((decoded_traj.mean(1) - Y) ** 2) * time_mask.unsqueeze(-1)
-                valid_mse = mse_per_sample.sum() / (time_mask.sum() * Y.shape[-1])
-                self.log('test_mse', valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            mse_per_sample = ((decoded_traj.mean(1) - Y) ** 2) * combined_mask
+            mae_per_sample = torch.abs(decoded_traj.mean(1) - Y) * combined_mask
+
+            # Normalize by total valid elements
+            valid_elements = combined_mask.sum()
+            valid_mse = mse_per_sample.sum() / valid_elements
+            valid_mae = mae_per_sample.sum() / valid_elements
+
+            self.log('test_mse', valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log('test_mae', valid_mae, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+        if batch_idx < 3 and self.debug:  # Plot first 3 batches
+            self.plot_nature_style_with_uncertainty(
+                decoded_traj,  # Full tensor with samples dimension [batch, samples, time, features]
+                Y,  # Targets [batch, time, features]
+                combined_mask,  # Mask [batch, time, features]
+                batch_idx
+            )
+            self.plot_nature_with_controls(decoded_traj, Y, combined_mask, i_ext_path, batch_idx)
+
 
             # Update the return statement:
         return {
                 'test_loss': loss,
                 'test_nll': nll,
                 'test_kl': kl_div,
-                'test_mse': valid_mse,  # Add this line
+                'test_mse': valid_mse,
+                'test_mae': valid_mae,
                 'decoded_traj': decoded_traj,
                 'true_traj': Y,
                 'mask': time_mask
@@ -1547,6 +1564,158 @@ class Hybrid_VAE_SDE(LightningModule):
         if 'theta' in checkpoint:
             self.theta = checkpoint['theta']
 
+    def plot_nature_style_with_uncertainty(self, predictions_full, targets, combined_mask, batch_idx):
+        """Nature-style plots with uncertainty bands around predictions"""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import os
+
+        plt.rcParams.update({
+            'font.size': 8,
+            'font.family': 'sans-serif',
+            'axes.linewidth': 0.8,
+            'axes.spines.top': False,
+            'axes.spines.right': False,
+            'legend.frameon': False
+        })
+
+        os.makedirs("nature_plots", exist_ok=True)
+
+        pred_mean = predictions_full.mean(1)
+        pred_std = predictions_full.std(1)
+
+        for patient_idx in range(min(3, predictions_full.shape[0])):
+            patient_mask = combined_mask[patient_idx]
+            valid_both = (patient_mask.sum(dim=1) == 2)
+            valid_indices = torch.where(valid_both)[0].cpu().numpy()
+
+            if len(valid_indices) < 5:
+                continue
+
+            time_seconds = valid_indices * 10
+
+            pred_mean_patient = pred_mean[patient_idx, valid_indices].cpu().numpy()
+            pred_std_patient = pred_std[patient_idx, valid_indices].cpu().numpy()
+            true_patient = targets[patient_idx, valid_indices].cpu().numpy()
+
+            fig, ax = plt.subplots(figsize=(7, 5))
+
+            # Plot arterial pressure
+            ax.plot(time_seconds, true_patient[:, 0],
+                    color='#2E86AB', linestyle='-', linewidth=2.0,
+                    label='Arterial pressure (true)', zorder=3)
+            ax.plot(time_seconds, pred_mean_patient[:, 0],
+                    color='#2E86AB', linestyle='--', linewidth=1.5,
+                    label='Arterial pressure (predicted)', alpha=0.9, zorder=2)
+            ax.fill_between(time_seconds,
+                            pred_mean_patient[:, 0] - pred_std_patient[:, 0],
+                            pred_mean_patient[:, 0] + pred_std_patient[:, 0],
+                            color='#2E86AB', alpha=0.2, zorder=1)
+
+            # Plot venous pressure
+            ax.plot(time_seconds, true_patient[:, 1],
+                    color='#A23B72', linestyle='-', linewidth=2.0,
+                    label='Venous pressure (true)', zorder=3)
+            ax.plot(time_seconds, pred_mean_patient[:, 1],
+                    color='#A23B72', linestyle='--', linewidth=1.5,
+                    label='Venous pressure (predicted)', alpha=0.9, zorder=2)
+            ax.fill_between(time_seconds,
+                            pred_mean_patient[:, 1] - pred_std_patient[:, 1],
+                            pred_mean_patient[:, 1] + pred_std_patient[:, 1],
+                            color='#A23B72', alpha=0.2, zorder=1)
+
+            ax.set_xlabel('Time (seconds)', fontweight='bold')
+            ax.set_ylabel('Pressure (mmHg)', fontweight='bold')
+            ax.set_title(f'Patient {patient_idx} (Batch {batch_idx})', fontweight='bold')
+            ax.legend(loc='upper right')
+            ax.grid(True, alpha=0.2)
+
+            plt.savefig(f'nature_plots/patient_{batch_idx}_{patient_idx}_uncertainty.png',
+                        dpi=300, bbox_inches='tight')
+            plt.close()
+
+    def plot_nature_with_controls(self, predictions_full, targets, combined_mask, i_ext_path, batch_idx):
+        """Nature-style plots with blood pressure + SDEnet control outputs with uncertainties"""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import os
+
+        plt.rcParams.update({
+            'font.size': 8,
+            'axes.spines.top': False,
+            'axes.spines.right': False,
+            'legend.frameon': False
+        })
+
+        os.makedirs("control_plots", exist_ok=True)
+
+        pred_mean = predictions_full.mean(1)
+        pred_std = predictions_full.std(1)
+        control_mean = i_ext_path.mean(1)
+        control_std = i_ext_path.std(1)
+
+        for patient_idx in range(min(3, predictions_full.shape[0])):
+            patient_mask = combined_mask[patient_idx]
+            valid_both = (patient_mask.sum(dim=1) == 2)
+            valid_indices = torch.where(valid_both)[0].cpu().numpy()
+
+            if len(valid_indices) < 5:
+                continue
+
+            time_seconds = valid_indices * 10
+
+            pred_mean_patient = pred_mean[patient_idx, valid_indices].cpu().numpy()
+            pred_std_patient = pred_std[patient_idx, valid_indices].cpu().numpy()
+            true_patient = targets[patient_idx, valid_indices].cpu().numpy()
+            control_mean_patient = control_mean[patient_idx, valid_indices].cpu().numpy()
+            control_std_patient = control_std[patient_idx, valid_indices].cpu().numpy()
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 8), sharex=True)
+
+            # Blood pressure plot
+            ax1.plot(time_seconds, true_patient[:, 0], 'b-', linewidth=2.0, label='Arterial BP (true)')
+            ax1.plot(time_seconds, pred_mean_patient[:, 0], 'b--', linewidth=1.5, label='Arterial BP (predicted)')
+            ax1.fill_between(time_seconds,
+                             pred_mean_patient[:, 0] - pred_std_patient[:, 0],
+                             pred_mean_patient[:, 0] + pred_std_patient[:, 0],
+                             color='blue', alpha=0.2)
+
+            ax1.plot(time_seconds, true_patient[:, 1], 'r-', linewidth=2.0, label='Venous BP (true)')
+            ax1.plot(time_seconds, pred_mean_patient[:, 1], 'r--', linewidth=1.5, label='Venous BP (predicted)')
+            ax1.fill_between(time_seconds,
+                             pred_mean_patient[:, 1] - pred_std_patient[:, 1],
+                             pred_mean_patient[:, 1] + pred_std_patient[:, 1],
+                             color='red', alpha=0.2)
+
+            ax1.set_ylabel('Pressure (mmHg)', fontweight='bold')
+            ax1.legend(loc='upper right')
+            ax1.grid(True, alpha=0.2)
+
+            # Control signals plot WITH UNCERTAINTY BANDS
+            ax2.plot(time_seconds, control_mean_patient[:, 0], 'orange', linewidth=1.5, label='Control 1')
+            ax2.fill_between(time_seconds,
+                             control_mean_patient[:, 0] - control_std_patient[:, 0],
+                             control_mean_patient[:, 0] + control_std_patient[:, 0],
+                             color='orange', alpha=0.3)
+
+            ax2.plot(time_seconds, control_mean_patient[:, 1], 'green', linewidth=1.5, label='Control 2')
+            ax2.fill_between(time_seconds,
+                             control_mean_patient[:, 1] - control_std_patient[:, 1],
+                             control_mean_patient[:, 1] + control_std_patient[:, 1],
+                             color='green', alpha=0.3)
+
+            ax2.set_xlabel('Time (seconds)', fontweight='bold')
+            ax2.set_ylabel('Control Signal', fontweight='bold')
+            ax2.legend(loc='upper right')
+            ax2.grid(True, alpha=0.2)
+            ax2.axhline(y=0, color='black', linestyle=':', alpha=0.5)
+
+            plt.suptitle(f'Patient {patient_idx} (Batch {batch_idx})', fontweight='bold')
+            plt.tight_layout()
+
+            plt.savefig(f'control_plots/patient_{batch_idx}_{patient_idx}_controls.png',
+                        dpi=300, bbox_inches='tight')
+            plt.close()
 
     def plot_mse_evolution(self, chart_type):
     
