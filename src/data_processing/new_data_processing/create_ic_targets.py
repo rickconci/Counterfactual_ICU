@@ -524,8 +524,8 @@ def inspect_physio_tensors(metadata: Dict, n_samples: int = 3) -> None:
 if __name__ == "__main__":
     # Example paths - adjust as needed
     waveforms_path = "combined_waveforms.cleaned.parquet"
-    med_metadata_path = "./med_tensors_output/med_tensors_metadata.pkl"
-    output_dir = "./physio_tensors_output"
+    med_metadata_path = "data/med_tensors_output/med_tensors_metadata.pkl"
+    output_dir = "data/physio_tensors_output"
 
     if os.path.exists(waveforms_path) and os.path.exists(med_metadata_path):
         metadata = create_physiological_tensors(

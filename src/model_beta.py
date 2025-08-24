@@ -56,6 +56,7 @@ class Hybrid_VAE_SDE(LightningModule):
                  theta, SDE_control_weighting, 
                 #SDE model params
                 num_samples, SDEnet_hidden_dim, SDEnet_depth, SDEnet_out_dims, final_activation, use_batch_norm,
+                integration_step_size, integration_method, rtol, atol,
                 #decoder params
                 decoder_output_dims, log_lik_output_scale, normalised_data, 
                 #loss
@@ -238,6 +239,11 @@ class Hybrid_VAE_SDE(LightningModule):
         self.normalised_data = normalised_data
         self.dataset = dataset
 
+        self.integration_step_size = integration_step_size
+        self.integration_method = integration_method
+        self.rtol = rtol
+        self.atol = atol
+
         ### LOSS
         self.MSE_loss = nn.MSELoss(reduction = "none")
         self.log_lik_output_scale = log_lik_output_scale
@@ -253,11 +259,15 @@ class Hybrid_VAE_SDE(LightningModule):
         # check baroreflex sensitivity
         self.physio_ranges = {
             'p_a': (39, 220.0), 'p_v': (0.0, 39.0), 's_reflex': (5, 20),
-            'sv': (40.0, 120.0), 'r_tpr_mod': (0.0, 2.0), 'f_hr_max': (2.0, 3.0),
+            'sv': (40.0, 120.0), 'r_tpr_mod': (-1.0, 1.0), 'f_hr_max': (2.0, 3.0),
             'f_hr_min': (0.4,0.6), 'r_tpr_max': (1.0,2.0), 'r_tpr_min': (0.45, 0.6),
             'ca': (2.0, 6.0), 'cv': (90.0, 120.0), 'k_width': (0.1, 0.3),
             'p_aset': (50.0, 90.0), 'tau': (15, 25)
         }
+
+        # In __init__, add these parameters (you'll need to pass them as arguments):
+        self.first_two_normalization_mu = torch.tensor([78.937, 8.505], dtype=torch.float32)
+        self.first_two_normalization_sigma = torch.tensor([23.009, 7.948], dtype=torch.float32)
 
         # Pre-compute range tensors for efficiency
         self.register_buffer('physio_min_vals', torch.tensor([self.physio_ranges[k][0] for k in
@@ -273,6 +283,7 @@ class Hybrid_VAE_SDE(LightningModule):
                                                                'p_aset', 'tau']]))
 
     def transform_sigmoid_to_physiological_ranges(self, sigmoid_values):
+        # TODO check this again in encoder setting
         """Simplified version using pre-computed ranges"""
         # Check input for NaN/inf
         if self.debug:
@@ -346,6 +357,7 @@ class Hybrid_VAE_SDE(LightningModule):
 
         valid_indices = (self.current_med_time <= t.item())  # Only past/current times
 
+        #
         med_context = []
 
         for expanded_idx in range(expanded_batch_size):
@@ -367,11 +379,11 @@ class Hybrid_VAE_SDE(LightningModule):
                     last_rate = med_values_batch[last_valid_idx].item()
                     time_since = t.item() - self.current_med_time[batch_idx, last_valid_idx].item()
                     # TODO predictions are 20min long -> 1200s
-                    recency_weight =  1 - time_since / 1200
+                    recency_weight =  max(time_since / 1200 - 1/1200, 0)
                 else:
                     # No valid measurement found
                     last_rate = 0.0
-                    recency_weight = 0.0
+                    recency_weight = 1.0
 
                 batch_context.extend([last_rate, recency_weight])
 
@@ -394,7 +406,7 @@ class Hybrid_VAE_SDE(LightningModule):
             print(f"[DEBUG] Hybrid_VAE_SDE apply_SDE_fun: t={t.item()}, y_shape={y.shape}, normalise_for_SDENN={self.normalise_for_SDENN}, include_time={self.include_time}, SDE_input_state={self.SDE_input_state}")
 
         if self.normalise_for_SDENN:
-            SDNN_expert_input_state = normalise_expert_data(y[:, self.SDEnet_out_dims:self.expert_latent_dims+self.SDEnet_out_dims])
+            SDNN_expert_input_state = self.normalise_sde_inputs(y[:, self.SDEnet_out_dims:self.expert_latent_dims+self.SDEnet_out_dims])
         else:
             SDNN_expert_input_state = y[:, self.SDEnet_out_dims:self.expert_latent_dims+self.SDEnet_out_dims]/self.divisors.to(self.device)
 
@@ -443,9 +455,9 @@ class Hybrid_VAE_SDE(LightningModule):
         SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
 
         # TODO do these clamps make sense
-        control_scales = torch.tensor([100.0, 30.0], device=SDE_NN_output_latents.device)
-        scaled_output = SDE_NN_output_latents * control_scales.unsqueeze(0)
-
+        #control_scales = torch.tensor([100.0, 30.0], device=SDE_NN_output_latents.device)
+        #scaled_output = SDE_NN_output_latents * control_scales.unsqueeze(0)
+        scaled_output = SDE_NN_output_latents
 
         if torch.isnan(SDE_NN_output_latents).any():
             print("SDE_NN_output contains NaN!")
@@ -460,6 +472,45 @@ class Hybrid_VAE_SDE(LightningModule):
             print(f"[DEBUG] Hybrid_VAE_SDE apply_SDE_fun: SDE_NN_input_shape={SDE_NN_input.shape}, SDE_NN_output_latents_shape={SDE_NN_output_latents.shape}")
         return scaled_output
 
+    def normalise_sde_inputs(self, expert_vars):
+        """
+        Normalize expert variables with different strategies:
+        - First two variables: (x - mu) / sigma
+        - Remaining variables: (x - midpoint) / (max - min)
+
+        Args:
+            expert_vars: Expert latent variables [batch, expert_latent_dims]
+
+        Returns:
+            normalized expert variables [batch, expert_latent_dims]
+        """
+        # Normalize first two expert variables with mu/sigma
+        first_two = expert_vars[:, :2]  # [batch, 2]
+        first_two_mu = self.first_two_normalization_mu.to(self.device)
+        first_two_sigma = self.first_two_normalization_sigma.to(self.device)
+        normalized_first_two = (first_two - first_two_mu) / first_two_sigma
+
+        # Normalize remaining expert variables with midpoint normalization
+        remaining_vars = expert_vars[:, 2:]  # [batch, remaining_dims]
+        if remaining_vars.shape[1] > 0:
+            # Calculate midpoints and ranges for remaining variables
+            remaining_min = self.physio_min_vals[2:].to(self.device)  # Skip first 2
+            remaining_max = self.physio_max_vals[2:].to(self.device)  # Skip first 2
+            midpoints = remaining_min + 0.5 * (remaining_max - remaining_min)
+            ranges = remaining_max - remaining_min
+
+            # Avoid division by zero
+            ranges = torch.clamp(ranges, min=1e-8)
+
+            normalized_remaining = (remaining_vars - midpoints) / ranges
+
+            # Combine normalized parts
+            normalized_expert_vars = torch.cat([normalized_first_two, normalized_remaining], dim=-1)
+        else:
+            normalized_expert_vars = normalized_first_two
+
+        return normalized_expert_vars
+
     def f(self, t, y, Tx, time_to_treatment):  # Approximate posterior drift.
         if self.debug and t.item() % 10 == 0:
             pass
@@ -469,31 +520,24 @@ class Hybrid_VAE_SDE(LightningModule):
         batch_size = y.shape[0]
 
         y_clamped = torch.cat([
-            y[:, :2],  # Keep i_ext unchanged
-            torch.clamp(y[:, 2:16], min=self.physio_min_vals, max=self.physio_max_vals),  # Clamp physio vars
-            y[:, 16:]  # Keep neural embedding unchanged
+            y[:, :self.SDEnet_out_dims],  # Keep i_ext unchanged
+            torch.clamp(y[:, self.SDEnet_out_dims:self.SDEnet_out_dims+self.expert_latent_dims], min=self.physio_min_vals, max=self.physio_max_vals),  # Clamp physio vars
+            y[:, self.SDEnet_out_dims+self.expert_latent_dims:]  # Keep neural embedding unchanged
         ], dim=1)
 
         # y now contains: [i_ext (2), expert_latents (14), neural_embedding (4)]
-        i_ext_1 = y_clamped[:, 0].unsqueeze(1)
-        i_ext_2 = y_clamped[:, 1].unsqueeze(1)
+        i_ext_SDE_1 = y_clamped[:, 0].unsqueeze(1)
+        i_ext_SDE_2 = y_clamped[:, 1].unsqueeze(1)
         c_v = y_clamped[:, 12].unsqueeze(1)
 
 
         if t.item() >= time_to_treatment: # this will always be the case when working with mimics
             dt_i_ext_SDE = self.apply_SDE_fun(t, y_clamped) * self.SDE_control_weighting
             if self.debug: print(f"dt i ext sd max: {torch.max(dt_i_ext_SDE)}")
-            #breakpoint()
             dt_i_ext_SDE_1 = dt_i_ext_SDE[:, 0].unsqueeze(1)
             dt_i_ext_SDE_2 = dt_i_ext_SDE[:, 1].unsqueeze(1)
         else:
-            dt_i_ext_SDE_1 = torch.zeros([batch_size, 1]).to(self.device)
-            dt_i_ext_SDE_2 = torch.zeros([batch_size, 1]).to(self.device)
-
-        i_ext_SDE_1 = Tx[:, None] * i_ext_1
-        i_ext_SDE_2 = Tx[:, None] * i_ext_2
-
-
+            raise ValueError("Time to treatment should always be less than t.item()")
 
 
         # Neural embedding derivatives (zeros - they evolve stochastically)
@@ -559,6 +603,7 @@ class Hybrid_VAE_SDE(LightningModule):
         # f_res contains derivatives for: i_ext (2) + expert (16) + neural (4) = 22 dims
         # We need to add derivatives for: logqp (1) + Tx (1) + time_to_tx (1) = 3 dims
         # Total should be 25 dims
+
 
         # Derivatives for Tx and time_to_tx are zero (they don't change)
         dt_tx = torch.zeros_like(f_logqp)
@@ -662,52 +707,6 @@ class Hybrid_VAE_SDE(LightningModule):
 
         return g_out
 
-    def _get_safe_init_states(self, init_states):
-        """
-        Create safe predetermined initial states for debugging.
-        Maintains the same shape as the passed init_states.
-        """
-        batch_size = init_states.shape[0]
-        num_vars = init_states.shape[1]
-
-        # Create stable cardiovascular parameter values
-        # These are normalized values that should work well with your dynamics
-        safe_values = {
-            'p_a': 1.2,  # Arterial pressure (normalized)
-            'p_v': 0.1,  # Venous pressure (normalized)
-            's_reflex': 0.5,  # Baroreflex state (0-1)
-            'sv': 0.7,  # Stroke volume (normalized)
-            'r_tpr_mod': 0.0,  # TPR modifier
-            'f_hr_max': 1.2,  # Max heart rate factor
-            'f_hr_min': 0.8,  # Min heart rate factor
-            'r_tpr_max': 1.5,  # Max TPR
-            'r_tpr_min': 0.5,  # Min TPR
-            'ca': 1.0,  # Arterial compliance
-            'cv': 1.0,  # Venous compliance
-            'k_width': 5.0,  # Sigmoid width
-            'p_aset': 1.0,  # Pressure setpoint
-            'tau': 2.0,  # Time constant
-        }
-
-        # Create tensor with safe values
-        # Assuming first 14 values correspond to the CV parameters above
-        safe_init = torch.zeros_like(init_states)
-
-        # Fill with safe values (adjust indices based on your actual parameter order)
-        safe_init[:] = torch.tensor([
-            safe_values['p_a'], safe_values['p_v'], safe_values['s_reflex'], safe_values['sv'],
-            safe_values['r_tpr_mod'], safe_values['f_hr_max'], safe_values['f_hr_min'],
-            safe_values['r_tpr_max'], safe_values['r_tpr_min'],
-            safe_values['ca'], safe_values['cv'], safe_values['k_width'],
-            safe_values['p_aset'], safe_values['tau']
-        ])[:num_vars]  # Take only as many values as needed
-
-        # If there are more variables than our safe values, fill with reasonable defaults
-        if num_vars > 14:
-            safe_init[:, 14:] = 0.5  # Default normalized value
-
-        return safe_init
-
     def _prepare_no_encoder_initial_state(self, init_states, ic_mask):
         """
         Prepares safe initial conditions for the no-encoder case.
@@ -720,10 +719,12 @@ class Hybrid_VAE_SDE(LightningModule):
         # Initialize tensor for all 14 expert variables
         safe_expert_states = torch.zeros(batch_size, self.expert_latent_dims, device=init_states.device)
 
-        # Sample from physiological ranges for all positions
-        # Generate random values between min and max for each variable
-        random_vals = torch.rand(batch_size, self.expert_latent_dims, device=init_states.device)
-        sampled_states = self.physio_min_vals + random_vals * (self.physio_max_vals - self.physio_min_vals)
+        # Use midpoint of physiological ranges for all positions
+        # Calculate midpoint between min and max for each variable
+        first_two_means = self.first_two_normalization_mu.to(init_states.device)
+        remaining_midpoints = self.physio_min_vals[2:] + 0.5 * (self.physio_max_vals[2:] - self.physio_min_vals[2:])
+        midpoint_states = torch.cat([first_two_means, remaining_midpoints])
+        sampled_states = midpoint_states.unsqueeze(0).repeat(batch_size, 1)
 
         # Start with sampled values for all positions
         safe_expert_states = sampled_states
@@ -806,15 +807,9 @@ class Hybrid_VAE_SDE(LightningModule):
         log_path = torch.zeros(batch_size, self.num_samples, 1).to(init_latents)
 
         # Add valid_time to augmented state
-        if valid_lengths is not None:
-            # TODO change this to actual length
-            valid_times = ts[torch.clamp(valid_lengths - 1, min=0, max=119)]
-            valid_times_expanded = valid_times.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
-            if self.debug: print(f"Valid times expanded shape: {valid_times_expanded.shape}. Expected: [23, 7, 1]")
-        else:
-            # Use a time beyond the end to indicate no masking needed
-            valid_times_expanded = torch.full((batch_size, self.num_samples, 1),
-                                              ts[-1] + 1.0, device=init_latents.device)
+        valid_times_expanded = valid_lengths.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
+        if self.debug: print(f"Valid times expanded shape: {valid_times_expanded.shape}. Expected: [23, 7, 1]")
+
 
 
         # Create augmented initial state
@@ -850,11 +845,11 @@ class Hybrid_VAE_SDE(LightningModule):
             sde=self,
             y0=aug_y0,
             ts=ts,
-            method='euler',
-            dt=0.1,
+            method=self.integration_method,
+            dt=self.integration_step_size,
             adaptive=True,
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=self.rtol,
+            atol=self.atol,
             options=options,
             names={'drift': 'f_aug', 'diffusion': 'g_aug'}
         )
@@ -917,6 +912,8 @@ class Hybrid_VAE_SDE(LightningModule):
 
         # Get the number of IC variables we have
         num_ic_vars = init_states.shape[-1]
+
+        # TODO compute loss over normlized values
 
         # predicted_ode_latents are already sigmoided, so use them directly
         sigmoid_predicted = predicted_ode_latents_sigmoid[:, :, :num_ic_vars]  # [batch, samples, ic_vars]

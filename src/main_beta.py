@@ -165,6 +165,11 @@ def main(args):
                            variational_encoder = args.variational_encoder,
                            encoder_w_time = args.encoder_w_time,
                            encoder_reverse_time = args.encoder_reverse_time,
+
+                           integration_step_size=args.integration_step_size,
+                           integration_method=args.integration_method,
+                           atol=args.integration_atol,
+                           rtol=args.integration_rtol,
                            
                            # New static fusion params
                            static_input_dim = data_module.static_input_dim,
@@ -294,6 +299,11 @@ if __name__ == '__main__':
     parser.add_argument('--SDEnet_depth', type=int, default=6, help='Num layeres for SDE NN  ')
     parser.add_argument('--use_batch_norm', type=bool, default=False, help='Whether to include batch norm within the SDE NN network )')
     parser.add_argument('--include_time', type=bool, default=True, help='Whether to include encoded time in the SDE NN inputs)')
+
+    parser.add_argument('--integration_step_size', type=float, default=0.1, help='Parameter dt for SDE integration')
+    parser.add_argument('--integration_method', type=str, default='euler', help='SDE integration method')
+    parser.add_argument('--integration_rtol', type=float, default=1e-3, help='SDE integration rtol')
+    parser.add_argument('--integration_atol', type=float, default=1e-3, help='SDE integration atol')
 
     parser.add_argument('--prior_tx_sigma', type=float, default=0.05, help='prior_tx_sigma defines our assumed prior noise of the stochastic control ')
     parser.add_argument('--self_reverting_prior_control', type=bool, default=False, help='Whether the control has a self reverting prior to it with a functional prior')

@@ -375,7 +375,7 @@ def load_and_inspect_tensor(tensor_path: str) -> None:
 if __name__ == "__main__":
     # Example usage - adjust paths as needed
     parquet_path = "mv_filtered_10min.parquet"
-    output_dir = "./med_tensors_output"
+    output_dir = "data/med_tensors_output"
 
     if os.path.exists(parquet_path):
         metadata = create_med_tensors_from_parquet(

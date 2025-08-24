@@ -578,9 +578,9 @@ def create_baseline_tensors(input_dir, output_dir, trajectory_metadata_path):
 if __name__ == "__main__":
     # Essential data processing
     waveforms_path = "combined_waveforms.cleaned.parquet"
-    med_metadata_path = "./med_tensors_output/med_tensors_metadata.pkl"
+    med_metadata_path = "data/med_tensors_output/med_tensors_metadata.pkl"
     med_data_path = "mv_filtered_10min.parquet"
-    output_dir = "./context_tensors_output"
+    output_dir = "data/context_tensors_output"
 
     if all(os.path.exists(p) for p in [waveforms_path, med_metadata_path, med_data_path]):
 
@@ -597,7 +597,7 @@ if __name__ == "__main__":
         # Inspect sample tensors
         inspect_context_tensors(context_metadata, n_samples=3)"""
 
-        create_baseline_tensors(input_dir="../../../data/mimic_3_data/input_data", output_dir=output_dir, trajectory_metadata_path="./med_tensors_output/med_tensors_metadata.pkl")
+        create_baseline_tensors(input_dir="../../../data/mimic_3_data/input_data", output_dir=output_dir, trajectory_metadata_path="data/med_tensors_output/med_tensors_metadata.pkl")
 
     else:
         print(f"Please ensure the following files exist:")
