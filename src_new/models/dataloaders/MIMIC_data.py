@@ -209,7 +209,7 @@ class MIMICDataset(Dataset):
         # The full trajectory for evaluation/plotting is p_in and p_out concatenated
         p_out_padded = torch.cat([
             p_out_values,
-            torch.zeros(p_out_values.shape[0], 3)
+            torch.zeros(p_out_values.shape[0], 2)
         ], dim=1)
         full_fact_traj = torch.cat([p_in_values, p_out_padded], dim=0)
         t_full = torch.cat([p_in_rel_time, p_out_rel_time])

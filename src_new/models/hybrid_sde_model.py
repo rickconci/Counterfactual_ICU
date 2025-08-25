@@ -5,7 +5,6 @@ import os
 import random
 from collections import namedtuple
 from typing import Optional, Union
-import sys
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -24,14 +23,11 @@ import torchsde
 import lightning as L
 from lightning import LightningModule
 
+from raindrop import Raindrop_v2
 
-#from CV_data_6_new import create_cv_data
-from CV_data_beta import create_cv_data
-from models_rd import Raindrop_v2
-
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'utils'))
 from utils_beta import CV_params, CV_params_divisors,  _stable_division, LinearScheduler, MLPSimple, CV_params_prior_mu, CV_params_prior_sigma, CV_params_max_min_2_5STD, CV_params_max_min_2STD, sigmoid_scale, normalize_latent_output, sigmoid
-from utils_beta import select_tensor_by_index_list_advanced, scale_unnormalised_experts, normalise_expert_data, get_last_valid_timestep_fast
-from plotting_beta import plot_trajectories_simple, plot_factuals_counterfactuals, plot_SDENN_output, plot_grouped_mse
+from utils_beta  import select_tensor_by_index_list_advanced, scale_unnormalised_experts, normalise_expert_data, get_last_valid_timestep_fast
 from train_utils import zenker_derivatives
 
 
@@ -1520,7 +1516,7 @@ class Hybrid_SDE(LightningModule):
             self.log('test_mse', valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
             self.log('test_mae', valid_mae, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
-        if batch_idx < 3 and self.debug:  # Plot first 3 batches
+        if batch_idx < 3:  # Plot first 3 batches
             self.plot_nature_style_with_uncertainty(
                 decoded_traj,  # Full tensor with samples dimension [batch, samples, time, features]
                 Y,  # Targets [batch, time, features]
@@ -1580,7 +1576,7 @@ class Hybrid_SDE(LightningModule):
             'legend.frameon': True
         })
 
-        os.makedirs("nature_plots", exist_ok=True)
+        os.makedirs(os.path.join(self.train_dir,'nature_plots'), exist_ok=True)
 
         pred_mean = predictions_full.mean(1)
         pred_std = predictions_full.std(1)
@@ -1630,8 +1626,10 @@ class Hybrid_SDE(LightningModule):
             ax.set_title(f'Patient {patient_idx} (Batch {batch_idx})', fontweight='bold')
             ax.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0)
             ax.grid(True, alpha=0.2)
-
-            plt.savefig(f'nature_plots/patient_{batch_idx}_{patient_idx}_uncertainty.png',
+            if self.log_wandb:
+                wandb.log({f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}": wandb.Image(plt)})
+            else:
+                plt.savefig(os.path.join(self.train_dir,f'nature_plots/patient_{batch_idx}_{patient_idx}_uncertainty.png'),
                         dpi=300, bbox_inches='tight')
             plt.close()
 
@@ -1648,7 +1646,7 @@ class Hybrid_SDE(LightningModule):
             'legend.frameon': True
         })
 
-        os.makedirs("control_plots", exist_ok=True)
+        os.makedirs(os.path.join(self.train_dir,"control_plots"), exist_ok=True)
 
         pred_mean = predictions_full.mean(1)
         pred_std = predictions_full.std(1)
@@ -1741,8 +1739,10 @@ class Hybrid_SDE(LightningModule):
 
             plt.suptitle(f'Patient {patient_idx} (Batch {batch_idx})', fontweight='bold')
             plt.tight_layout()
-
-            plt.savefig(f'control_plots/patient_{batch_idx}_{patient_idx}_controls.png',
+            if self.log_wandb:
+                wandb.log({f"patient_{batch_idx}_{patient_idx}_controls": wandb.Image(plt)})
+            else:
+                plt.savefig(os.path.join(self.train_dir,f'control_plots/patient_{batch_idx}_{patient_idx}_controls.png'),
                         dpi=300, bbox_inches='tight')
             plt.close()
 

@@ -15,37 +15,38 @@ echo "Checking dependencies..."
 python -c "import torch, lightning, torchsde, torch_geometric; print('All dependencies OK')"
 
 # Create logs directory
-mkdir -p logs
-mkdir -p model_checkpoints
+mkdir -p ../../results/logs
+mkdir -p ../../results/model_checkpoints
 
 # Training command
 echo "Starting training with nohup..."
-nohup python main_beta.py \
+python ../models/hybrid_sde_main.py \
     --dataset_type mimic \
     --use_encoder none \
     --num_samples 1 \
     --batch_size 32 \
     --seed 14 \
     --learning_rate 1e-4 \
-    --max_epochs 20 \
-    --data_root 'new_data_processing' \
+    --max_epochs 1 \
+    --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \
     --early_stopping True \
-    > logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+    --run_eval \
+    > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
 # Get the process ID
 TRAIN_PID=$!
 echo "Training started with PID: $TRAIN_PID"
-echo "Log file: logs/training_$(date +%Y%m%d_%H%M%S).log"
+echo "Log file: ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log"
 
 # Save PID for later reference
-echo $TRAIN_PID > logs/train_pid.txt
-echo "PID saved to logs/train_pid.txt"
+echo $TRAIN_PID > ../../results/logs/train_pid.txt
+echo "PID saved to ../../results/logs/train_pid.txt"
 
 echo ""
 echo "=== MONITORING COMMANDS ==="
-echo "View live log:    tail -f logs/training_$(date +%Y%m%d_%H%M%S).log"
+echo "View live log:    tail -f ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log"
 echo "Check if running: ps aux | grep $TRAIN_PID"
 echo "Kill training:    kill $TRAIN_PID"
 echo "Kill all python:  pkill -f main_beta.py"

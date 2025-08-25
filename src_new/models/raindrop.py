@@ -3,10 +3,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from train_utils import *
+import sys
 import os
-#os.add_dll_directory('c:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v10.1/bin')
-#os.add_dll_directory(os.path.dirname(__file__))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'utils'))
+from train_utils import *
 
 from torch.nn.parameter import Parameter
 from torch_geometric.nn.inits import uniform, glorot, zeros, ones, reset

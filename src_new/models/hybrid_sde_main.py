@@ -17,11 +17,9 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
 
-#from CV_data_6_new import create_load_save_data, CVDataModule_final
-from CV_data_beta import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
-from MIMIC_data import MIMICDataModule
+from dataloaders.MIMIC_data import MIMICDataModule
 
-from model_beta import Hybrid_VAE_SDE
+from hybrid_sde_model import Hybrid_SDE
 from utils_beta import process_input
 
 
@@ -50,12 +48,12 @@ def main(args):
     if args.HPC_work:
         torch.set_float32_matmul_precision('medium')  # Faster computations with less precision
         
-    saving_dir = os.getcwd()
-    os.environ['TMPDIR'] = os.path.join(os.getcwd(), 'Tempdir')
+    saving_dir = "../../results/"
+    os.environ['TMPDIR'] = os.path.join(os.getcwd(), '../../results/Tempdir')
     os.makedirs(os.environ['TMPDIR'], exist_ok=True)
     if DEBUG: print(f"[DEBUG] main_beta.py: Saving directory set to: {saving_dir}")
     print("Temporary directory set to:", tempfile.gettempdir())
-    os.environ['WANDB_DIR'] = os.path.join(os.getcwd(), 'Wandbdir')
+    os.environ['WANDB_DIR'] = os.path.join(os.getcwd(), '../../results/Wandbdir')
     os.makedirs(os.environ['WANDB_DIR'], exist_ok=True)
     if DEBUG: print(f"[DEBUG] main_beta.py: WANDB_DIR set to: {os.environ['WANDB_DIR']}")
     print("Setting WANDB_DIR to:", os.environ['WANDB_DIR'])
@@ -149,7 +147,7 @@ def main(args):
 
 
     if DEBUG: print(f"[DEBUG] main_beta.py: Initializing Hybrid_VAE_SDE model.")
-    model = Hybrid_VAE_SDE(use_encoder = args.use_encoder,
+    model = Hybrid_SDE(use_encoder = args.use_encoder,
                            start_dec_at_treatment = args.start_dec_at_treatment, 
                            variational_sampling = args.variational_sampling,
 
@@ -200,7 +198,7 @@ def main(args):
                            log_lik_output_scale = args.output_scale,
 
                            #admin
-                           train_dir = os.path.join(saving_dir, 'figures', unique_dir_name), 
+                           train_dir = os.path.join(saving_dir, unique_dir_name),
                            KL_weighting_SDE = args.KL_weighting_SDE, 
                            learning_rate = args.learning_rate,
                            log_wandb = args.log_wandb,
@@ -210,6 +208,7 @@ def main(args):
                            dataset = args.dataset_type,
                            debug = args.debug # <<< Pass debug flag >>>
     )
+    os.makedirs(model.train_dir, exist_ok=True)
     if DEBUG: print(f"[DEBUG] main_beta.py: Hybrid_VAE_SDE model initialized.")
 
 
