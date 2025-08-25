@@ -885,12 +885,13 @@ class Hybrid_VAE_SDE(LightningModule):
             #print('latent_out', latent_out[1, 0, :, 0])
             #print('latent_out', latent_out[1, 1, :, 0])
             #print('latent device', latent_out.device)
-        if self.normalised_data:
-            latent_out = normalise_expert_data(latent_out)
-        else:
-            divisors = self.divisors.view(1, 1, 1, self.expert_latent_dims).to(latent_out.device)
-            latent_out = latent_out / divisors
 
+        # TODO turned off normalization because our decoder is the ODE
+        #if self.normalised_data:
+          #  latent_out = normalise_expert_data(latent_out)
+        #else:
+        #    divisors = self.divisors.view(1, 1, 1, self.expert_latent_dims).to(latent_out.device)
+        #    latent_out = latent_out / divisors
         output_traj = select_tensor_by_index_list_advanced(latent_out, self.decoder_output_dims)
 
         pa = torch.clamp(output_traj[..., 0], min=40.0, max=220.0)

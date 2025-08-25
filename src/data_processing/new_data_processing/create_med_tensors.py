@@ -174,7 +174,7 @@ def process_single_trajectory(
         for _, row in item_infusions.iterrows():
             # Get rate value
             rate_value = 0.0
-            for rate_col in ['rate']:
+            for rate_col in ['rate/weight_normalized']:
                 if rate_col in row and pd.notna(row[rate_col]):
                     rate_value = float(row[rate_col])
                     break
@@ -337,8 +337,8 @@ def create_med_tensors_from_parquet(
     summary_stats = {
         'total_trajectories': len(trajectories),
         'total_tensor_files': len(saved_files),
-        'unique_hadm_ids': df['hadm_id'].nunique(),
-        'unique_action_cluster_ids': df['action_cluster_id'].nunique(),
+        'unique_hadm_ids': df_triggers['hadm_id'].nunique(),
+        'unique_action_cluster_ids': df_triggers['action_cluster_id'].nunique(),
         'unique_item_labels': len(unique_item_labels),
         'time_grid_intervals': n_intervals,
         'interval_seconds': interval_seconds,

@@ -20,7 +20,6 @@ from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
 #from CV_data_6_new import create_load_save_data, CVDataModule_final
 from CV_data_beta import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
 from MIMIC_data import MIMICDataModule
-from mimic_eval import evaluate_model_simple
 
 from model_beta import Hybrid_VAE_SDE
 from utils_beta import process_input
@@ -159,7 +158,7 @@ def main(args):
                            encoder_hidden_dim = args.encoder_hidden_dim,
                            expert_latent_dims  = 14, # Fixed by the ODE model #todo check that
                            encoder_SDENN_dims = 0 if args.use_encoder == 'none' else args.encoder_SDENN_dims,
-                           n_medications=20, # TODO fix this with new meds tensors
+                           n_medications=22,
 
                            use_2_5std_encoder_minmax = args.use_2_5std_encoder_minmax,
                            encoder_num_layers = args.encoder_num_layers,

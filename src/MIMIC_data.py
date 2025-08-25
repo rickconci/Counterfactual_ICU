@@ -197,7 +197,7 @@ class MIMICDataset(Dataset):
             print(f"Warning: Using dummy meds context for {traj_key}")
             n_context_intervals = 6
             n_medications = med_traj_values.shape[1] if hasattr(med_traj_values, 'shape') and len(
-                med_traj_values.shape) > 1 else 20
+                med_traj_values.shape) > 1 else 22
             context_meds_values = torch.zeros(n_context_intervals, n_medications)
             context_meds_mask = torch.zeros(n_context_intervals, n_medications)
             context_meds_time_hr = torch.arange(-6, 0, dtype=torch.float32) * (10 / 60)  # -1.0, -0.83, etc.

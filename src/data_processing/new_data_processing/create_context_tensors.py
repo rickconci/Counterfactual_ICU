@@ -155,7 +155,7 @@ def load_waveforms_data(parquet_path: str) -> pd.DataFrame:
         df['absolute_timestamp'] = pd.to_datetime(df['absolute_timestamp'])
 
     # Check for required physio columns
-    required_physio = ['ABP MEAN', 'CVP', 'HR', 'RESP']
+    required_physio = ['ABP MEAN_z', 'CVP_z', 'HR_z', 'RESP_z']
     available_physio = [col for col in required_physio if col in df.columns]
     missing_physio = [col for col in required_physio if col not in df.columns]
 
@@ -174,7 +174,7 @@ def load_medication_data(parquet_path: str) -> pd.DataFrame:
     df = pd.read_parquet(parquet_path)
 
     # Check required columns
-    required_cols = ['hadm_id', 'start_time', 'end_time', 'rate', 'item_label']
+    required_cols = ['hadm_id', 'start_time', 'end_time', 'rate/weight_normalized', 'item_label']
     missing_cols = [col for col in required_cols if col not in df.columns]
 
     if missing_cols:
@@ -336,8 +336,8 @@ def create_meds_context_tensor(
         for _, row in item_infusions.iterrows():
             # Get rate value
             rate_value = 0.0
-            if 'rate' in row and pd.notna(row['rate']):
-                rate_value = float(row['rate'])
+            if 'rate' in row and pd.notna(row['rate/weight_normalized']):
+                rate_value = float(row['rate/weight_normalized'])
 
             if rate_value == 0.0:
                 continue
@@ -585,7 +585,7 @@ if __name__ == "__main__":
     if all(os.path.exists(p) for p in [waveforms_path, med_metadata_path, med_data_path]):
 
         # Create context tensors
-        """context_metadata = create_context_tensors(
+        context_metadata = create_context_tensors(
             waveforms_parquet_path=waveforms_path,
             med_tensors_metadata_path=med_metadata_path,
             med_data_parquet_path=med_data_path,
@@ -595,9 +595,9 @@ if __name__ == "__main__":
         )
 
         # Inspect sample tensors
-        inspect_context_tensors(context_metadata, n_samples=3)"""
+        inspect_context_tensors(context_metadata, n_samples=3)
 
-        create_baseline_tensors(input_dir="../../../data/mimic_3_data/input_data", output_dir=output_dir, trajectory_metadata_path="data/med_tensors_output/med_tensors_metadata.pkl")
+        #create_baseline_tensors(input_dir="../../../data/mimic_3_data/input_data", output_dir=output_dir, trajectory_metadata_path="data/med_tensors_output/med_tensors_metadata.pkl")
 
     else:
         print(f"Please ensure the following files exist:")
