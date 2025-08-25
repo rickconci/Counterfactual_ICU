@@ -31,7 +31,7 @@ python ../models/hybrid_sde_main.py \
     --log_wandb True \
     --model_checkpoint True \
     --early_stopping True \
-    --integration_step_size 1 \
+    --integration_step_size 10 \
     --run_eval \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
