@@ -258,9 +258,9 @@ class Hybrid_VAE_SDE(LightningModule):
 
         # check baroreflex sensitivity
         self.physio_ranges = {
-            'p_a': (39, 220.0), 'p_v': (0.0, 39.0), 's_reflex': (5, 20),
+            'p_a': (39, 220.0), 'p_v': (0.0, 39.0), 's_reflex': (0, 1),
             'sv': (40.0, 120.0), 'r_tpr_mod': (-1.0, 1.0), 'f_hr_max': (2.0, 3.0),
-            'f_hr_min': (0.4,0.6), 'r_tpr_max': (1.0,2.0), 'r_tpr_min': (0.45, 0.6),
+            'f_hr_min': (0.5,1), 'r_tpr_max': (1.0,2.0), 'r_tpr_min': (0.45, 0.6),
             'ca': (2.0, 6.0), 'cv': (90.0, 120.0), 'k_width': (0.1, 0.3),
             'p_aset': (50.0, 90.0), 'tau': (15, 25)
         }
@@ -1576,7 +1576,7 @@ class Hybrid_VAE_SDE(LightningModule):
             'axes.linewidth': 0.8,
             'axes.spines.top': False,
             'axes.spines.right': False,
-            'legend.frameon': False
+            'legend.frameon': True
         })
 
         os.makedirs("nature_plots", exist_ok=True)
@@ -1599,7 +1599,7 @@ class Hybrid_VAE_SDE(LightningModule):
             true_patient = targets[patient_idx, valid_indices].cpu().numpy()
 
             fig, ax = plt.subplots(figsize=(7, 5))
-
+            ax.set_xlim(0, 1200)
             # Plot arterial pressure
             ax.plot(time_seconds, true_patient[:, 0],
                     color='#2E86AB', linestyle='-', linewidth=2.0,
@@ -1627,7 +1627,7 @@ class Hybrid_VAE_SDE(LightningModule):
             ax.set_xlabel('Time (seconds)', fontweight='bold')
             ax.set_ylabel('Pressure (mmHg)', fontweight='bold')
             ax.set_title(f'Patient {patient_idx} (Batch {batch_idx})', fontweight='bold')
-            ax.legend(loc='upper right')
+            ax.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0)
             ax.grid(True, alpha=0.2)
 
             plt.savefig(f'nature_plots/patient_{batch_idx}_{patient_idx}_uncertainty.png',
@@ -1635,7 +1635,7 @@ class Hybrid_VAE_SDE(LightningModule):
             plt.close()
 
     def plot_nature_with_controls(self, predictions_full, targets, combined_mask, i_ext_path, batch_idx):
-        """Nature-style plots with blood pressure + SDEnet control outputs with uncertainties"""
+        """Plot BP + controls, controls only when BP data is present"""
         import matplotlib.pyplot as plt
         import numpy as np
         import os
@@ -1644,7 +1644,7 @@ class Hybrid_VAE_SDE(LightningModule):
             'font.size': 8,
             'axes.spines.top': False,
             'axes.spines.right': False,
-            'legend.frameon': False
+            'legend.frameon': True
         })
 
         os.makedirs("control_plots", exist_ok=True)
@@ -1655,58 +1655,86 @@ class Hybrid_VAE_SDE(LightningModule):
         control_std = i_ext_path.std(1)
 
         for patient_idx in range(min(3, predictions_full.shape[0])):
-            patient_mask = combined_mask[patient_idx]
-            valid_both = (patient_mask.sum(dim=1) == 2)
-            valid_indices = torch.where(valid_both)[0].cpu().numpy()
+            patient_mask = combined_mask[patient_idx]  # [time, features]
 
-            if len(valid_indices) < 5:
-                continue
+            time_seconds = np.arange(patient_mask.shape[0]) * 10
 
-            time_seconds = valid_indices * 10
+            pred_mean_patient = pred_mean[patient_idx].cpu().numpy()
+            pred_std_patient = pred_std[patient_idx].cpu().numpy()
+            true_patient = targets[patient_idx].cpu().numpy()
+            control_mean_patient = control_mean[patient_idx].cpu().numpy()
+            control_std_patient = control_std[patient_idx].cpu().numpy()
 
-            pred_mean_patient = pred_mean[patient_idx, valid_indices].cpu().numpy()
-            pred_std_patient = pred_std[patient_idx, valid_indices].cpu().numpy()
-            true_patient = targets[patient_idx, valid_indices].cpu().numpy()
-            control_mean_patient = control_mean[patient_idx, valid_indices].cpu().numpy()
-            control_std_patient = control_std[patient_idx, valid_indices].cpu().numpy()
+            # Individual masks for each BP measurement
+            arterial_mask = patient_mask[:, 0].cpu().numpy().astype(bool)
+            venous_mask = patient_mask[:, 1].cpu().numpy().astype(bool)
+
+            # Control mask: show controls only when at least one BP is present
+            bp_available_mask = arterial_mask | venous_mask
 
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 8), sharex=True)
 
-            # Blood pressure plot
-            ax1.plot(time_seconds, true_patient[:, 0], 'b-', linewidth=2.0, label='Arterial BP (true)')
-            ax1.plot(time_seconds, pred_mean_patient[:, 0], 'b--', linewidth=1.5, label='Arterial BP (predicted)')
+            # Blood pressure plot (each where available)
+            arterial_true = true_patient[:, 0].copy()
+            arterial_pred = pred_mean_patient[:, 0].copy()
+            arterial_std = pred_std_patient[:, 0].copy()
+            arterial_true[~arterial_mask] = np.nan
+            arterial_pred[~arterial_mask] = np.nan
+            arterial_std[~arterial_mask] = np.nan
+
+            ax1.plot(time_seconds, arterial_true, 'b-', linewidth=2.0, label='Arterial BP (true)')
+            ax1.plot(time_seconds, arterial_pred, 'b--', linewidth=1.5, label='Arterial BP (predicted)')
+            ax1.set_xlim(0, 1200)
             ax1.fill_between(time_seconds,
-                             pred_mean_patient[:, 0] - pred_std_patient[:, 0],
-                             pred_mean_patient[:, 0] + pred_std_patient[:, 0],
+                             arterial_pred - arterial_std,
+                             arterial_pred + arterial_std,
                              color='blue', alpha=0.2)
 
-            ax1.plot(time_seconds, true_patient[:, 1], 'r-', linewidth=2.0, label='Venous BP (true)')
-            ax1.plot(time_seconds, pred_mean_patient[:, 1], 'r--', linewidth=1.5, label='Venous BP (predicted)')
+            venous_true = true_patient[:, 1].copy()
+            venous_pred = pred_mean_patient[:, 1].copy()
+            venous_std = pred_std_patient[:, 1].copy()
+            venous_true[~venous_mask] = np.nan
+            venous_pred[~venous_mask] = np.nan
+            venous_std[~venous_mask] = np.nan
+
+            ax1.plot(time_seconds, venous_true, 'r-', linewidth=2.0, label='Venous BP (true)')
+            ax1.plot(time_seconds, venous_pred, 'r--', linewidth=1.5, label='Venous BP (predicted)')
             ax1.fill_between(time_seconds,
-                             pred_mean_patient[:, 1] - pred_std_patient[:, 1],
-                             pred_mean_patient[:, 1] + pred_std_patient[:, 1],
+                             venous_pred - venous_std,
+                             venous_pred + venous_std,
                              color='red', alpha=0.2)
 
             ax1.set_ylabel('Pressure (mmHg)', fontweight='bold')
-            ax1.legend(loc='upper right')
+            ax1.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0)
             ax1.grid(True, alpha=0.2)
 
-            # Control signals plot WITH UNCERTAINTY BANDS
-            ax2.plot(time_seconds, control_mean_patient[:, 0], 'orange', linewidth=1.5, label='Control 1')
+            # Control signals (only when at least one BP measurement is present)
+            control1_values = control_mean_patient[:, 0].copy()
+            control1_std_values = control_std_patient[:, 0].copy()
+            control2_values = control_mean_patient[:, 1].copy()
+            control2_std_values = control_std_patient[:, 1].copy()
+
+            # Mask controls where no BP data is available
+            control1_values[~bp_available_mask] = np.nan
+            control1_std_values[~bp_available_mask] = np.nan
+            control2_values[~bp_available_mask] = np.nan
+            control2_std_values[~bp_available_mask] = np.nan
+
+            ax2.plot(time_seconds, control1_values, 'orange', linewidth=1.5, label='Control 1')
             ax2.fill_between(time_seconds,
-                             control_mean_patient[:, 0] - control_std_patient[:, 0],
-                             control_mean_patient[:, 0] + control_std_patient[:, 0],
+                             control1_values - control1_std_values,
+                             control1_values + control1_std_values,
                              color='orange', alpha=0.3)
 
-            ax2.plot(time_seconds, control_mean_patient[:, 1], 'green', linewidth=1.5, label='Control 2')
+            ax2.plot(time_seconds, control2_values, 'green', linewidth=1.5, label='Control 2')
             ax2.fill_between(time_seconds,
-                             control_mean_patient[:, 1] - control_std_patient[:, 1],
-                             control_mean_patient[:, 1] + control_std_patient[:, 1],
+                             control2_values - control2_std_values,
+                             control2_values + control2_std_values,
                              color='green', alpha=0.3)
 
             ax2.set_xlabel('Time (seconds)', fontweight='bold')
             ax2.set_ylabel('Control Signal', fontweight='bold')
-            ax2.legend(loc='upper right')
+            ax2.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0)
             ax2.grid(True, alpha=0.2)
             ax2.axhline(y=0, color='black', linestyle=':', alpha=0.5)
 

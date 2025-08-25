@@ -523,7 +523,7 @@ def inspect_physio_tensors(metadata: Dict, n_samples: int = 3) -> None:
 # Example usage
 if __name__ == "__main__":
     # Example paths - adjust as needed
-    waveforms_path = "combined_waveforms.cleaned.parquet"
+    waveforms_path = "combined_waveforms_cleaned_smooth.parquet"
     med_metadata_path = "data/med_tensors_output/med_tensors_metadata.pkl"
     output_dir = "data/physio_tensors_output"
 

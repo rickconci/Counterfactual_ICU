@@ -155,7 +155,7 @@ def load_waveforms_data(parquet_path: str) -> pd.DataFrame:
         df['absolute_timestamp'] = pd.to_datetime(df['absolute_timestamp'])
 
     # Check for required physio columns
-    required_physio = ['ABP MEAN', 'NBP MEAN', 'CVP', 'HR', 'RESP']
+    required_physio = ['ABP MEAN', 'CVP', 'HR', 'RESP']
     available_physio = [col for col in required_physio if col in df.columns]
     missing_physio = [col for col in required_physio if col not in df.columns]
 
@@ -212,7 +212,7 @@ def create_physio_context_tensor(
     context_end_time = t0_time
 
     # Initialize arrays: [ABP MEAN, NBP MEAN, CVP, HR, RESP]
-    physio_measurements = ['ABP MEAN', 'NBP MEAN', 'CVP', 'HR', 'RESP']
+    physio_measurements = ['ABP MEAN', 'CVP', 'HR', 'RESP']
     n_measurements = len(physio_measurements)
 
     values_array = np.zeros((n_intervals, n_measurements), dtype=np.float32)

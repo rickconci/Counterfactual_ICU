@@ -716,7 +716,15 @@ def dpa(p_a, p_v, r_tpr, sv, f_hr, c_a):
 
     Returns: dpa_dt, the derivative of the arterial pressure
     """
-    return (1 / (c_a * 100))*(((p_a-p_v)/r_tpr) - sv*f_hr)
+
+    outflow = (p_a - p_v) / r_tpr  # ml/s
+    inflow = sv * f_hr  # ml/s
+    dva_dt = -1. * outflow + inflow
+
+    # Pressure derivatives exactly as specified
+    dpa_dt = dva_dt / (c_a * 100.)
+
+    return dpa_dt
 
 def dpv(dpa_dt, c_a, c_v):
     """
@@ -730,7 +738,7 @@ def dpv(dpa_dt, c_a, c_v):
 
     """
     # TODO note to self: we do not include ANY control here and assume this will be handled during the forward latent step (dependent on which model)
-    return (1/(c_v*10))*(-c_a*dpa_dt)
+    return (1/(c_v*10))*(-100.*c_a*dpa_dt)
 
 def dsdt(tau, k_width, p_a, p_aset, s_reflex):
 
