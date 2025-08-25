@@ -26,8 +26,7 @@ python ../models/hybrid_sde_main.py \
     --num_samples 1 \
     --batch_size 32 \
     --seed 14 \
-    --learning_rate 1e-4 \
-    --max_epochs 1 \
+    --max_epochs 20 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \
