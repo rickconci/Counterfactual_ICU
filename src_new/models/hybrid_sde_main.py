@@ -359,7 +359,4 @@ if __name__ == '__main__':
 
     
     args = parser.parse_args()
-    # <<< Control stdout redirection based on DEBUG >>>
-    if not args.debug:
-        sys.stdout = open('Hybrid_SDE_output_beta.txt', 'w')
     main(args)
