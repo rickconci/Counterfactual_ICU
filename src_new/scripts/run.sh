@@ -32,6 +32,10 @@ python ../models/hybrid_sde_main.py \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 10 \
+    --HPC_work True \
+    --rtol 1e-2 \
+    --atol 1e-2 \
+    --integration_adaptive True \
     --run_eval \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 

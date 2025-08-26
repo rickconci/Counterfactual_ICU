@@ -52,7 +52,7 @@ class Hybrid_SDE(LightningModule):
                  theta, SDE_control_weighting, 
                 #SDE model params
                 num_samples, SDEnet_hidden_dim, SDEnet_depth, SDEnet_out_dims, final_activation, use_batch_norm,
-                integration_step_size, integration_method, rtol, atol,
+                integration_step_size, integration_method, rtol, atol, integration_adaptive,
                 #decoder params
                 decoder_output_dims, log_lik_output_scale, normalised_data, 
                 #loss
@@ -239,6 +239,7 @@ class Hybrid_SDE(LightningModule):
         self.integration_method = integration_method
         self.rtol = rtol
         self.atol = atol
+        self.integration_adaptive = integration_adaptive
 
         ### LOSS
         self.MSE_loss = nn.MSELoss(reduction = "none")
@@ -843,7 +844,7 @@ class Hybrid_SDE(LightningModule):
             ts=ts,
             method=self.integration_method,
             dt=self.integration_step_size,
-            adaptive=True,
+            adaptive=self.integration_adaptive,
             rtol=self.rtol,
             atol=self.atol,
             options=options,

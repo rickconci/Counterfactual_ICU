@@ -168,6 +168,7 @@ def main(args):
                            integration_method=args.integration_method,
                            atol=args.integration_atol,
                            rtol=args.integration_rtol,
+                           integration_adaptive=args.integration_adaptive,
                            
                            # New static fusion params
                            static_input_dim = data_module.static_input_dim,
@@ -308,6 +309,7 @@ if __name__ == '__main__':
     parser.add_argument('--integration_method', type=str, default='euler', help='SDE integration method')
     parser.add_argument('--integration_rtol', type=float, default=1e-3, help='SDE integration rtol')
     parser.add_argument('--integration_atol', type=float, default=1e-3, help='SDE integration atol')
+    parser.add_argument('--integration_adaptive', type=bool, default=True, help='Use adaptive SDE integration?')
 
     parser.add_argument('--prior_tx_sigma', type=float, default=0.05, help='prior_tx_sigma defines our assumed prior noise of the stochastic control ')
     parser.add_argument('--self_reverting_prior_control', type=bool, default=False, help='Whether the control has a self reverting prior to it with a functional prior')
