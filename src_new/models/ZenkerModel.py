@@ -113,20 +113,6 @@ class ZenkerODE:
         dpa_dt = dva_dt / (self.ca * 100.)
         dpv_dt = -100.*self.ca*dpa_dt / (self.cv * 10.)
 
-        # Debug on first call to show scaling imbalance
-        if not hasattr(self, '_scaling_debug'):
-            self._scaling_debug = True
-            print(f"\n🔍 SCALING DEBUG at t=0:")
-            print(f"  Inflow:  {inflow:.1f} ml/s")
-            print(f"  Outflow: {outflow:.1f} ml/s")
-            print(f"  dva_dt:  {dva_dt:.1f} ml/s")
-            print(f"\n📊 SCALING FACTORS:")
-            print(f"  Arterial: ca*100 = {self.ca}*100 = {self.ca * 100}")
-            print(f"  Venous:   cv*10  = {self.cv}*10  = {self.cv * 10}")
-            print(f"  Ratio: Venous changes {(self.ca * 100) / (self.cv * 10):.1f}x FASTER than arterial!")
-            print(f"\n⚠️  PRESSURE DERIVATIVES:")
-            print(f"  dpa_dt: {dva_dt:.1f}/{self.ca * 100} = {dpa_dt:.4f} mmHg/s")
-            print(f"  → Venous pressure changing {abs(dpv_dt / dpa_dt if dpa_dt != 0 else float('inf')):.1f}x faster!")
 
         # Reflex derivative exactly as specified
         sigmoid = 1. / (1 + np.exp(-self.k_width * (p_a - self.p_aset)))
@@ -156,17 +142,12 @@ class ZenkerODE:
         y0 = self.get_initial_conditions()
         y0 = self.apply_physiological_clamps(y0)
 
-        print(f"Initial conditions: p_a={y0[0]:.1f}, p_v={y0[1]:.1f}, s_reflex={y0[2]:.3f}, sv={y0[3]:.1f}")
-
         # Integrate ODE
         self.solution = odeint(self.derivatives, y0, self.t)
 
         # Post-integration clamping if enabled
         if self.use_physiological_clamping:
             self.solution = np.clip(self.solution, self.physio_min, self.physio_max)
-
-        # Plot results
-        self.plot()
 
         return self.t, self.solution
 

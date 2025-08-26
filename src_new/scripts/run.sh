@@ -24,14 +24,16 @@ nohup python ../models/hybrid_sde_main.py \
     --dataset_type mimic \
     --use_encoder none \
     --num_samples 3 \
-    --batch_size 64 \
+    --batch_size 32 \
     --seed 14 \
     --max_epochs 5 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \
     --early_stopping True \
+    --integration_step_size 1 \
     --HPC_work True \
+    --SDE_control_weighting 10.0 \
     --run_eval \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 

@@ -804,7 +804,6 @@ class Hybrid_SDE(LightningModule):
         # Prepare standard augmented state components
         Tx_expanded = Tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
         if self.debug: print(f"Tx expanded shape: {Tx_expanded.shape}. Expected: [23 x 7 x 1]")
-        print(time_to_tx)
 
         time_to_tx_expanded = time_to_tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
         i_ext = torch.zeros(batch_size, self.num_samples, self.SDEnet_out_dims).to(init_latents)
@@ -1531,7 +1530,7 @@ class Hybrid_SDE(LightningModule):
                 combined_mask,  # Mask [batch, time, features]
                 batch_idx
             )
-            self.plot_nature_with_controls(decoded_traj, Y, combined_mask, i_ext_path, batch_idx)
+            self.plot_nature_with_controls(decoded_traj, Y, combined_mask, i_ext_path, batch_idx, z1_for_sde)
 
 
             # Update the return statement:
@@ -1546,6 +1545,32 @@ class Hybrid_SDE(LightningModule):
                 'mask': time_mask
             }
 
+    def on_test_epoch_end(self):
+        """Log final test metrics to wandb"""
+        if self.log_wandb:
+            # Get the logged metrics
+            test_results = {
+                'final_test_loss': self.trainer.callback_metrics.get('test_total_loss', 0),
+                'final_test_mse': self.trainer.callback_metrics.get('test_mse', 0),
+                'final_test_mae': self.trainer.callback_metrics.get('test_mae', 0),
+                'final_test_nll': self.trainer.callback_metrics.get('test_NLL', 0),
+                'final_test_kl': self.trainer.callback_metrics.get('test_KL', 0)
+            }
+
+            # Log final summary
+            wandb.log(test_results)
+
+            # Create a summary table
+            test_summary = [
+                ['Metric', 'Value'],
+                ['Total Loss', f"{test_results['final_test_loss']:.4f}"],
+                ['MSE', f"{test_results['final_test_mse']:.4f}"],
+                ['MAE', f"{test_results['final_test_mae']:.4f}"],
+                ['NLL', f"{test_results['final_test_nll']:.4f}"],
+                ['KL Divergence', f"{test_results['final_test_kl']:.4f}"]
+            ]
+
+            wandb.log({"test_summary_table": wandb.Table(data=test_summary[1:], columns=test_summary[0])})
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr = self.learning_rate)
         
@@ -1569,22 +1594,41 @@ class Hybrid_SDE(LightningModule):
         if 'theta' in checkpoint:
             self.theta = checkpoint['theta']
 
+
+    def _setup_plot_style(self):
+            """Shared plotting style configuration"""
+            plt.rcParams.update({
+                'font.size': 8,
+                'font.family': 'sans-serif',
+                'axes.linewidth': 0.8,
+                'axes.spines.top': False,
+                'axes.spines.right': False,
+                'legend.frameon': True
+            })
+
+            # Define consistent color scheme
+            colors = {
+                'arterial_true': '#2E86AB',
+                'arterial_pred': '#2E86AB',
+                'arterial_baseline': '#2E86AB',
+                'venous_true': '#A23B72',
+                'venous_pred': '#A23B72',
+                'venous_baseline': '#A23B72',
+                'control1': '#F18F01',  # Orange
+                'control2': '#C73E1D',  # Red
+                'derivative1': '#F18F01',
+                'derivative2': '#C73E1D'
+            }
+            return colors
+
     def plot_nature_style_with_uncertainty(self, predictions_full, targets, combined_mask, batch_idx):
         """Nature-style plots with uncertainty bands around predictions"""
         import matplotlib.pyplot as plt
         import numpy as np
         import os
 
-        plt.rcParams.update({
-            'font.size': 8,
-            'font.family': 'sans-serif',
-            'axes.linewidth': 0.8,
-            'axes.spines.top': False,
-            'axes.spines.right': False,
-            'legend.frameon': True
-        })
-
-        os.makedirs(os.path.join(self.train_dir,'nature_plots'), exist_ok=True)
+        colors = self._setup_plot_style()
+        os.makedirs(os.path.join(self.train_dir, 'nature_plots'), exist_ok=True)
 
         pred_mean = predictions_full.mean(1)
         pred_std = predictions_full.std(1)
@@ -1598,63 +1642,57 @@ class Hybrid_SDE(LightningModule):
                 continue
 
             time_seconds = valid_indices * 10
-
             pred_mean_patient = pred_mean[patient_idx, valid_indices].cpu().numpy()
             pred_std_patient = pred_std[patient_idx, valid_indices].cpu().numpy()
             true_patient = targets[patient_idx, valid_indices].cpu().numpy()
 
             fig, ax = plt.subplots(figsize=(7, 5))
             ax.set_xlim(0, 1200)
-            # Plot arterial pressure
+
+            # Use consistent colors and styling
             ax.plot(time_seconds, true_patient[:, 0],
-                    color='#2E86AB', linestyle='-', linewidth=2.0,
+                    color=colors['arterial_true'], linestyle='-', linewidth=2.0,
                     label='Arterial pressure (true)', zorder=3)
             ax.plot(time_seconds, pred_mean_patient[:, 0],
-                    color='#2E86AB', linestyle='--', linewidth=1.5,
+                    color=colors['arterial_pred'], linestyle='--', linewidth=1.5,
                     label='Arterial pressure (predicted)', alpha=0.9, zorder=2)
             ax.fill_between(time_seconds,
                             pred_mean_patient[:, 0] - pred_std_patient[:, 0],
                             pred_mean_patient[:, 0] + pred_std_patient[:, 0],
-                            color='#2E86AB', alpha=0.2, zorder=1)
+                            color=colors['arterial_pred'], alpha=0.2, zorder=1)
 
-            # Plot venous pressure
             ax.plot(time_seconds, true_patient[:, 1],
-                    color='#A23B72', linestyle='-', linewidth=2.0,
+                    color=colors['venous_true'], linestyle='-', linewidth=2.0,
                     label='Venous pressure (true)', zorder=3)
             ax.plot(time_seconds, pred_mean_patient[:, 1],
-                    color='#A23B72', linestyle='--', linewidth=1.5,
+                    color=colors['venous_pred'], linestyle='--', linewidth=1.5,
                     label='Venous pressure (predicted)', alpha=0.9, zorder=2)
             ax.fill_between(time_seconds,
                             pred_mean_patient[:, 1] - pred_std_patient[:, 1],
                             pred_mean_patient[:, 1] + pred_std_patient[:, 1],
-                            color='#A23B72', alpha=0.2, zorder=1)
+                            color=colors['venous_pred'], alpha=0.2, zorder=1)
 
             ax.set_xlabel('Time (seconds)', fontweight='bold')
             ax.set_ylabel('Pressure (mmHg)', fontweight='bold')
             ax.set_title(f'Patient {patient_idx} (Batch {batch_idx})', fontweight='bold')
             ax.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0)
             ax.grid(True, alpha=0.2)
+
             if self.log_wandb:
                 wandb.log({f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}": wandb.Image(plt)})
             else:
-                plt.savefig(os.path.join(self.train_dir,f'nature_plots/patient_{batch_idx}_{patient_idx}_uncertainty.png'),
-                        dpi=300, bbox_inches='tight')
+                plt.savefig(
+                    os.path.join(self.train_dir, f'nature_plots/patient_{batch_idx}_{patient_idx}_uncertainty.png'),
+                    dpi=300, bbox_inches='tight')
             plt.close()
 
-    def plot_nature_with_controls(self, predictions_full, targets, combined_mask, i_ext_path, batch_idx):
-        """Plot BP + controls, controls only when BP data is present"""
-        import matplotlib.pyplot as plt
-        import numpy as np
-        import os
+    def plot_nature_with_controls(self, predictions_full, targets, combined_mask, i_ext_path, batch_idx,
+                                  z1_for_sde=None):
+        """Plot BP + controls with Zenker baseline and detailed control analysis"""
+        from ZenkerModel import ZenkerODE
 
-        plt.rcParams.update({
-            'font.size': 8,
-            'axes.spines.top': False,
-            'axes.spines.right': False,
-            'legend.frameon': True
-        })
-
-        os.makedirs(os.path.join(self.train_dir,"control_plots"), exist_ok=True)
+        colors = self._setup_plot_style()  # Use same style
+        os.makedirs(os.path.join(self.train_dir, "control_plots"), exist_ok=True)
 
         pred_mean = predictions_full.mean(1)
         pred_std = predictions_full.std(1)
@@ -1662,8 +1700,7 @@ class Hybrid_SDE(LightningModule):
         control_std = i_ext_path.std(1)
 
         for patient_idx in range(min(3, predictions_full.shape[0])):
-            patient_mask = combined_mask[patient_idx]  # [time, features]
-
+            patient_mask = combined_mask[patient_idx]
             time_seconds = np.arange(patient_mask.shape[0]) * 10
 
             pred_mean_patient = pred_mean[patient_idx].cpu().numpy()
@@ -1672,16 +1709,48 @@ class Hybrid_SDE(LightningModule):
             control_mean_patient = control_mean[patient_idx].cpu().numpy()
             control_std_patient = control_std[patient_idx].cpu().numpy()
 
-            # Individual masks for each BP measurement
             arterial_mask = patient_mask[:, 0].cpu().numpy().astype(bool)
             venous_mask = patient_mask[:, 1].cpu().numpy().astype(bool)
-
-            # Control mask: show controls only when at least one BP is present
             bp_available_mask = arterial_mask | venous_mask
 
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 8), sharex=True)
+            # Extract ALL initial conditions from z1_for_sde
+            if z1_for_sde is not None:
+                patient_z1 = z1_for_sde[patient_idx, 0].cpu().numpy()
+                p_a_init, p_v_init, s_reflex_init, sv_init = patient_z1[:4]
+                r_tpr_mod, f_hr_max, f_hr_min, r_tpr_max, r_tpr_min = patient_z1[4:9]
+                ca, cv, k_width, p_aset, tau = patient_z1[9:14]
+            else:
+                p_a_init, p_v_init, s_reflex_init, sv_init = 80.0, 8.0, 0.5, 70.0
+                r_tpr_mod, f_hr_max, f_hr_min = 0.0, 3.0, 0.5
+                r_tpr_max, r_tpr_min = 2.0, 0.8
+                ca, cv = 2.0, 20.0
+                k_width, p_aset, tau = 0.05, 100.0, 20.0
 
-            # Blood pressure plot (each where available)
+            # Run Zenker baseline
+            zenker_model = ZenkerODE(
+                p_a_init=float(p_a_init), p_v_init=float(p_v_init),
+                s_reflex_init=float(s_reflex_init), sv_init=float(sv_init),
+                r_tpr_mod=float(r_tpr_mod), f_hr_max=float(f_hr_max), f_hr_min=float(f_hr_min),
+                r_tpr_max=float(r_tpr_max), r_tpr_min=float(r_tpr_min),
+                ca=float(ca), cv=float(cv), k_width=float(k_width),
+                p_aset=float(p_aset), tau=float(tau),
+                use_physiological_clamping=True
+            )
+
+            t_zenker, solution_zenker = zenker_model.integrate(
+                t_span=time_seconds[-1], dt=self.integration_step_size
+            )
+            zenker_pa = np.interp(time_seconds, t_zenker, solution_zenker[:, 0])
+            zenker_pv = np.interp(time_seconds, t_zenker, solution_zenker[:, 1])
+
+            # Calculate derivatives
+            sde_derivatives = np.zeros_like(control_mean_patient)
+            sde_derivatives[1:] = np.diff(control_mean_patient, axis=0) / 10.0
+            sde_derivatives[0] = sde_derivatives[1]
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 10), sharex=True)
+
+            # === TOP PANEL: Use same styling as uncertainty plots ===
             arterial_true = true_patient[:, 0].copy()
             arterial_pred = pred_mean_patient[:, 0].copy()
             arterial_std = pred_std_patient[:, 0].copy()
@@ -1689,13 +1758,14 @@ class Hybrid_SDE(LightningModule):
             arterial_pred[~arterial_mask] = np.nan
             arterial_std[~arterial_mask] = np.nan
 
-            ax1.plot(time_seconds, arterial_true, 'b-', linewidth=2.0, label='Arterial BP (true)')
-            ax1.plot(time_seconds, arterial_pred, 'b--', linewidth=1.5, label='Arterial BP (predicted)')
-            ax1.set_xlim(0, 1200)
-            ax1.fill_between(time_seconds,
-                             arterial_pred - arterial_std,
-                             arterial_pred + arterial_std,
-                             color='blue', alpha=0.2)
+            ax1.plot(time_seconds, arterial_true, color=colors['arterial_true'],
+                     linestyle='-', linewidth=2.0, label='Arterial BP (true)')
+            ax1.plot(time_seconds, arterial_pred, color=colors['arterial_pred'],
+                     linestyle='--', linewidth=1.5, label='Arterial BP (predicted)')
+            ax1.plot(time_seconds, zenker_pa, color=colors['arterial_baseline'],
+                     linestyle=':', linewidth=2.0, alpha=0.7, label='Arterial BP (Zenker baseline)')
+            ax1.fill_between(time_seconds, arterial_pred - arterial_std, arterial_pred + arterial_std,
+                             color=colors['arterial_pred'], alpha=0.2)
 
             venous_true = true_patient[:, 1].copy()
             venous_pred = pred_mean_patient[:, 1].copy()
@@ -1704,54 +1774,66 @@ class Hybrid_SDE(LightningModule):
             venous_pred[~venous_mask] = np.nan
             venous_std[~venous_mask] = np.nan
 
-            ax1.plot(time_seconds, venous_true, 'r-', linewidth=2.0, label='Venous BP (true)')
-            ax1.plot(time_seconds, venous_pred, 'r--', linewidth=1.5, label='Venous BP (predicted)')
-            ax1.fill_between(time_seconds,
-                             venous_pred - venous_std,
-                             venous_pred + venous_std,
-                             color='red', alpha=0.2)
+            ax1.plot(time_seconds, venous_true, color=colors['venous_true'],
+                     linestyle='-', linewidth=2.0, label='Venous BP (true)')
+            ax1.plot(time_seconds, venous_pred, color=colors['venous_pred'],
+                     linestyle='--', linewidth=1.5, label='Venous BP (predicted)')
+            ax1.plot(time_seconds, zenker_pv, color=colors['venous_baseline'],
+                     linestyle=':', linewidth=2.0, alpha=0.7, label='Venous BP (Zenker baseline)')
+            ax1.fill_between(time_seconds, venous_pred - venous_std, venous_pred + venous_std,
+                             color=colors['venous_pred'], alpha=0.2)
 
+            ax1.set_xlim(0, 1200)
             ax1.set_ylabel('Pressure (mmHg)', fontweight='bold')
-            ax1.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0)
+            ax1.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0, fontsize=7)
             ax1.grid(True, alpha=0.2)
 
-            # Control signals (only when at least one BP measurement is present)
+            # === BOTTOM PANEL: Consistent control styling ===
+            sde_deriv_1 = sde_derivatives[:, 0].copy()
+            sde_deriv_2 = sde_derivatives[:, 1].copy()
+            sde_deriv_1[~bp_available_mask] = np.nan
+            sde_deriv_2[~bp_available_mask] = np.nan
+
+            ax2.plot(time_seconds, sde_deriv_1, color=colors['derivative1'],
+                     linewidth=1.0, linestyle='-', label='SDE derivative 1', alpha=0.8)
+            ax2.plot(time_seconds, sde_deriv_2, color=colors['derivative2'],
+                     linewidth=1.0, linestyle='-', label='SDE derivative 2', alpha=0.8)
+
             control1_values = control_mean_patient[:, 0].copy()
             control1_std_values = control_std_patient[:, 0].copy()
             control2_values = control_mean_patient[:, 1].copy()
             control2_std_values = control_std_patient[:, 1].copy()
 
-            # Mask controls where no BP data is available
             control1_values[~bp_available_mask] = np.nan
             control1_std_values[~bp_available_mask] = np.nan
             control2_values[~bp_available_mask] = np.nan
             control2_std_values[~bp_available_mask] = np.nan
 
-            ax2.plot(time_seconds, control1_values, 'orange', linewidth=1.5, label='Control 1')
-            ax2.fill_between(time_seconds,
-                             control1_values - control1_std_values,
-                             control1_values + control1_std_values,
-                             color='orange', alpha=0.3)
+            ax2.plot(time_seconds, control1_values, color=colors['control1'],
+                     linewidth=2.0, label='Integrated control 1')
+            ax2.fill_between(time_seconds, control1_values - control1_std_values,
+                             control1_values + control1_std_values, color=colors['control1'], alpha=0.3)
 
-            ax2.plot(time_seconds, control2_values, 'green', linewidth=1.5, label='Control 2')
-            ax2.fill_between(time_seconds,
-                             control2_values - control2_std_values,
-                             control2_values + control2_std_values,
-                             color='green', alpha=0.3)
+            ax2.plot(time_seconds, control2_values, color=colors['control2'],
+                     linewidth=2.0, label='Integrated control 2')
+            ax2.fill_between(time_seconds, control2_values - control2_std_values,
+                             control2_values + control2_std_values, color=colors['control2'], alpha=0.3)
 
             ax2.set_xlabel('Time (seconds)', fontweight='bold')
             ax2.set_ylabel('Control Signal', fontweight='bold')
-            ax2.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0)
+            ax2.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0, fontsize=7)
             ax2.grid(True, alpha=0.2)
             ax2.axhline(y=0, color='black', linestyle=':', alpha=0.5)
 
             plt.suptitle(f'Patient {patient_idx} (Batch {batch_idx})', fontweight='bold')
             plt.tight_layout()
+
             if self.log_wandb:
-                wandb.log({f"patient_{batch_idx}_{patient_idx}_controls": wandb.Image(plt)})
+                wandb.log({f"enhanced_control_plot_batch_{batch_idx}_patient_{patient_idx}": wandb.Image(plt)})
             else:
-                plt.savefig(os.path.join(self.train_dir,f'control_plots/patient_{batch_idx}_{patient_idx}_controls.png'),
-                        dpi=300, bbox_inches='tight')
+                plt.savefig(
+                    os.path.join(self.train_dir, f'control_plots/patient_{batch_idx}_{patient_idx}_enhanced.png'),
+                    dpi=300, bbox_inches='tight')
             plt.close()
 
     def plot_mse_evolution(self, chart_type):

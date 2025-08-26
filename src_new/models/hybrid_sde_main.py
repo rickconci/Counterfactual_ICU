@@ -314,7 +314,7 @@ if __name__ == '__main__':
     parser.add_argument('--integration_atol', type=float, default=1e-3, help='SDE integration atol')
     parser.add_argument('--integration_adaptive', type=bool, default=True, help='Use adaptive SDE integration?')
 
-    parser.add_argument('--prior_tx_sigma', type=float, default=0.05, help='prior_tx_sigma defines our assumed prior noise of the stochastic control ')
+    parser.add_argument('--prior_tx_sigma', type=float, default=0.1, help='prior_tx_sigma defines our assumed prior noise of the stochastic control ')
     parser.add_argument('--self_reverting_prior_control', type=bool, default=False, help='Whether the control has a self reverting prior to it with a functional prior')
     parser.add_argument('--KL_weighting_SDE', type=float, default=0.001, help='Defines the weighting to the KL loss for the SDE')
 
