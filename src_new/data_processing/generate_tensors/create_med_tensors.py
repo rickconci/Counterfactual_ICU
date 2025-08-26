@@ -37,7 +37,7 @@ def load_and_prepare_data(parquet_path: str) -> Tuple[pd.DataFrame, pd.DataFrame
 def identify_trajectories(df_full: pd.DataFrame, df_triggers: pd.DataFrame, trajectory_duration_minutes: int = 20) -> Dict:
     """
     Group by hadm_id and action_cluster_id to identify trajectories.
-    Each trajectory lasts 20 minutes OR until the start of the next action_cluster_id.
+    Each trajectory lasts trajectory_duration_minutes OR until the start of the next action_cluster_id.
     """
     print("Identifying trajectories and calculating trajectory windows...")
 
@@ -61,7 +61,7 @@ def identify_trajectories(df_full: pd.DataFrame, df_triggers: pd.DataFrame, traj
             t0_time = row['t0_time']
 
             # Calculate trajectory end time
-            # Option 1: 20 minutes after t0
+            # Option 1: configurable minutes after t0
             end_time_20min = t0_time + pd.Timedelta(minutes=trajectory_duration_minutes)
 
             # Option 2: Start of next action_cluster_id
@@ -99,27 +99,26 @@ def identify_trajectories(df_full: pd.DataFrame, df_triggers: pd.DataFrame, traj
     print(f"  Std: {np.std(durations):.2f} minutes")
     print(f"  Min: {np.min(durations):.2f} minutes")
     print(f"  Max: {np.max(durations):.2f} minutes")
-    print(f"  Full 20min trajectories: {sum(1 for d in durations if d >= 19.9)}")
-    print(f"  Truncated trajectories: {sum(1 for d in durations if d < 19.9)}")
+    print(f"  Full {trajectory_duration_minutes}min trajectories: {sum(1 for d in durations if d >= (trajectory_duration_minutes - 0.1))}")
+    print(f"  Truncated trajectories: {sum(1 for d in durations if d < (trajectory_duration_minutes - 0.1))}")
 
     return trajectories
 
 
-def create_time_grid(trajectories: Dict, interval_seconds: int = 10) -> Dict:
+def create_time_grid(trajectories: Dict, interval_seconds: int = 10, trajectory_duration_minutes: int = 20) -> Dict:
     """
-    Create time grid parameters. Since trajectories are max 20 minutes,
-    we can set a fixed grid size.
+    Create time grid parameters using the configured maximum forward duration.
     """
     print("Creating time grid parameters...")
 
-    # Maximum trajectory duration is 20 minutes = 1200 seconds
-    max_duration_seconds = 20 * 60  # 20 minutes
+    # Maximum trajectory duration is configurable (default 20 minutes)
+    max_duration_seconds = trajectory_duration_minutes * 60
     n_intervals = int(np.ceil(max_duration_seconds / interval_seconds))
 
     # Verify this covers all trajectories
     actual_max_duration = max(traj['duration_minutes'] for traj in trajectories.values()) * 60
 
-    print(f"Fixed trajectory duration: {max_duration_seconds} seconds (20 minutes)")
+    print(f"Fixed trajectory duration: {max_duration_seconds} seconds ({trajectory_duration_minutes} minutes)")
     print(f"Actual max trajectory duration: {actual_max_duration:.1f} seconds")
     print(f"Time grid will have {n_intervals} intervals of {interval_seconds} seconds each")
 
@@ -240,6 +239,7 @@ def create_med_tensors_from_parquet(
         parquet_path: str,
         output_dir: str = "./med_tensors_output",
         interval_seconds: int = 10,
+        trajectory_duration_minutes: int = 20,
         n_workers: int = 1
 ) -> Dict:
     """
@@ -263,7 +263,11 @@ def create_med_tensors_from_parquet(
     df_full, df_triggers = load_and_prepare_data(parquet_path)
 
     # Step 2: Identify trajectories using trigger data, but get all meds from full data
-    trajectories = identify_trajectories(df_full, df_triggers)
+    trajectories = identify_trajectories(
+        df_full,
+        df_triggers,
+        trajectory_duration_minutes=trajectory_duration_minutes,
+    )
 
     # Step 3: Get unique item labels from FULL dataset (all medications)
     unique_item_labels = sorted(df_full['item_label'].unique().tolist())
@@ -271,8 +275,12 @@ def create_med_tensors_from_parquet(
     for i, label in enumerate(unique_item_labels):
         print(f"  {i}: {label}")
 
-    # Step 4: Create time grid parameters
-    grid_params = create_time_grid(trajectories, interval_seconds)
+    # Step 4: Create time grid parameters respecting configurable forward duration
+    grid_params = create_time_grid(
+        trajectories,
+        interval_seconds,
+        trajectory_duration_minutes=trajectory_duration_minutes,
+    )
     n_intervals = grid_params['n_intervals']
 
     # Step 5: Process each trajectory
