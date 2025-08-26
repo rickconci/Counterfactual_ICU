@@ -345,49 +345,56 @@ class Hybrid_SDE(LightningModule):
         return z1, z1_logvar, logqp0
 
     def get_medication_context(self, t, expanded_batch_size):
-        """
-        For each medication, return [last_rate, recency_weight] at time t
-        """
-        # Map expanded batch indices back to original batch indices
-        original_batch_size = self.current_med_values.shape[0]
-        if self.debug: print(f"Current med values shape: {self.current_med_values.shape}")
+        # TODO check this again
+        """Fully vectorized medication context handling intermittent availability"""
+        batch_size, time_steps, n_meds = self.current_med_values.shape
 
-        valid_indices = (self.current_med_time <= t.item())  # Only past/current times
+        # Create valid mask: time ≤ t AND medication is actually present
+        time_valid = (self.current_med_time <= t.item())  # (batch, time)
+        med_present = (self.current_med_mask > 0)  # (batch, time, meds)
+        valid_mask = time_valid.unsqueeze(-1) & med_present  # (batch, time, meds)
 
-        #
-        med_context = []
+        # Create time indices for argmax trick
+        time_indices = torch.arange(time_steps, device=self.device).float()  # (time,)
+        time_indices = time_indices.unsqueeze(0).unsqueeze(-1)  # (1, time, 1)
+        time_indices = time_indices.expand(batch_size, -1, n_meds)  # (batch, time, meds)
 
-        for expanded_idx in range(expanded_batch_size):
-            # Map back to original batch index
-            batch_idx = expanded_idx % original_batch_size
-            batch_context = []
+        # Where invalid, set to large negative number so argmax ignores them
+        masked_indices = torch.where(
+            valid_mask,
+            time_indices,
+            torch.full_like(time_indices, -1e6)
+        )  # (batch, time, meds)
 
-            for med_idx in range(self.current_med_values.shape[-1]):  # For each medication
-                # Find last valid rate for this med in this batch
-                med_mask_batch = self.current_med_mask[batch_idx, :, med_idx]  # (time,)
-                med_values_batch = self.current_med_values[batch_idx, :, med_idx]  # (time,)
+        # Find last valid time index for each (batch, med) pair
+        last_valid_indices = masked_indices.argmax(dim=1)  # (batch, meds)
 
+        # Check if any valid data exists (max index > -1e6 means we found valid data)
+        has_valid_data = (masked_indices.max(dim=1)[0] > -1e5)  # (batch, meds)
 
-                # Find last valid measurement ≤ t
-                valid_mask = valid_indices[batch_idx] & (med_mask_batch > 0)
+        # Gather the values using advanced indexing
+        batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(1)  # (batch, 1)
+        med_idx = torch.arange(n_meds, device=self.device).unsqueeze(0)  # (1, meds)
 
-                if torch.any(valid_mask):
-                    last_valid_idx = torch.where(valid_mask)[0][-1]  # Last valid index
-                    last_rate = med_values_batch[last_valid_idx].item()
-                    time_since = t.item() - self.current_med_time[batch_idx, last_valid_idx].item()
-                    # TODO predictions are 20min long -> 1200s
-                    recency_weight =  max(time_since / 1200 - 1/1200, 0)
-                else:
-                    # No valid measurement found
-                    last_rate = 0.0
-                    recency_weight = 1.0
+        # Get last rates and times
+        last_rates = self.current_med_values[batch_idx, last_valid_indices, med_idx]  # (batch, meds)
+        last_times = self.current_med_time[batch_idx, last_valid_indices]  # (batch, meds)
 
-                batch_context.extend([last_rate, recency_weight])
+        # Calculate recency weights
+        time_since = t.item() - last_times
+        recency_weights = torch.clamp(time_since / 1200 - 1 / 1200, min=0)
 
-            med_context.append(batch_context)
+        # Set defaults where no valid data exists
+        last_rates = torch.where(has_valid_data, last_rates, torch.zeros_like(last_rates))
+        recency_weights = torch.where(has_valid_data, recency_weights, torch.ones_like(recency_weights))
 
-        return torch.tensor(med_context, device=self.device, dtype=torch.float32)
+        # Interleave rates and weights: [rate1, weight1, rate2, weight2, ...]
+        result = torch.stack([last_rates, recency_weights], dim=-1)  # (batch, meds, 2)
+        result = result.flatten(start_dim=1)  # (batch, meds*2)
 
+        # Expand for multiple samples per batch element
+        samples_per_batch = expanded_batch_size // batch_size
+        return result.repeat_interleave(samples_per_batch, dim=0)
 
     def apply_SDE_fun(self, t, y):
         """

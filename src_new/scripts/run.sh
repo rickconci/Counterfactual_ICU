@@ -26,7 +26,7 @@ nohup python ../models/hybrid_sde_main.py \
     --num_samples 3 \
     --batch_size 64 \
     --seed 14 \
-    --max_epochs 10 \
+    --max_epochs 5 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \

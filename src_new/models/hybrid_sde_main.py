@@ -129,10 +129,13 @@ def main(args):
         data_module.setup() # Need to call this to get dims
 
     elif args.dataset_type == 'mimic':
+        num_workers = 0
+        if args.HPC_work:
+            num_workers = 4
         data_module = MIMICDataModule(data_root=args.data_root,
                                       icu_stays_path=args.icu_stays_path, 
                                       batch_size=args.batch_size, 
-                                      num_workers=4,
+                                      num_workers=num_workers,
                                       random_state=args.seed,
                                       max_samples=args.max_samples)
         data_module.setup()
