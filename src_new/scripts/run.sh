@@ -34,6 +34,8 @@ nohup python ../models/hybrid_sde_main.py \
     --integration_step_size 1 \
     --HPC_work True \
     --SDE_control_weighting 10.0 \
+    --prior_tx_sigma 1 \
+    --output_scale \
     --run_eval \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 

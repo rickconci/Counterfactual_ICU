@@ -461,7 +461,7 @@ class Hybrid_SDE(LightningModule):
         # TODO do these clamps make sense
         #control_scales = torch.tensor([100.0, 30.0], device=SDE_NN_output_latents.device)
         #scaled_output = SDE_NN_output_latents * control_scales.unsqueeze(0)
-        scaled_output = SDE_NN_output_latents
+        scaled_output = SDE_NN_output_latents * self.SDE_control_weighting
 
         if torch.isnan(SDE_NN_output_latents).any():
             print("SDE_NN_output contains NaN!")
@@ -472,8 +472,10 @@ class Hybrid_SDE(LightningModule):
         #print('SDE_NN_output_latents example', SDE_NN_output_latents[0, :])
         has_nonzero = SDE_NN_output_latents.ne(0.).any()
         #print('SDE_NN Has non-0 OUTPUT??', has_nonzero)
-        if self.debug and t.item() % 10 == 0:
+        if self.debug and t.item() % 100 == 0:
             print(f"[DEBUG] Hybrid_SDE apply_SDE_fun: SDE_NN_input_shape={SDE_NN_input.shape}, SDE_NN_output_latents_shape={SDE_NN_output_latents.shape}")
+            print(f"Scaled output: {scaled_output}")
+
         return scaled_output
 
     def normalise_sde_inputs(self, expert_vars):
@@ -536,7 +538,7 @@ class Hybrid_SDE(LightningModule):
 
 
         if t.item() >= time_to_treatment: # this will always be the case when working with mimics
-            dt_i_ext_SDE = self.apply_SDE_fun(t, y_clamped) * self.SDE_control_weighting
+            dt_i_ext_SDE = self.apply_SDE_fun(t, y_clamped)
             if self.debug: print(f"dt i ext sd max: {torch.max(dt_i_ext_SDE)}")
             dt_i_ext_SDE_1 = dt_i_ext_SDE[:, 0].unsqueeze(1)
             dt_i_ext_SDE_2 = dt_i_ext_SDE[:, 1].unsqueeze(1)
@@ -810,7 +812,7 @@ class Hybrid_SDE(LightningModule):
         log_path = torch.zeros(batch_size, self.num_samples, 1).to(init_latents)
 
         # Add valid_time to augmented state
-        valid_times_expanded = valid_lengths.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
+        valid_times_expanded = (valid_lengths * 10).unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
         if self.debug: print(f"Valid times expanded shape: {valid_times_expanded.shape}. Expected: [23, 7, 1]")
 
 
@@ -1714,17 +1716,12 @@ class Hybrid_SDE(LightningModule):
             bp_available_mask = arterial_mask | venous_mask
 
             # Extract ALL initial conditions from z1_for_sde
-            if z1_for_sde is not None:
-                patient_z1 = z1_for_sde[patient_idx, 0].cpu().numpy()
-                p_a_init, p_v_init, s_reflex_init, sv_init = patient_z1[:4]
-                r_tpr_mod, f_hr_max, f_hr_min, r_tpr_max, r_tpr_min = patient_z1[4:9]
-                ca, cv, k_width, p_aset, tau = patient_z1[9:14]
-            else:
-                p_a_init, p_v_init, s_reflex_init, sv_init = 80.0, 8.0, 0.5, 70.0
-                r_tpr_mod, f_hr_max, f_hr_min = 0.0, 3.0, 0.5
-                r_tpr_max, r_tpr_min = 2.0, 0.8
-                ca, cv = 2.0, 20.0
-                k_width, p_aset, tau = 0.05, 100.0, 20.0
+
+            patient_z1 = z1_for_sde[patient_idx, 0].cpu().numpy()
+            p_a_init, p_v_init, s_reflex_init, sv_init = patient_z1[:4]
+            r_tpr_mod, f_hr_max, f_hr_min, r_tpr_max, r_tpr_min = patient_z1[4:9]
+            ca, cv, k_width, p_aset, tau = patient_z1[9:14]
+
 
             # Run Zenker baseline
             zenker_model = ZenkerODE(
