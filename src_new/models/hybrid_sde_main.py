@@ -132,7 +132,7 @@ def main(args):
         data_module = MIMICDataModule(data_root=args.data_root,
                                       icu_stays_path=args.icu_stays_path, 
                                       batch_size=args.batch_size, 
-                                      num_workers=0,
+                                      num_workers=4,
                                       random_state=args.seed,
                                       max_samples=args.max_samples)
         data_module.setup()

@@ -20,22 +20,18 @@ mkdir -p ../../results/model_checkpoints
 
 # Training command
 echo "Starting training with nohup..."
-python ../models/hybrid_sde_main.py \
+nohup python ../models/hybrid_sde_main.py \
     --dataset_type mimic \
     --use_encoder none \
-    --num_samples 1 \
-    --batch_size 32 \
+    --num_samples 3 \
+    --batch_size 64 \
     --seed 14 \
-    --max_epochs 20 \
+    --max_epochs 10 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \
     --early_stopping True \
-    --integration_step_size 10 \
     --HPC_work True \
-    --rtol 1e-2 \
-    --atol 1e-2 \
-    --integration_adaptive True \
     --run_eval \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
