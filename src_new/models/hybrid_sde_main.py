@@ -235,7 +235,7 @@ def main(args):
         early_stopping = EarlyStopping(
             min_delta=0.00,
             monitor='val_total_loss',        # Ensure this is the exact name used in your logging
-            patience=100,                    # num epochs with a val loss not improving before it stops 
+            patience=args.early_stopping_patience,                    # num epochs with a val loss not improving before it stops
             mode='min',                     # Minimize the monitored value
             verbose=True
         )
@@ -361,6 +361,7 @@ if __name__ == '__main__':
     parser.add_argument('--accelerator', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
     parser.add_argument('--max_samples', type=str, default=None, help='Max dataset length (None for production)')
     parser.add_argument('--run_eval', action='store_true', help='Run evaluation after training')
+    parser.add_argument('--early_stopping_patience', type = int, default = 20)
 
     
     args = parser.parse_args()
