@@ -574,6 +574,7 @@ def create_baseline_tensors(input_dir, output_dir, trajectory_metadata_path):
     with open(trajectory_metadata_path, 'rb') as f:
         trajectory_data = pickle.load(f)
     valid_hadm_ids = list(trajectory_data['trajectories'].keys())
+    valid_hadm_ids = [int(s.split('_')[0]) if '_' in s else int(s) for s in valid_hadm_ids]
     print(f"Found {len(valid_hadm_ids)} patients with trajectories.")
 
     # Load raw MIMIC data tables from the 'hosp' module
@@ -606,8 +607,10 @@ def create_baseline_tensors(input_dir, output_dir, trajectory_metadata_path):
     merged_df['DISCHTIME'] = pd.to_datetime(merged_df['DISCHTIME'])
     merged_df['ADMIT_DURATION'] = (merged_df['DISCHTIME'] - merged_df['ADMITTIME']).dt.total_seconds() / (3600 * 24)
 
+
     # Filter by the valid hadm_ids that have trajectories
     merged_df_final_filtered = merged_df[merged_df['HADM_ID'].isin(valid_hadm_ids)]
+
 
     # Apply additional filters as requested
     merged_with_disch_df_final_filtered = merged_df_final_filtered[merged_df_final_filtered['ADMIT_DURATION'] <= 10]
@@ -663,15 +666,15 @@ def create_baseline_tensors(input_dir, output_dir, trajectory_metadata_path):
 # Example usage
 if __name__ == "__main__":
     # Essential data processing
-    waveforms_path = "combined_waveforms.cleaned.parquet"
-    med_metadata_path = "data/med_tensors_output/med_tensors_metadata.pkl"
-    med_data_path = "mv_filtered_10min.parquet"
-    output_dir = "data/context_tensors_output"
+    waveforms_path = "../../../data/mimic_3_data/processed_data/combined_waveforms_cleaned_smooth.parquet"
+    med_metadata_path = "../../../data/mimic_3_data/processed_data/med_tensors_output/med_tensors_metadata.pkl"
+    med_data_path = "../../../data/mimic_3_data/processed_data/mv_filtered_10min.parquet"
+    output_dir = "../../../data/mimic_3_data/processed_data/context_tensors_output"
 
     if all(os.path.exists(p) for p in [waveforms_path, med_metadata_path, med_data_path]):
 
         # Create context tensors
-        context_metadata = create_context_tensors(
+        """context_metadata = create_context_tensors(
             waveforms_parquet_path=waveforms_path,
             med_tensors_metadata_path=med_metadata_path,
             med_data_parquet_path=med_data_path,
@@ -681,11 +684,14 @@ if __name__ == "__main__":
         )
 
         # Inspect sample tensors
-        inspect_context_tensors(context_metadata, n_samples=3)
+        inspect_context_tensors(context_metadata, n_samples=3)"""
 
-        #create_baseline_tensors(input_dir="../../../data/mimic_3_data/input_data", output_dir=output_dir, trajectory_metadata_path="data/med_tensors_output/med_tensors_metadata.pkl")
+        create_baseline_tensors(input_dir="../../../data/mimic_3_data/input_data", output_dir=output_dir, trajectory_metadata_path="../../../data/mimic_3_data/processed_data/med_tensors_output/med_tensors_metadata.pkl")
 
     else:
+        for p in [waveforms_path, med_metadata_path, med_data_path]:
+            if not os.path.exists(p):
+                print(p)
         print(f"Please ensure the following files exist:")
         print(f"  - Waveforms: {waveforms_path}")
         print(f"  - Med metadata: {med_metadata_path}")
