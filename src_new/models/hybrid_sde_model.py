@@ -1870,36 +1870,52 @@ class Hybrid_SDE(LightningModule):
             ax1.legend(loc='upper right', fancybox=False, facecolor='white', framealpha=1.0, fontsize=7)
             ax1.grid(True, alpha=0.2)
 
-            # === BOTTOM PANEL: Consistent control styling ===
-            sde_deriv_1 = sde_derivatives[:, 0].copy()
-            sde_deriv_2 = sde_derivatives[:, 1].copy()
-            sde_deriv_1[~bp_available_mask] = np.nan
-            sde_deriv_2[~bp_available_mask] = np.nan
+            # === BOTTOM PANEL: Plot a variable number of SDE control dims ===
+            num_controls = control_mean_patient.shape[1] if control_mean_patient.ndim == 2 else 1
 
-            ax2.plot(time_seconds, sde_deriv_1, color=colors['derivative1'],
-                     linewidth=1.0, linestyle='-', label='SDE derivative 1', alpha=0.8)
-            ax2.plot(time_seconds, sde_deriv_2, color=colors['derivative2'],
-                     linewidth=1.0, linestyle='-', label='SDE derivative 2', alpha=0.8)
+            # Build a color palette for arbitrary number of controls
+            control_cmap = plt.cm.get_cmap('tab10', num_controls)
 
-            control1_values = control_mean_patient[:, 0].copy()
-            control1_std_values = control_std_patient[:, 0].copy()
-            control2_values = control_mean_patient[:, 1].copy()
-            control2_std_values = control_std_patient[:, 1].copy()
+            for control_idx in range(num_controls):
+                # Derivative of the control signal
+                deriv_values = sde_derivatives[:, control_idx].copy()
+                deriv_values[~bp_available_mask] = np.nan
 
-            control1_values[~bp_available_mask] = np.nan
-            control1_std_values[~bp_available_mask] = np.nan
-            control2_values[~bp_available_mask] = np.nan
-            control2_std_values[~bp_available_mask] = np.nan
+                # Integrated control signal and its std
+                control_values = control_mean_patient[:, control_idx].copy()
+                control_std_values = control_std_patient[:, control_idx].copy()
+                control_values[~bp_available_mask] = np.nan
+                control_std_values[~bp_available_mask] = np.nan
 
-            ax2.plot(time_seconds, control1_values, color=colors['control1'],
-                     linewidth=2.0, label='Integrated control 1')
-            ax2.fill_between(time_seconds, control1_values - control1_std_values,
-                             control1_values + control1_std_values, color=colors['control1'], alpha=0.3)
+                color = control_cmap(control_idx)
 
-            ax2.plot(time_seconds, control2_values, color=colors['control2'],
-                     linewidth=2.0, label='Integrated control 2')
-            ax2.fill_between(time_seconds, control2_values - control2_std_values,
-                             control2_values + control2_std_values, color=colors['control2'], alpha=0.3)
+                # Plot derivative (thin line)
+                ax2.plot(
+                    time_seconds,
+                    deriv_values,
+                    color=color,
+                    linewidth=1.0,
+                    linestyle='-',
+                    alpha=0.8,
+                    label=f'SDE derivative {control_idx + 1}'
+                )
+
+                # Plot integrated control (thicker line) with uncertainty band
+                ax2.plot(
+                    time_seconds,
+                    control_values,
+                    color=color,
+                    linewidth=2.0,
+                    linestyle='--',
+                    label=f'Integrated control {control_idx + 1}'
+                )
+                ax2.fill_between(
+                    time_seconds,
+                    control_values - control_std_values,
+                    control_values + control_std_values,
+                    color=color,
+                    alpha=0.2
+                )
 
             ax2.set_xlabel('Time (seconds)', fontweight='bold')
             ax2.set_ylabel('Control Signal', fontweight='bold')
