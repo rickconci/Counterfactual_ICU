@@ -210,6 +210,7 @@ def main(args):
                            plot_every = args.plot_every, 
                            batch_size = args.batch_size,
                            dataset = args.dataset_type,
+                           test_zenker=args.test_zenker,
                            debug = args.debug # <<< Pass debug flag >>>
     )
     os.makedirs(model.train_dir, exist_ok=True)
@@ -362,6 +363,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_samples', type=str, default=None, help='Max dataset length (None for production)')
     parser.add_argument('--run_eval', action='store_true', help='Run evaluation after training')
     parser.add_argument('--early_stopping_patience', type = int, default = 20)
+    parser.add_argument('--test_zenker', type=bool, default=False, help='Run the pure Zenker baseline as comparison?')
 
     
     args = parser.parse_args()

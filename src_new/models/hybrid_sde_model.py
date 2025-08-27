@@ -17,6 +17,7 @@ import torch
 import tqdm
 from torch import distributions, nn, optim
 from torch.special import erf
+from ZenkerModel import ZenkerODE
 
 import torchsde
 
@@ -60,6 +61,7 @@ class Hybrid_SDE(LightningModule):
                 #admin
                 train_dir, learning_rate, log_wandb, adjoint, plot_every, batch_size,
                 dataset,
+                test_zenker,
                 debug=False # <<< Add debug flag >>>
                 ):
         super().__init__()
@@ -240,6 +242,7 @@ class Hybrid_SDE(LightningModule):
         self.rtol = rtol
         self.atol = atol
         self.integration_adaptive = integration_adaptive
+        self.test_zenker = test_zenker
 
         ### LOSS
         self.MSE_loss = nn.MSELoss(reduction = "none")
@@ -1525,6 +1528,53 @@ class Hybrid_SDE(LightningModule):
             self.log('test_mse', valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
             self.log('test_mae', valid_mae, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
+            # Add Zenker baseline evaluation if requested
+            if self.test_zenker:
+
+                zenker_predictions = torch.zeros_like(Y)
+
+                for patient_idx in range(batch_size):
+                    # Extract initial conditions from z1_for_sde
+                    patient_z1 = z1_for_sde[patient_idx, 0].cpu().numpy()
+                    p_a_init, p_v_init, s_reflex_init, sv_init = patient_z1[:4]
+                    r_tpr_mod, f_hr_max, f_hr_min, r_tpr_max, r_tpr_min = patient_z1[4:9]
+                    ca, cv, k_width, p_aset, tau = patient_z1[9:14]
+
+                    # Create and run Zenker model
+                    zenker_model = ZenkerODE(
+                        p_a_init=float(p_a_init), p_v_init=float(p_v_init),
+                        s_reflex_init=float(s_reflex_init), sv_init=float(sv_init),
+                        r_tpr_mod=float(r_tpr_mod), f_hr_max=float(f_hr_max), f_hr_min=float(f_hr_min),
+                        r_tpr_max=float(r_tpr_max), r_tpr_min=float(r_tpr_min),
+                        ca=float(ca), cv=float(cv), k_width=float(k_width),
+                        p_aset=float(p_aset), tau=float(tau),
+                        use_physiological_clamping=True
+                    )
+
+                    # Integrate for the same time span as the model
+                    time_seconds = np.arange(seq_len) * 10  # Assuming 10-second intervals
+                    t_zenker, solution_zenker = zenker_model.integrate(
+                        t_span=time_seconds[-1], dt=self.integration_step_size
+                    )
+
+                    # Interpolate to match model time grid and store
+                    zenker_pa = np.interp(time_seconds, t_zenker, solution_zenker[:, 0])
+                    zenker_pv = np.interp(time_seconds, t_zenker, solution_zenker[:, 1])
+                    zenker_predictions[patient_idx, :, 0] = torch.from_numpy(zenker_pa)
+                    zenker_predictions[patient_idx, :, 1] = torch.from_numpy(zenker_pv)
+
+                zenker_predictions = zenker_predictions.to(Y.device)
+
+                # Compute Zenker MSE/MAE
+                zenker_mse_per_sample = ((zenker_predictions - Y) ** 2) * combined_mask
+                zenker_mae_per_sample = torch.abs(zenker_predictions - Y) * combined_mask
+
+                zenker_mse = zenker_mse_per_sample.sum() / valid_elements
+                zenker_mae = zenker_mae_per_sample.sum() / valid_elements
+
+                self.log('test_zenker_mse', zenker_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                self.log('test_zenker_mae', zenker_mae, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
         if batch_idx < 3:  # Plot first 3 batches
             self.plot_nature_style_with_uncertainty(
                 decoded_traj,  # Full tensor with samples dimension [batch, samples, time, features]
@@ -1536,7 +1586,7 @@ class Hybrid_SDE(LightningModule):
 
 
             # Update the return statement:
-        return {
+        return_dict = {
                 'test_loss': loss,
                 'test_nll': nll,
                 'test_kl': kl_div,
@@ -1546,6 +1596,13 @@ class Hybrid_SDE(LightningModule):
                 'true_traj': Y,
                 'mask': time_mask
             }
+        # Add Zenker metrics if computed
+        if self.test_zenker:
+            return_dict.update({
+                'test_zenker_mse': zenker_mse,
+                'test_zenker_mae': zenker_mae
+            })
+        return return_dict
 
     def on_test_epoch_end(self):
         """Log final test metrics to wandb"""
@@ -1558,6 +1615,11 @@ class Hybrid_SDE(LightningModule):
                 'final_test_nll': self.trainer.callback_metrics.get('test_NLL', 0),
                 'final_test_kl': self.trainer.callback_metrics.get('test_KL', 0)
             }
+            if self.test_zenker:
+                test_results.update({
+                    'final_test_zenker_mse': self.trainer.callback_metrics.get('test_zenker_mse', 0),
+                    'final_test_zenker_mae': self.trainer.callback_metrics.get('test_zenker_mae', 0)
+                })
 
             # Log final summary
             wandb.log(test_results)
@@ -1571,8 +1633,15 @@ class Hybrid_SDE(LightningModule):
                 ['NLL', f"{test_results['final_test_nll']:.4f}"],
                 ['KL Divergence', f"{test_results['final_test_kl']:.4f}"]
             ]
+            if self.test_zenker:
+                test_summary.extend([
+                    ['Zenker MSE', f"{test_results['final_test_zenker_mse']:.4f}"],
+                    ['Zenker MAE', f"{test_results['final_test_zenker_mae']:.4f}"]
+                ])
 
             wandb.log({"test_summary_table": wandb.Table(data=test_summary[1:], columns=test_summary[0])})
+
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr = self.learning_rate)
         
@@ -1691,7 +1760,6 @@ class Hybrid_SDE(LightningModule):
     def plot_nature_with_controls(self, predictions_full, targets, combined_mask, i_ext_path, batch_idx,
                                   z1_for_sde=None):
         """Plot BP + controls with Zenker baseline and detailed control analysis"""
-        from ZenkerModel import ZenkerODE
 
         colors = self._setup_plot_style()  # Use same style
         os.makedirs(os.path.join(self.train_dir, "control_plots"), exist_ok=True)
