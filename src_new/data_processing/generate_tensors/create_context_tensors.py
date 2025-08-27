@@ -169,22 +169,107 @@ def load_waveforms_data(parquet_path: str) -> pd.DataFrame:
 def load_medication_data(parquet_path: str) -> pd.DataFrame:
     """
     Load medication data for context tensor creation.
+
+    Supports parquet and pickle-like binaries (.pkl/.pickle/.bin). Normalizes
+    schema to include a 'rate/weight_normalized' column by mapping from common
+    alternatives when needed.
     """
     print(f"Loading medication data from {parquet_path}...")
-    df = pd.read_parquet(parquet_path)
 
-    # Check required columns
-    required_cols = ['hadm_id', 'start_time', 'end_time', 'rate/weight_normalized', 'item_label']
+    df: Optional[pd.DataFrame] = None
+
+    # Try to load based on extension, with fallbacks
+    lower_path = parquet_path.lower()
+    try:
+        if lower_path.endswith('.parquet'):
+            df = pd.read_parquet(parquet_path)
+        elif lower_path.endswith(('.pkl', '.pickle', '.bin')):
+            try:
+                df = pd.read_pickle(parquet_path)
+            except Exception:
+                import pickle as _pkl
+                with open(parquet_path, 'rb') as f:
+                    obj = _pkl.load(f)
+                if isinstance(obj, pd.DataFrame):
+                    df = obj
+                else:
+                    raise ValueError("Pickle file did not contain a pandas DataFrame")
+        else:
+            # Heuristic: try parquet first, then pickle
+            try:
+                df = pd.read_parquet(parquet_path)
+            except Exception:
+                df = pd.read_pickle(parquet_path)
+    except Exception as e:
+        raise ValueError(f"Failed to load medication data from {parquet_path}: {e}")
+
+    # Normalize column names where possible (map common variants to canonical)
+    cols_lower_map = {c.lower(): c for c in df.columns}
+
+    def _ensure_column(df_in: pd.DataFrame, canonical: str, candidates: List[str]) -> None:
+        for cand in candidates:
+            cand_lower = cand.lower()
+            if cand_lower in cols_lower_map:
+                src = cols_lower_map[cand_lower]
+                if src != canonical and canonical not in df_in.columns:
+                    df_in.rename(columns={src: canonical}, inplace=True)
+                return
+
+    _ensure_column(df, 'hadm_id', ['hadm_id', 'HADM_ID'])
+    _ensure_column(df, 'start_time', ['start_time', 'START_TIME', 'STARTTIME'])
+    _ensure_column(df, 'end_time', ['end_time', 'END_TIME', 'ENDTIME'])
+    _ensure_column(df, 'item_label', ['item_label', 'ITEM_LABEL'])
+
+    # Normalize rate column -> create 'rate/weight_normalized' if missing
+    rate_canonical = 'rate/weight_normalized'
+    if rate_canonical not in df.columns:
+        # Candidates: common variants and fuzzy contains('rate') & contains('weight')
+        candidate_order = [
+            'rate_weight_normalized',
+            'rate_per_kg',
+            'rate_per_weight',
+            'rate/weight',
+            'rate',
+            'RATE',
+        ]
+        picked_src: Optional[str] = None
+
+        for cand in candidate_order:
+            if cand in df.columns:
+                picked_src = cand
+                break
+            if cand.lower() in cols_lower_map:
+                picked_src = cols_lower_map[cand.lower()]
+                break
+
+        if picked_src is None:
+            # Fuzzy search: any col name containing both 'rate' and 'weight'
+            fuzzy = [c for c in df.columns if ('rate' in c.lower() and 'weight' in c.lower())]
+            if len(fuzzy) > 0:
+                picked_src = fuzzy[0]
+
+        if picked_src is not None:
+            df[rate_canonical] = pd.to_numeric(df[picked_src], errors='coerce')
+        else:
+            # As a last resort, if a plain 'rate' exists, use it
+            if 'rate' in df.columns:
+                df[rate_canonical] = pd.to_numeric(df['rate'], errors='coerce')
+
+    # Validate required columns
+    required_cols = ['hadm_id', 'start_time', 'end_time', 'item_label', rate_canonical]
     missing_cols = [col for col in required_cols if col not in df.columns]
-
     if missing_cols:
-        raise ValueError(f"Missing required medication columns: {missing_cols}")
+        raise ValueError(
+            "Missing required medication columns: {}. Available: {}".format(
+                missing_cols, list(df.columns)
+            )
+        )
 
-    # Ensure datetime columns
+    # Ensure datetime types
     if not pd.api.types.is_datetime64_any_dtype(df['start_time']):
-        df['start_time'] = pd.to_datetime(df['start_time'])
+        df['start_time'] = pd.to_datetime(df['start_time'], errors='coerce')
     if not pd.api.types.is_datetime64_any_dtype(df['end_time']):
-        df['end_time'] = pd.to_datetime(df['end_time'])
+        df['end_time'] = pd.to_datetime(df['end_time'], errors='coerce')
 
     print(f"Loaded {len(df)} medication events")
     return df
@@ -334,10 +419,11 @@ def create_meds_context_tensor(
             continue
 
         for _, row in item_infusions.iterrows():
-            # Get rate value
+            # Get rate value from normalized column
             rate_value = 0.0
-            if 'rate' in row and pd.notna(row['rate/weight_normalized']):
-                rate_value = float(row['rate/weight_normalized'])
+            rate_col = 'rate/weight_normalized'
+            if rate_col in row and pd.notna(row[rate_col]):
+                rate_value = float(row[rate_col])
 
             if rate_value == 0.0:
                 continue
