@@ -41,93 +41,92 @@ class MIMICDataset(Dataset):
 
         # Each trajectory from the IC metadata is a sample
         # First, collect all trajectories
+        # Load ADMISSIONS.csv to get HADM_ID -> SUBJECT_ID mapping
+        admissions_path = os.path.join(os.path.dirname(data_root), 'input_data', 'ADMISSIONS.csv')
+        if not os.path.exists(admissions_path):
+            raise FileNotFoundError(f"ADMISSIONS.csv not found at {admissions_path}")
+
+        admissions_df = pd.read_csv(admissions_path)
+        hadm_to_subject = dict(zip(admissions_df['HADM_ID'], admissions_df['SUBJECT_ID']))
+
+        # Each trajectory from the IC metadata is a sample
         all_trajectories = []
         for traj_key, ic_traj_info in self.ic_tensors_metadata.items():
             hadm_id = ic_traj_info['hadm_id']
             action_cluster_id = ic_traj_info['action_cluster_id']
 
-            # Check if a baseline tensor exists for this hadm_id
-            baseline_path = os.path.join(self.baseline_tensor_dir, f"baseline_{hadm_id}.pt")
 
-            #TODO add this back in when we have baselines
-            #if not os.path.exists(baseline_path):
-                #continue
+            # Get subject_id for this hadm_id
+            if hadm_id not in hadm_to_subject:
+                continue
+            subject_id = hadm_to_subject[hadm_id]
 
             # Check if corresponding med trajectory exists
             if traj_key not in self.med_trajectories:
                 continue
 
-            # Add this trajectory
+            # Add this trajectory (now with subject_id)
             all_trajectories.append({
                 'hadm_id': hadm_id,
+                'subject_id': subject_id,  # Add subject_id
                 'action_cluster_id': action_cluster_id,
                 'traj_key': traj_key
             })
 
-        # Split by hadm_id to prevent data leakage, but balance trajectory counts
-        # Step 1: Count trajectories per patient
-        patient_trajectory_counts = {}
+        # Split by subject_id instead of hadm_id to prevent data leakage
+        subject_trajectory_counts = {}
         for traj in all_trajectories:
-            hadm_id = traj['hadm_id']
-            patient_trajectory_counts[hadm_id] = patient_trajectory_counts.get(hadm_id, 0) + 1
+            subject_id = traj['subject_id']
+            subject_trajectory_counts[subject_id] = subject_trajectory_counts.get(subject_id, 0) + 1
 
-        # Step 2: Randomly shuffle patients (no sorting bias)
-        patients_with_counts = [(hadm_id, count) for hadm_id, count in patient_trajectory_counts.items()]
+        # Randomly shuffle subjects (not hadm_ids)
+        subjects_with_counts = [(subject_id, count) for subject_id, count in subject_trajectory_counts.items()]
         np.random.seed(random_state)
-        np.random.shuffle(patients_with_counts)  # Completely random order
+        np.random.shuffle(subjects_with_counts)
 
-        # Step 3: Greedy assignment to balance trajectory counts
         total_trajectories = len(all_trajectories)
         target_train = int(train_ratio * total_trajectories)
         target_val = int(val_ratio * total_trajectories)
         target_test = total_trajectories - target_train - target_val
 
-        # Initialize split counters
-        train_patients = []
-        val_patients = []
-        test_patients = []
-        train_count = 0
-        val_count = 0
-        test_count = 0
+        # Greedy assignment by subject
+        train_subjects = []
+        val_subjects = []
+        test_subjects = []
+        train_count = val_count = test_count = 0
 
-        # Greedy assignment: assign each patient to the split that needs trajectories most
-        for hadm_id, traj_count in patients_with_counts:
-            # Calculate how far each split is from its target
+        for subject_id, traj_count in subjects_with_counts:
             train_deficit = target_train - train_count
             val_deficit = target_val - val_count
             test_deficit = target_test - test_count
 
-            # Assign to split with largest deficit (that can still accept this patient)
             if train_deficit >= val_deficit and train_deficit >= test_deficit and train_deficit > 0:
-                train_patients.append(hadm_id)
+                train_subjects.append(subject_id)
                 train_count += traj_count
             elif val_deficit >= test_deficit and val_deficit > 0:
-                val_patients.append(hadm_id)
+                val_subjects.append(subject_id)
                 val_count += traj_count
             else:
-                test_patients.append(hadm_id)
+                test_subjects.append(subject_id)
                 test_count += traj_count
 
-        # Select patients for this split
+        # Select subjects for this split
         if split == 'train':
-            split_hadm_ids = set(train_patients)
-            split_traj_count = train_count
+            split_subject_ids = set(train_subjects)
         elif split == 'val':
-            split_hadm_ids = set(val_patients)
-            split_traj_count = val_count
+            split_subject_ids = set(val_subjects)
         elif split == 'test':
-            split_hadm_ids = set(test_patients)
-            split_traj_count = test_count
-        else:
-            raise ValueError(f"Invalid split '{split}'. Must be one of 'train', 'val', or 'test'.")
+            split_subject_ids = set(test_subjects)
 
-        # Filter trajectories to only include those from the selected hadm_ids
-        self.samples = [traj for traj in all_trajectories if traj['hadm_id'] in split_hadm_ids]
+        # Filter trajectories by subject_id (not hadm_id)
+        self.samples = [traj for traj in all_trajectories if traj['subject_id'] in split_subject_ids]
+
+
         if self.max_samples is not None:
             self.samples = self.samples[:int(max_samples)]
             print(f"[DEBUG] Limited to {len(self.samples)} samples for testing")
 
-        print(f"Split '{split}': {len(split_hadm_ids)} patients, {len(self.samples)} trajectories")
+        print(f"Split '{split}': {len(self.samples)} trajectories")
         print(f"Target trajectory split: {target_train}/{target_val}/{target_test}")
         print(f"Actual trajectory split: {train_count}/{val_count}/{test_count}")
         print(
