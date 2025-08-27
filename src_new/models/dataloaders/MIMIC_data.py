@@ -146,15 +146,6 @@ class MIMICDataset(Dataset):
         physio_context_path = os.path.join(physio_context_dir, f"physio_context_{traj_key}.pt")
         if os.path.exists(physio_context_path):
             p_in_values, p_in_mask, _, p_in_rel_time, _ = torch.load(physio_context_path)
-        else:
-            # TODO REMOVE THIS FOR PROD
-            # Create dummy physio context for development
-            print(f"Warning: Using dummy physio context for {traj_key}")
-            n_context_intervals = 6
-            n_physio_measurements = 5  # ABP MEAN, NBP MEAN, CVP, HR, RESP
-            p_in_values = torch.zeros(n_context_intervals, n_physio_measurements)
-            p_in_mask = torch.zeros(n_context_intervals, n_physio_measurements)
-            p_in_rel_time = torch.arange(-6, 0, dtype=torch.float32) * (10 / 60)  # -1.0, -0.83, etc.
 
         # Load IC tensor (new format)
         ic_path = os.path.join(self.ic_tensor_dir, f"ic_tensor_{traj_key}.pt")
@@ -169,14 +160,9 @@ class MIMICDataset(Dataset):
         p_out_values, p_out_mask, p_out_rel_time, _, _ = torch.load(p_out_path)
 
         # Load static features
-
-        # TODO ADD BACK IN WHEN WE HAVE BASELINES
-        #baseline_path = os.path.join(self.baseline_tensor_dir, f"baseline_{hadm_id}.pt")
-        #if not os.path.exists(baseline_path):
-          #  raise FileNotFoundError(f"Baseline tensor not found: {baseline_path}")
-
-        # TODO placeholder for baseline tensors
-        static_feats = torch.zeros(10)
+        baseline_path = os.path.join(self.baseline_tensor_dir, f"baseline_{hadm_id}.pt")
+        if not os.path.exists(baseline_path):
+            raise FileNotFoundError(f"Baseline tensor not found: {baseline_path}")
 
         # Load main trajectory med tensor (t₀ forward)
         med_traj_path = os.path.join(self.m_tensor_dir, f"med_tensor_{traj_key}.pt")
@@ -190,17 +176,6 @@ class MIMICDataset(Dataset):
         if os.path.exists(context_meds_path):
             context_meds_values, context_meds_mask, context_meds_time_sec, context_meds_time_hr, _ = torch.load(
                 context_meds_path)
-        else:
-            # TODO REMOVE FOR PROD
-            # Create dummy context for development
-            print(f"Warning: Using dummy meds context for {traj_key}")
-            n_context_intervals = 6
-            n_medications = med_traj_values.shape[1] if hasattr(med_traj_values, 'shape') and len(
-                med_traj_values.shape) > 1 else 22
-            context_meds_values = torch.zeros(n_context_intervals, n_medications)
-            context_meds_mask = torch.zeros(n_context_intervals, n_medications)
-            context_meds_time_hr = torch.arange(-6, 0, dtype=torch.float32) * (10 / 60)  # -1.0, -0.83, etc.
-            context_meds_time_sec = context_meds_time_hr * 3600  # Convert hours to seconds
 
         # The time for Y should be relative to t0
         t_Y = p_out_rel_time

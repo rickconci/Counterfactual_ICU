@@ -264,7 +264,7 @@ def main(args):
     # At the end of main(), after trainer.fit():
     if args.run_eval:
             print("Running evaluation on test set...")
-            test_results = trainer.test(model, data_module)
+            test_results = trainer.test(ckpt_path="best", dataloaders = data_module)
             print(f"Test results: {test_results}")
     
     #test_results_IID = trainer.test(ckpt_path='last', dataloaders = cv_data_module_IID.test_dataloader())
