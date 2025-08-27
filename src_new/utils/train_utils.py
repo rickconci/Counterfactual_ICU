@@ -673,7 +673,6 @@ def zenker_derivatives(y, device):
     dpv_dt = dpv(dpa_dt, c_a, c_v)
     ds_dt = dsdt(tau, k_width, p_a, p_aset, s_reflex)
 
-    # TODO fix this
     dsv_dt = torch.zeros([batch_size, 1], device=device)
 
     # Fixed parameters don't change

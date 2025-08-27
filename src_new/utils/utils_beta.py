@@ -186,14 +186,11 @@ class MLPSimple(nn.Module):
             self.layers.append(nn.Sequential(*layer_components))
 
     def forward(self, x):
-        if self.debug: print(f"[DEBUG] MLPSimple forward: input_shape={x.shape}")
         x_in = self.input_layer(x)
         x_hidden = x_in
         for i, layer in enumerate(self.layers):
             x_hidden = layer(x_hidden)
-            if self.debug: print(f"[DEBUG] MLPSimple forward: After layer {i}, shape={x_hidden.shape}")
         x_out = self.output_layer(x_hidden)
-        if self.debug: print(f"[DEBUG] MLPSimple forward: output_shape={x_out.shape}")
         return x_out
 
 CV_params = {"r_tpr_mod": 0.,

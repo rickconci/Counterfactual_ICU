@@ -26,21 +26,22 @@ nohup python ../models/hybrid_sde_main.py \
     --num_samples 3 \
     --batch_size 32 \
     --seed 14 \
-    --max_epochs 50 \
+    --max_epochs 5 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 0.1 \
     --HPC_work True \
-    --SDE_control_weighting 10.0 \
+    --SDE_control_weighting 1 \
     --prior_tx_sigma 0.1 \
     --output_scale 1 \
     --final_activation tanh \
     --run_eval \
-    --learning_rate 0.0005 \
-    --early_stopping_patience 10 \
+    --learning_rate 0.001 \
+    --early_stopping_patience 1 \
     --test_zenker True \
+    --max_samples 50 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
 # Get the process ID

@@ -52,7 +52,6 @@ class Hybrid_SDE(LightningModule):
                  SDE_input_state, include_time, 
                  theta, SDE_control_weighting, 
                 #SDE model params
-                SDEN_model_type,
                 num_samples, SDEnet_hidden_dim, SDEnet_depth, SDEnet_out_dims, final_activation, use_batch_norm,
                 integration_step_size, integration_method, rtol, atol, integration_adaptive,
                 #decoder params
@@ -557,13 +556,11 @@ class Hybrid_SDE(LightningModule):
         i_ext_SDE_dict = {}
         for i in range(self.SDEnet_out_dims):
             i_ext_SDE_dict[f'i_ext_SDE_{i+1}'] = y_clamped[:, i].unsqueeze(1)
-            
-        c_v = y_clamped[:, 12].unsqueeze(1)
+
 
 
         if t.item() >= time_to_treatment: # this will always be the case when working with mimic data as time to treatment is 0
             dt_i_ext_SDE = self.apply_SDE_fun(t, y_clamped)
-            if self.debug: print(f"dt i ext sd max: {torch.max(dt_i_ext_SDE)}")
             dt_i_ext_SDE_dict = {}
             for i in range(self.SDEnet_out_dims):
                 dt_i_ext_SDE_dict[f'dt_i_ext_SDE_{i+1}'] = dt_i_ext_SDE[:, i].unsqueeze(1)
@@ -585,10 +582,16 @@ class Hybrid_SDE(LightningModule):
         dpa_dt, dpv_dt, ds_dt, dsv_dt, dt_expert, dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min, dt_r_tpr_max, dt_r_tpr_min, dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau = zenker_derivatives(y_clamped, device=self.device)
 
         # apply model-specific transformations on Zenker model output
-        dpv_dt = dpv_dt + i_ext_SDE_dict[f'i_ext_SDE_1'] / (c_v*10)
+        dpv_dt = dpv_dt + i_ext_SDE_dict[f'i_ext_SDE_1']
         dsv_dt = i_ext_SDE_dict[f'i_ext_SDE_2']
-        dt_ca = dt_ca + i_ext_SDE_dict[f'i_ext_SDE_3']
-        dt_r_tpr_mod = dt_r_tpr_mod + i_ext_SDE_dict[f'i_ext_SDE_4']
+        dt_ca = dt_ca + i_ext_SDE_dict[f'i_ext_SDE_3'] / 100
+        dt_r_tpr_mod = dt_r_tpr_mod + i_ext_SDE_dict[f'i_ext_SDE_4'] / 100
+
+        if self.debug:
+            print(f"Time: {t}")
+            print(f"controls/derivs: {y_clamped[0,:9]}")
+            print(f"dt_ca: {dt_ca}")
+            print(f"dt_r_tpr_mod: {dt_r_tpr_mod}")
 
     
         dt_expert = torch.cat([
@@ -711,11 +714,18 @@ class Hybrid_SDE(LightningModule):
         active_mask = (t <= valid_time).float().unsqueeze(1)
 
         # Standard diffusion computation
-        i_ext_2 = y[:, 1].unsqueeze(1)
-        g_i_ext_2 = self.g(t, i_ext_2)
 
         i_ext_1 = y[:, 0].unsqueeze(1)
         g_i_ext_1 = self.g(t, i_ext_1)
+
+        i_ext_2 = y[:, 1].unsqueeze(1)
+        g_i_ext_2 = self.g(t, i_ext_2)
+
+        i_ext_3 = y[:, 2].unsqueeze(1)
+        g_i_ext_3 = self.g(t, i_ext_3)
+
+        i_ext_4 = y[:, 3].unsqueeze(1)
+        g_i_ext_4 = self.g(t, i_ext_4)
 
         # Build the full diffusion matrix
         g_expert_dims = torch.zeros([batch_size, self.expert_latent_dims]).to(y.device)
@@ -727,7 +737,7 @@ class Hybrid_SDE(LightningModule):
 
         # Concatenate all components
         g_out = torch.cat([
-            g_i_ext_1, g_i_ext_2, g_expert_dims, g_neural_dims,
+            g_i_ext_1, g_i_ext_2,g_i_ext_3, g_i_ext_4, g_expert_dims, g_neural_dims,
             g_logqp, g_tx, g_time_to_tx, g_valid_time
         ], dim=1)
 
@@ -828,7 +838,7 @@ class Hybrid_SDE(LightningModule):
         self.current_med_mask = med_traj_mask  # (batch, time, n_meds)
         self.current_med_time = med_traj_time  # (batch, time)
 
-        if self.debug: print(f"current_med_values shape: {current_med_values.shape}. (batch, time, n_meds)")
+        if self.debug: print(f"current_med_values shape: {self.current_med_values.shape}. (batch, time, n_meds)")
 
       
         # Prepare standard augmented state components

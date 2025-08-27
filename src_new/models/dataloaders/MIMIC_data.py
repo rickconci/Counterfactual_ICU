@@ -160,9 +160,10 @@ class MIMICDataset(Dataset):
         p_out_values, p_out_mask, p_out_rel_time, _, _ = torch.load(p_out_path)
 
         # Load static features
-        baseline_path = os.path.join(self.baseline_tensor_dir, f"baseline_{hadm_id}.pt")
-        if not os.path.exists(baseline_path):
-            raise FileNotFoundError(f"Baseline tensor not found: {baseline_path}")
+        #baseline_path = os.path.join(self.baseline_tensor_dir, f"baseline_{hadm_id}.pt")
+        #if not os.path.exists(baseline_path):
+            #raise FileNotFoundError(f"Baseline tensor not found: {baseline_path}")
+        static_feats = torch.zeros(10)
 
         # Load main trajectory med tensor (t₀ forward)
         med_traj_path = os.path.join(self.m_tensor_dir, f"med_tensor_{traj_key}.pt")
