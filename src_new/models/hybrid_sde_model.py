@@ -52,6 +52,7 @@ class Hybrid_SDE(LightningModule):
                  SDE_input_state, include_time, 
                  theta, SDE_control_weighting, 
                 #SDE model params
+                SDEN_model_type,
                 num_samples, SDEnet_hidden_dim, SDEnet_depth, SDEnet_out_dims, final_activation, use_batch_norm,
                 integration_step_size, integration_method, rtol, atol, integration_adaptive,
                 #decoder params
@@ -219,6 +220,8 @@ class Hybrid_SDE(LightningModule):
 
 
         # TODO change net input dims to be 14 + number of meds if there is no encoder, else encoder dim + 14 + meds
+
+       
         self.SDEnet = MLPSimple(input_dim = net_input_dims, 
                                 output_dim = SDEnet_out_dims, 
                                 hidden_dim = SDEnet_hidden_dim, 
@@ -226,7 +229,9 @@ class Hybrid_SDE(LightningModule):
                                 activations = [nn.Tanh() for _ in range(SDEnet_depth)], 
                                 final_activation=final_activation_real, 
                                 use_batch_norm=use_batch_norm,
-                                debug=self.debug) # <<< Pass debug flag (if MLPSimple is modified) >>>
+                                debug=self.debug) 
+
+        
 
         # Initialization trick from Glow.
         #self.SDEnet.output_layer[0].weight.data.fill_(0.)
@@ -258,9 +263,9 @@ class Hybrid_SDE(LightningModule):
 
         # check baroreflex sensitivity
         self.physio_ranges = {
-            'p_a': (39, 220.0), 'p_v': (0.0, 39.0), 's_reflex': (0, 1),
+            'p_a': (39, 180.0), 'p_v': (0.0, 39.0), 's_reflex': (0, 1),
             'sv': (40.0, 120.0), 'r_tpr_mod': (-1.0, 1.0), 'f_hr_max': (2.0, 3.0),
-            'f_hr_min': (0.5,1), 'r_tpr_max': (1.0,2.0), 'r_tpr_min': (0.45, 0.6),
+            'f_hr_min': (0.9, 1.1), 'r_tpr_max': (1.8,2.4), 'r_tpr_min': (0.45, 0.6),
             'ca': (2.0, 6.0), 'cv': (90.0, 120.0), 'k_width': (0.1, 0.3),
             'p_aset': (50.0, 90.0), 'tau': (15, 25)
         }
@@ -406,9 +411,24 @@ class Hybrid_SDE(LightningModule):
             t:
             y:
 
+        a) all of the initial ODE variables at t0 (initial conditions) √
+
+        b) for the ODE variables that are dynamic, the ones at time t √
+
+        c) the control at time t √
+
+        d) the med trajectories: these provide at each time t which medication and which dose is given. √
+
+        e) the physio context + med context tensors: this is the physio variables averaged per 10 mins in the hour before t0, so k x 6 if k is the number of physio vars. 
+
+
+
         Returns:
 
         """
+
+        batch_size = y.shape[0]
+
         if self.debug and t.item() % 10 == 0: # Avoid excessive printing
             print(f"[DEBUG] Hybrid_SDE apply_SDE_fun: t={t.item()}, y_shape={y.shape}, normalise_for_SDENN={self.normalise_for_SDENN}, include_time={self.include_time}, SDE_input_state={self.SDE_input_state}")
 
@@ -450,14 +470,14 @@ class Hybrid_SDE(LightningModule):
                 print(f"[ERROR] NaN weights in {name}!")
                 breakpoint()
 
-        batch_size = y.shape[0]
-        # Add medication context
+
         med_context = self.get_medication_context(t, batch_size)  # (batch, 2*n_meds)
 
-        # Augment SDE input
         SDE_NN_input = torch.cat([SDE_NN_input, med_context], dim=-1)
+
         if self.debug: print(f"SDE_NN_input shape: {SDE_NN_input.shape}")
-        if self.debug: print(f"Med context shape: {med_context.shape}")
+
+
 
         SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
 
@@ -524,8 +544,6 @@ class Hybrid_SDE(LightningModule):
         if self.debug and t.item() % 10 == 0:
             pass
 
-
-
         batch_size = y.shape[0]
 
         y_clamped = torch.cat([
@@ -535,19 +553,22 @@ class Hybrid_SDE(LightningModule):
         ], dim=1)
 
         # y now contains: [i_ext (2), expert_latents (14), neural_embedding (4)]
-        i_ext_SDE_1 = y_clamped[:, 0].unsqueeze(1)
-        i_ext_SDE_2 = y_clamped[:, 1].unsqueeze(1)
+
+        i_ext_SDE_dict = {}
+        for i in range(self.SDEnet_out_dims):
+            i_ext_SDE_dict[f'i_ext_SDE_{i+1}'] = y_clamped[:, i].unsqueeze(1)
+            
         c_v = y_clamped[:, 12].unsqueeze(1)
 
 
-        if t.item() >= time_to_treatment: # this will always be the case when working with mimics
+        if t.item() >= time_to_treatment: # this will always be the case when working with mimic data as time to treatment is 0
             dt_i_ext_SDE = self.apply_SDE_fun(t, y_clamped)
             if self.debug: print(f"dt i ext sd max: {torch.max(dt_i_ext_SDE)}")
-            dt_i_ext_SDE_1 = dt_i_ext_SDE[:, 0].unsqueeze(1)
-            dt_i_ext_SDE_2 = dt_i_ext_SDE[:, 1].unsqueeze(1)
+            dt_i_ext_SDE_dict = {}
+            for i in range(self.SDEnet_out_dims):
+                dt_i_ext_SDE_dict[f'dt_i_ext_SDE_{i+1}'] = dt_i_ext_SDE[:, i].unsqueeze(1)
         else:
             raise ValueError("Time to treatment should always be less than t.item()")
-
 
         # Neural embedding derivatives (zeros - they evolve stochastically)
         dt_neural_embedding = torch.zeros([batch_size, self.encoder_SDENN_dims]).to(self.device)
@@ -557,15 +578,19 @@ class Hybrid_SDE(LightningModule):
         # Total: 20 dimensions
 
         # For i_ext
-        dt_i_ext = torch.cat([dt_i_ext_SDE_1, dt_i_ext_SDE_2], dim=-1)
+        dt_i_ext = torch.cat([dt_i_ext_SDE_dict[f'dt_i_ext_SDE_{i+1}'] for i in range(self.SDEnet_out_dims)], dim=-1)
 
 
         # compute the expert latents from
         dpa_dt, dpv_dt, ds_dt, dsv_dt, dt_expert, dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min, dt_r_tpr_max, dt_r_tpr_min, dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau = zenker_derivatives(y_clamped, device=self.device)
 
         # apply model-specific transformations on Zenker model output
-        dpv_dt = dpv_dt + i_ext_SDE_1 / (c_v*10)
-        dsv_dt = i_ext_SDE_2
+        dpv_dt = dpv_dt + i_ext_SDE_dict[f'i_ext_SDE_1'] / (c_v*10)
+        dsv_dt = i_ext_SDE_dict[f'i_ext_SDE_2']
+        dt_ca = dt_ca + i_ext_SDE_dict[f'i_ext_SDE_3']
+        dt_r_tpr_mod = dt_r_tpr_mod + i_ext_SDE_dict[f'i_ext_SDE_4']
+
+    
         dt_expert = torch.cat([
             dpa_dt, dpv_dt, ds_dt, dsv_dt,
             dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min,  # Next 3 (indices 6-8)
@@ -789,6 +814,9 @@ class Hybrid_SDE(LightningModule):
         """
         Forward through SDE with batch-compatible variable length support.
         """
+
+        batch_size = init_latents.shape[0]
+        
         #sys.setrecursionlimit(10)
         if self.debug:
             print(f"[DEBUG] forward_latent: init_latents_shape={init_latents.shape}")
@@ -800,15 +828,12 @@ class Hybrid_SDE(LightningModule):
         self.current_med_mask = med_traj_mask  # (batch, time, n_meds)
         self.current_med_time = med_traj_time  # (batch, time)
 
+        if self.debug: print(f"current_med_values shape: {current_med_values.shape}. (batch, time, n_meds)")
 
-
-        batch_size = init_latents.shape[0]
-        if self.debug: print(f"init latents shape: {init_latents.shape}. Expected 23 x 7 x 18")
-
-        if self.debug: print(f"Tx shape: {Tx.shape}. Expect [23 x 215]")
+      
         # Prepare standard augmented state components
         Tx_expanded = Tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
-        if self.debug: print(f"Tx expanded shape: {Tx_expanded.shape}. Expected: [23 x 7 x 1]")
+        if self.debug: print(f"Tx expanded shape: {Tx_expanded.shape}.")
 
         time_to_tx_expanded = time_to_tx.unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
         i_ext = torch.zeros(batch_size, self.num_samples, self.SDEnet_out_dims).to(init_latents)
@@ -816,9 +841,7 @@ class Hybrid_SDE(LightningModule):
 
         # Add valid_time to augmented state
         valid_times_expanded = (valid_lengths * 10).unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
-        if self.debug: print(f"Valid times expanded shape: {valid_times_expanded.shape}. Expected: [23, 7, 1]")
-
-
+        if self.debug: print(f"Valid times expanded shape: {valid_times_expanded.shape}")
 
         # Create augmented initial state
         aug_y0 = torch.cat([
@@ -894,12 +917,7 @@ class Hybrid_SDE(LightningModule):
             #print('latent_out', latent_out[1, 1, :, 0])
             #print('latent device', latent_out.device)
 
-        # TODO turned off normalization because our decoder is the ODE
-        #if self.normalised_data:
-          #  latent_out = normalise_expert_data(latent_out)
-        #else:
-        #    divisors = self.divisors.view(1, 1, 1, self.expert_latent_dims).to(latent_out.device)
-        #    latent_out = latent_out / divisors
+      
         output_traj = select_tensor_by_index_list_advanced(latent_out, self.decoder_output_dims)
 
         pa = torch.clamp(output_traj[..., 0], min=40.0, max=220.0)
@@ -1069,7 +1087,6 @@ class Hybrid_SDE(LightningModule):
 
         batch_size = X.shape[0]
 
-        # Use the full time grid - we'll handle variable lengths in forward_latent
         ts = time_post[0, :]  # Assuming all sequences share the same time grid
 
 

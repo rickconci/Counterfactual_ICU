@@ -16,21 +16,18 @@ class ZenkerODE:
                  sv_init=70.0,  # Initial stroke volume (ml)
 
                  # Cardiovascular parameters
-                 f_hr_max=3.0,  # Maximum heart rate (Hz) = 180 bpm
-                 f_hr_min=0.5,  # Minimum heart rate (Hz) = 30 bpm
-                 r_tpr_max=2.0,  # Maximum total peripheral resistance
-                 r_tpr_min=0.8,  # Minimum total peripheral resistance
+                 f_hr_max=3.0,  # Maximum heart rate (Hz) = 180 bpm  # 3.0
+                 f_hr_min=1.0,  # Minimum heart rate (Hz) = 30 bpm  # 0.5
+                 r_tpr_max=2.13,  # Maximum total peripheral resistance  # 2.0
+                 r_tpr_min=0.53,  # Minimum total peripheral resistance  # 0.8
                  r_tpr_mod=0.0,  # TPR modulation
-                 ca=2.0,  # Arterial compliance (scaled by *100)
-                 cv=20.0,  # Venous compliance (scaled by *10) - LARGER for balance
-                 k_width=0.05,  # Sigmoid steepness for reflex (gentle)
-                 p_aset=100.0,  # Arterial pressure setpoint
-                 tau=20.0,  # Reflex time constant (slower for stability)
+                 ca=4.0,  # Arterial compliance (scaled by *100)  # 2.0
+                 cv=111.0,  # Venous compliance (scaled by *10) - LARGER for balance  # 20.0
+                 k_width=0.18,  # Sigmoid steepness for reflex (gentle)  # 0.05
+                 p_aset=70.0,  # Arterial pressure setpoint  # 100.0
+                 tau=20.0,  # Reflex time constant (slower for stability)  # 20.0
 
-                 # External intervention
-                 i_ext_tx_effect=0.0,  # External treatment effect
-
-                 # Enable physiological clamping
+                # Enable physiological clamping
                  use_physiological_clamping=True):
         """
         Initialize the Zenker ODE model exactly as specified.
@@ -53,9 +50,6 @@ class ZenkerODE:
         self.k_width = k_width
         self.p_aset = p_aset
         self.tau = tau
-
-        # External treatment effect
-        self.i_ext_tx_effect = i_ext_tx_effect
 
         # Physiological clamping
         self.use_physiological_clamping = use_physiological_clamping
@@ -97,6 +91,8 @@ class ZenkerODE:
         Returns:
             dy_dt: Derivative vector
         """
+
+
         # Apply physiological clamping if enabled
         y_clamped = self.apply_physiological_clamps(y)
         p_a, p_v, s, sv = y_clamped
@@ -110,8 +106,9 @@ class ZenkerODE:
         inflow = sv * f_hr  # ml/s
         dva_dt = -1. * outflow + inflow
         # Pressure derivatives exactly as specified
-        dpa_dt = dva_dt / (self.ca * 100.)
-        dpv_dt = -100.*self.ca*dpa_dt / (self.cv * 10.)
+        dpa_dt = dva_dt / (self.ca) #* 100.)
+        #dpv_dt = -100*self.ca*dpa_dt / (self.cv) #* 10.)
+        dpv_dt = -dva_dt / self.cv
 
 
         # Reflex derivative exactly as specified
@@ -268,10 +265,6 @@ class ZenkerODE:
 
         return violations
 
-    def set_external_effect(self, i_ext_tx_effect):
-        """Set the external treatment effect."""
-        self.i_ext_tx_effect = i_ext_tx_effect
-
     def get_current_state(self, t_index):
         """Get the cardiovascular state at a specific time index."""
         if self.solution is None:
@@ -307,9 +300,14 @@ if __name__ == "__main__":
 
     print("\n📊 Testing current parameters to show the problem...")
     model = ZenkerODE(
-        p_a_init=80, p_v_init=10, s_reflex_init=0.5, sv_init=70.0,
-        ca=2.0, cv=100,  # Current values causing imbalance
-        f_hr_max=3.0, f_hr_min=0.5,
+        p_a_init=100, 
+        p_v_init=4, 
+        s_reflex_init=0.5, 
+        sv_init=70.0,
+        ca=4, 
+        cv=111,  # Current values causing imbalance
+        f_hr_max=3.0, 
+        f_hr_min=1.0,
         use_physiological_clamping=True
     )
 
@@ -317,3 +315,6 @@ if __name__ == "__main__":
 
     if input("\nTry full integration with balanced scaling? (y/n): ").lower().startswith('y'):
         t_full, _ = model.integrate(t_span=1200.0, dt=0.1)
+
+    model.plot()  # creates the figure
+    plt.savefig('zenker_plot.png', dpi=300, bbox_inches='tight')

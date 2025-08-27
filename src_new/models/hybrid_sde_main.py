@@ -321,7 +321,7 @@ if __name__ == '__main__':
 
 
     parser.add_argument('--use_2_5std_encoder_minmax', type=bool, default=False, help='pushes the outputs of the encoder into a narrower range. BUT will mean some are NOT reached appropriately. ')
-    parser.add_argument('--encoder_SDENN_dims', type=int, default=4, help='Encoder output used by SDENN')
+    parser.add_argument('--encoder_SDENN_dims', type=int, default=64, help='Encoder output used by SDENN')
 
     #Default args _not be changed_
     parser.add_argument('--num_samples', type=int, default=10, help='Number of SDE samples- is affected if sigma >0 ')
@@ -342,7 +342,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--final_activation', type=str, default='none', choices=['relu', 'none', 'tanh'], help='Which nonlinearity to add as a final layer to the NN!')
     parser.add_argument('--normalise_for_SDENN', type=bool, default=True, help='Whether to normalise data when handing it to the SDE NN or just scale it )')
-    parser.add_argument('--SDEnet_out_dims', type=int, default=2, help='Num output dims for SDE NN  ')
+    parser.add_argument('--SDEnet_out_dims', type=int, default=4, help='Num output dims for SDE NN  ')
     parser.add_argument("--output_scale",type=float,default = 0.1, help = "Standard Deviation when computing GaussianNegLL between Y_true and Y_hat")
     parser.add_argument('--SDE_input_state', type=str, default='full', choices=['full', 'partial'], help='which dims to include in the SDE NN - always do full!')
 
