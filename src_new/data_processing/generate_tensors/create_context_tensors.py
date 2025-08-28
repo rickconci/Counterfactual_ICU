@@ -611,13 +611,13 @@ def create_baseline_tensors(input_dir, output_dir, trajectory_metadata_path):
     # Filter by the valid hadm_ids that have trajectories
     merged_df_final_filtered = merged_df[merged_df['HADM_ID'].isin(valid_hadm_ids)]
     #print(sorted(list(merged_df['HADM_ID'].unique())))
-    print(merged_df_final_filtered[merged_df_final_filtered['HADM_ID'] == 100477])
+    #print(merged_df_final_filtered[merged_df_final_filtered['HADM_ID'] == 100477])
 
 
     # Apply additional filters as requested
-    merged_with_disch_df_final_filtered = merged_df_final_filtered[merged_df_final_filtered['ADMIT_DURATION'] <= 10]
-    merged_with_disch_df_final_filtered = merged_with_disch_df_final_filtered[
-        merged_with_disch_df_final_filtered['ADMIT_DURATION'] >= 2]
+    #merged_with_disch_df_final_filtered = merged_df_final_filtered[merged_df_final_filtered['ADMIT_DURATION'] <= 10]
+    #merged_with_disch_df_final_filtered = merged_with_disch_df_final_filtered[merged_with_disch_df_final_filtered['ADMIT_DURATION'] >= 2]
+    merged_with_disch_df_final_filtered = merged_df_final_filtered
 
     print(f"Found {len(merged_with_disch_df_final_filtered)} patients after duration filtering (2-10 days).")
     print("Available columns in merged data:", merged_df_final_filtered.columns.tolist())
