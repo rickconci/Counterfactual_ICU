@@ -146,6 +146,8 @@ def create_context_tensors(
 def load_waveforms_data(parquet_path: str) -> pd.DataFrame:
     """
     Load waveforms data for context tensor creation.
+
+    Supports parquet and pickle-like binaries (.pkl/.pickle/.bin).
     """
     print(f"Loading waveforms data from {parquet_path}...")
     df = pd.read_parquet(parquet_path)

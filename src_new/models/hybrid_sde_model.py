@@ -62,7 +62,12 @@ class Hybrid_SDE(LightningModule):
                 train_dir, learning_rate, log_wandb, adjoint, plot_every, batch_size,
                 dataset,
                 test_zenker,
-                debug=False # <<< Add debug flag >>>
+                debug=False, # <<< Add debug flag >>>
+                # Diagnostics
+                force_zenker_defaults=False,
+                force_no_controls=False,
+                # Plotting
+                plot_outputs_train=True
                 ):
         super().__init__()
         self.debug = debug # <<< Store debug flag >>>
@@ -247,6 +252,11 @@ class Hybrid_SDE(LightningModule):
         self.atol = atol
         self.integration_adaptive = integration_adaptive
         self.test_zenker = test_zenker
+        # Diagnostics flags
+        self.force_zenker_defaults = force_zenker_defaults
+        self.force_no_controls = force_no_controls
+        # Plotting flags
+        self.plot_outputs_train = plot_outputs_train
 
         ### LOSS
         self.MSE_loss = nn.MSELoss(reduction = "none")
@@ -483,7 +493,10 @@ class Hybrid_SDE(LightningModule):
         # TODO do these clamps make sense
         #control_scales = torch.tensor([100.0, 30.0], device=SDE_NN_output_latents.device)
         #scaled_output = SDE_NN_output_latents * control_scales.unsqueeze(0)
-        scaled_output = SDE_NN_output_latents * self.SDE_control_weighting
+        if self.force_no_controls:
+            scaled_output = torch.zeros_like(SDE_NN_output_latents)
+        else:
+            scaled_output = SDE_NN_output_latents * self.SDE_control_weighting
 
         if torch.isnan(SDE_NN_output_latents).any():
             print("SDE_NN_output contains NaN!")
@@ -579,7 +592,11 @@ class Hybrid_SDE(LightningModule):
 
 
         # compute the expert latents from
-        dpa_dt, dpv_dt, ds_dt, dsv_dt, dt_expert, dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min, dt_r_tpr_max, dt_r_tpr_min, dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau = zenker_derivatives(y_clamped, device=self.device)
+        # Pass only the expert slice to ensure indexing aligns with Zenker state order
+        expert_slice = y_clamped[:, self.SDEnet_out_dims:self.SDEnet_out_dims + self.expert_latent_dims]
+        dpa_dt, dpv_dt, ds_dt, dsv_dt, dt_expert, dt_r_tpr_mod, dt_f_hr_max, dt_f_hr_min, dt_r_tpr_max, dt_r_tpr_min, dt_ca, dt_cv, dt_k_width, dt_p_aset, dt_tau = zenker_derivatives(
+            expert_slice, device=self.device, expert_start_index=0
+        )
 
         # apply model-specific transformations on Zenker model output
         dpv_dt = dpv_dt + i_ext_SDE_dict[f'i_ext_SDE_1']
@@ -852,6 +869,28 @@ class Hybrid_SDE(LightningModule):
         # Add valid_time to augmented state
         valid_times_expanded = (valid_lengths * 10).unsqueeze(1).unsqueeze(2).repeat(1, self.num_samples, 1).to(init_latents)
         if self.debug: print(f"Valid times expanded shape: {valid_times_expanded.shape}")
+
+        # Optionally override initial latents with exact Zenker defaults for diagnostics
+        if self.force_zenker_defaults:
+            # Zenker defaults from ZenkerModel.ZenkerODE
+            pa0 = torch.full_like(init_latents[..., 0], 100.0)
+            pv0 = torch.full_like(init_latents[..., 1], 8.0)
+            s0 = torch.full_like(init_latents[..., 2], 0.5)
+            sv0 = torch.full_like(init_latents[..., 3], 70.0)
+            r_tpr_mod0 = torch.full_like(init_latents[..., 4], 0.0)
+            f_hr_max0 = torch.full_like(init_latents[..., 5], 3.0)
+            f_hr_min0 = torch.full_like(init_latents[..., 6], 1.0)
+            r_tpr_max0 = torch.full_like(init_latents[..., 7], 2.13)
+            r_tpr_min0 = torch.full_like(init_latents[..., 8], 0.53)
+            ca0 = torch.full_like(init_latents[..., 9], 4.0)
+            cv0 = torch.full_like(init_latents[..., 10], 111.0)
+            k_width0 = torch.full_like(init_latents[..., 11], 0.18)
+            p_aset0 = torch.full_like(init_latents[..., 12], 70.0)
+            tau0 = torch.full_like(init_latents[..., 13], 20.0)
+            expert0 = torch.stack([pa0, pv0, s0, sv0, r_tpr_mod0, f_hr_max0, f_hr_min0, r_tpr_max0, r_tpr_min0,
+                                   ca0, cv0, k_width0, p_aset0, tau0], dim=-1)
+            zeros_neural = torch.zeros_like(init_latents[..., :self.encoder_SDENN_dims])
+            init_latents = torch.cat([expert0, zeros_neural], dim=-1)
 
         # Create augmented initial state
         aug_y0 = torch.cat([
@@ -1179,6 +1218,27 @@ class Hybrid_SDE(LightningModule):
         if self.debug:print(f"Y_mask stats: min={Y_mask.min()}, max={Y_mask.max()}, mean={Y_mask.mean()}")
         if self.debug:print(f"Combined mask sum per sample: {combined_mask.sum(dim=(1, 2))}")
         if self.debug:print(f"Valid timesteps per sample: {combined_mask.sum(dim=(1, 2)) / Y.shape[-1]}")
+
+        # Optionally plot during training at a cadence
+        if self.plot_outputs_train and (batch_idx < 1) and (self.global_step % max(int(self.plot_every), 1) == 0):
+            try:
+                self.plot_nature_style_with_uncertainty(
+                    decoded_traj,
+                    Y,
+                    combined_mask,
+                    batch_idx,
+                )
+                self.plot_nature_with_controls(
+                    decoded_traj,
+                    Y,
+                    combined_mask,
+                    i_ext_path,
+                    batch_idx,
+                    z1_for_sde,
+                )
+            except Exception as e:
+                if self.debug:
+                    print(f"[WARN] Training plot failed: {e}")
 
         # After computing the main loss:
         total_logqp = logqp0 + logqp_path

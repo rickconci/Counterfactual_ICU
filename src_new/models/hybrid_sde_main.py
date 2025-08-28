@@ -288,9 +288,9 @@ if __name__ == '__main__':
     parser.add_argument('--plot_every', type=int, default=14, help='Plot every how many global steps? ')
 
     # Data specific args
-    parser.add_argument('--dataset_type', type=str, default='synthetic', choices=['synthetic', 'mimic'], help='Which dataset to use.')
-    parser.add_argument('--data_root', type=str, default='../data/mimic_3_data/processed_data', help='Root directory for MIMIC preprocessed data.')
-    parser.add_argument('--icu_stays_path', type=str, default='data/input_data/icustays.csv', help='Path to icustays.csv file.')
+    parser.add_argument('--dataset_type', type=str, default='mimic', choices=['synthetic', 'mimic'], help='Which dataset to use.')
+    parser.add_argument('--data_root', type=str, default='/n/netscratch/mzitnik_lab/Lab/rconci/BIOMM/processed_data', help='Root directory for MIMIC preprocessed data.')
+    parser.add_argument('--icu_stays_path', type=str, default='/n/netscratch/mzitnik_lab/Lab/rconci/BIOMM/input_data/ICUSTAYS.csv', help='Path to icustays.csv file.')
     parser.add_argument('--static_hidden_dim', type=int, default=16, help='Hidden dimension for the static encoder MLP.')
     parser.add_argument('--fusion_hidden_dim', type=int, default=32, help='Hidden dimension for the fusion MLP.')
     parser.add_argument('--normalise', type=bool, default=False, help='Whether to normalise the data. Recommended ONLY if using an Encoder')
@@ -324,7 +324,7 @@ if __name__ == '__main__':
     parser.add_argument('--encoder_SDENN_dims', type=int, default=64, help='Encoder output used by SDENN')
 
     #Default args _not be changed_
-    parser.add_argument('--num_samples', type=int, default=10, help='Number of SDE samples- is affected if sigma >0 ')
+    parser.add_argument('--num_samples', type=int, default=3, help='Number of SDE samples- is affected if sigma >0 ')
     parser.add_argument('--prior_tx_mu', type=float, default=0.01, help='prior_tx_mu defines our assumed prior Dt_iexternal of the stochastic control ')
     parser.add_argument('--theta', type=float, default=0.001, help='Theta defines how the impact of the mean reverting process correction on the SDE')
     parser.add_argument('--SDE_control_weighting', type=float, default=1, help='how much to scale the output of the SDE NN')
@@ -357,10 +357,10 @@ if __name__ == '__main__':
 
     # Training specific args
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for the optimizer')
-    parser.add_argument('--batch_size', type=int, default=128, help='Training batch size')
-    parser.add_argument('--max_epochs', type=int, default=200, help='Maximum number of epochs to train')
+    parser.add_argument('--batch_size', type=int, default=2, help='Training batch size')
+    parser.add_argument('--max_epochs', type=int, default=3, help='Maximum number of epochs to train')
     parser.add_argument('--accelerator', type=str, default='auto', choices=['gpu', 'mps', 'cpu', 'auto'], help='Which accelerator to use')
-    parser.add_argument('--max_samples', type=str, default=None, help='Max dataset length (None for production)')
+    parser.add_argument('--max_samples', type=str, default=14, help='Max dataset length (None for production)')
     parser.add_argument('--run_eval', action='store_true', help='Run evaluation after training')
     parser.add_argument('--early_stopping_patience', type = int, default = 20)
     parser.add_argument('--test_zenker', type=bool, default=False, help='Run the pure Zenker baseline as comparison?')

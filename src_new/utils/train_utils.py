@@ -642,26 +642,29 @@ def get_phecode_statistics(batch_data, idx_key='next_idx_padded', len_key='next_
         'max_codes': max_codes
     }
 
-def zenker_derivatives(y, device):
+def zenker_derivatives(y, device, expert_start_index: int = 0):
 
     batch_size = y.shape[0]
 
-    # y now contains: [i_ext (2), expert_latents (14), neural_embedding (4)]
-    p_a = y[:, 0].unsqueeze(1)
-    p_v = y[:, 1].unsqueeze(1)
+    # Expect expert variables in the order:
+    # [p_a, p_v, s_reflex, sv, r_tpr_mod, f_hr_max, f_hr_min, r_tpr_max, r_tpr_min, ca, cv, k_width, p_aset, tau]
+    # Use expert_start_index to support callers passing a larger state vector with leading controls.
+    off = expert_start_index
+    p_a = y[:, off + 0].unsqueeze(1)
+    p_v = y[:, off + 1].unsqueeze(1)
 
-    s_reflex = y[:, 2].unsqueeze(1)
-    sv = y[:, 3].unsqueeze(1)
-    r_tpr_mod = y[:, 4].unsqueeze(1)
-    f_hr_max = y[:, 5].unsqueeze(1)
-    f_hr_min = y[:, 6].unsqueeze(1)
-    r_tpr_max = y[:, 7].unsqueeze(1)
-    r_tpr_min = y[:, 8].unsqueeze(1)
-    c_a = y[:, 9].unsqueeze(1)
-    c_v = y[:, 10].unsqueeze(1)
-    k_width = y[:, 11].unsqueeze(1)
-    p_aset = y[:, 12].unsqueeze(1)
-    tau = y[:, 13].unsqueeze(1)
+    s_reflex = y[:, off + 2].unsqueeze(1)
+    sv = y[:, off + 3].unsqueeze(1)
+    r_tpr_mod = y[:, off + 4].unsqueeze(1)
+    f_hr_max = y[:, off + 5].unsqueeze(1)
+    f_hr_min = y[:, off + 6].unsqueeze(1)
+    r_tpr_max = y[:, off + 7].unsqueeze(1)
+    r_tpr_min = y[:, off + 8].unsqueeze(1)
+    c_a = y[:, off + 9].unsqueeze(1)
+    c_v = y[:, off + 10].unsqueeze(1)
+    k_width = y[:, off + 11].unsqueeze(1)
+    p_aset = y[:, off + 12].unsqueeze(1)
+    tau = y[:, off + 13].unsqueeze(1)
 
 
     f_hr = fhr(s_reflex,f_hr_max,f_hr_min)
