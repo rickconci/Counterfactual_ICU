@@ -1,0 +1,38 @@
+name: cf_icu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip<25
+  - numpy
+  - scipy
+  - pandas
+  - pyarrow
+  - ipykernel
+  - jupyterlab
+  - matplotlib
+  - networkx
+  - typing_extensions
+  - setuptools
+  - wheel
+  - ninja            # handy for any local builds
+  - pkg-config
+  - cmake
+  - pip:
+      # Tell pip where to find CUDA 11.8 PyTorch wheels
+      - --extra-index-url=https://download.pytorch.org/whl/cu118
+      # PyTorch stack (GPU-enabled, matches cu118)
+      - torch==2.6.0
+      - torchvision==0.21.0
+      - torchaudio==2.6.0
+      # Tell pip where to find PyG wheels compiled for torch==2.6.0+cu118
+      - --find-links=https://data.pyg.org/whl/torch-2.6.0+cu118.html
+      # PyG compiled extensions + meta
+      - pyg-lib
+      - torch-scatter
+      - torch-sparse
+      - torch-cluster
+      - torch-spline-conv
+      - torch-geometric
+      # Core SDE lib
+      - torchsde==0.2.6

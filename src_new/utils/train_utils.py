@@ -647,23 +647,21 @@ def zenker_derivatives(y, device):
     batch_size = y.shape[0]
 
     # y now contains: [i_ext (2), expert_latents (14), neural_embedding (4)]
-    i_ext_1 = y[:, 0].unsqueeze(1)
-    i_ext_2 = y[:, 1].unsqueeze(1)
-    p_a = y[:, 2].unsqueeze(1)
-    p_v = y[:, 3].unsqueeze(1)
+    p_a = y[:, 0].unsqueeze(1)
+    p_v = y[:, 1].unsqueeze(1)
 
-    s_reflex = y[:, 4].unsqueeze(1)
-    sv = y[:, 5].unsqueeze(1)
-    r_tpr_mod = y[:, 6].unsqueeze(1)
-    f_hr_max = y[:, 7].unsqueeze(1)
-    f_hr_min = y[:, 8].unsqueeze(1)
-    r_tpr_max = y[:, 9].unsqueeze(1)
-    r_tpr_min = y[:, 10].unsqueeze(1)
-    c_a = y[:, 11].unsqueeze(1)
-    c_v = y[:, 12].unsqueeze(1)
-    k_width = y[:, 13].unsqueeze(1)
-    p_aset = y[:, 14].unsqueeze(1)
-    tau = y[:, 15].unsqueeze(1)
+    s_reflex = y[:, 2].unsqueeze(1)
+    sv = y[:, 3].unsqueeze(1)
+    r_tpr_mod = y[:, 4].unsqueeze(1)
+    f_hr_max = y[:, 5].unsqueeze(1)
+    f_hr_min = y[:, 6].unsqueeze(1)
+    r_tpr_max = y[:, 7].unsqueeze(1)
+    r_tpr_min = y[:, 8].unsqueeze(1)
+    c_a = y[:, 9].unsqueeze(1)
+    c_v = y[:, 10].unsqueeze(1)
+    k_width = y[:, 11].unsqueeze(1)
+    p_aset = y[:, 12].unsqueeze(1)
+    tau = y[:, 13].unsqueeze(1)
 
 
     f_hr = fhr(s_reflex,f_hr_max,f_hr_min)
@@ -721,7 +719,7 @@ def dpa(p_a, p_v, r_tpr, sv, f_hr, c_a):
     dva_dt = -1. * outflow + inflow
 
     # Pressure derivatives exactly as specified
-    dpa_dt = dva_dt / (c_a * 100.)
+    dpa_dt = dva_dt / (c_a)
 
     return dpa_dt
 
@@ -737,7 +735,7 @@ def dpv(dpa_dt, c_a, c_v):
 
     """
     # TODO note to self: we do not include ANY control here and assume this will be handled during the forward latent step (dependent on which model)
-    return (1/(c_v*10))*(-100.*c_a*dpa_dt)
+    return (1/(c_v))*(-c_a*dpa_dt)
 
 def dsdt(tau, k_width, p_a, p_aset, s_reflex):
 
