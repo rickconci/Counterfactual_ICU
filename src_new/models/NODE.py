@@ -18,8 +18,6 @@ import torch
 import tqdm
 from torch import distributions, nn, optim
 from torch.special import erf
-from ZenkerModel import ZenkerODE
-
 import torchsde
 
 import lightning as L
@@ -33,7 +31,6 @@ from utils_beta import CV_params, CV_params_divisors, _stable_division, LinearSc
     sigmoid
 from utils_beta import select_tensor_by_index_list_advanced, scale_unnormalised_experts, normalise_expert_data, \
     get_last_valid_timestep_fast
-from train_utils import zenker_derivatives
 
 # <<< Global DEBUG flag for model_beta.py, to be set by instance >>>
 # This is more of a placeholder if a module-level default is ever needed,
@@ -367,7 +364,7 @@ class NODE(LightningModule):
 
     def f_ode(self, t, y):
         batch_size = y.shape[0]
-        print(f"Y shape: {y.shape}. Expect batch x 18")
+
         # y structure: [expert_latents (14), neural_embedding (4)]
         # Where expert_latents[:2] are the current p_a, p_v
 
@@ -388,7 +385,6 @@ class NODE(LightningModule):
             nn_input = torch.cat([nn_input, time_encoding], dim=-1)
 
         nn_input = torch.cat([nn_input, med_context], dim=-1)
-        print(f"NN input shape: {nn_input.shape}. Expect batch x 60")
 
         # Get derivatives for only p_a, p_v (first 2 elements)
         pressure_derivatives = self.ODEnet(nn_input)  # [batch, 2]
@@ -478,32 +474,6 @@ class NODE(LightningModule):
 
         return safe_expert_states
 
-    def prior_diext_dt(self, t):
-        factor = -2 * (t - 5) / 5
-        exponential = torch.exp(-((t - 5) / 5) ** 2)
-        diext_dt = torch.tensor([5 / 3 * factor * exponential]).to(self.device)
-        # print('diext_dt', diext_dt.shape)
-        return diext_dt.unsqueeze(1)
-
-    def prior_rate_of_change_of_flow(self, t, volumes=50, durations=20, width_factor=3):
-        volumes = torch.tensor(volumes, dtype=torch.float32).unsqueeze(0).to(self.device)
-        durations = torch.tensor(durations, dtype=torch.float32).unsqueeze(0).to(self.device)
-        width_factor = torch.tensor(width_factor, dtype=torch.float32).to(self.device)
-
-        # print('t:', t.shape)
-        if t.ndim == 0:
-            t = t.unsqueeze(0)
-
-        means = durations / 2
-        sigmas = width_factor * durations / 10
-        A = volumes / (torch.sqrt(torch.tensor(np.pi)) * sigmas * erf((durations - means) / sigmas))
-        # print('A:', A.shape)
-
-        derivatives = -2 * A[:, None] * (t - means[:, None]) / sigmas[:, None] ** 2 * torch.exp(
-            -((t - means[:, None]) / sigmas[:, None]) ** 2)
-        # print('derivatives', derivatives.shape)
-        return derivatives
-
     def forward_latent(self, init_latents, ts, Tx, time_to_tx, valid_lengths=None,
                        med_traj_values=None, med_traj_mask=None, med_traj_time=None):
 
@@ -514,13 +484,9 @@ class NODE(LightningModule):
         self.current_med_mask = med_traj_mask
         self.current_med_time = med_traj_time
 
-        # Extract from z1_for_sde: [batch, samples, full_latent_dim]
-        if init_latents.dim() == 3:
-            z1 = init_latents[:, 0, :]  # Take first sample: [batch, full_latent_dim]
-        else:
-            z1 = init_latents
+        y0 = init_latents # [batch, 14]
 
-        y0 = z1  # [batch, 18]
+        assert y0.dim() == 2, f"Expected [batch, features], got {y0.shape}"
 
         # Integrate ODE
         trajectory = self.odeint_fn(
@@ -528,16 +494,13 @@ class NODE(LightningModule):
             y0,
             ts,
             method=self.integration_method,
-            rtol=self.rtol,
-            atol=self.atol
+            options={'step_size': self.integration_step_size}
         )
 
         # Reshape and extract pressure trajectory
         trajectory = trajectory.permute(1, 0, 2)  # [batch, time, features]
         pressure_traj = trajectory[:, :, :2]  # Only p_a, p_v: [batch, time, 2]
 
-        # Add samples dimension for compatibility
-        pressure_traj = pressure_traj.unsqueeze(1)  # [batch, 1, time, 2]
 
         return pressure_traj, torch.zeros(batch_size), None
 
@@ -589,53 +552,18 @@ class NODE(LightningModule):
         return ic_consistency_loss
 
     def compute_factual_loss(self, predicted_traj, true_traj, logqp, mask=None):
-        true_traj_expanded = true_traj.unsqueeze(1)
-        if self.debug:
-            print(
-                f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}, logqp_mean={logqp.mean().item() if logqp.numel() > 0 else 'N/A'}")
+        # predicted_traj is [batch, time, 2], no need to expand true_traj
+        # true_traj_expanded = true_traj.unsqueeze(1)  # Remove this line
 
-            print(
-                f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}")
+        logpy = distributions.Normal(loc=predicted_traj, scale=self.log_lik_output_scale).log_prob(true_traj)
 
-            # ADD THESE DEBUG CHECKS:
-            print(f"[DEBUG] log_lik_output_scale: {self.log_lik_output_scale}")
-            print(f"[DEBUG] log_lik_output_scale type: {type(self.log_lik_output_scale)}")
-            print(f"[DEBUG] predicted_traj contains inf: {torch.isinf(predicted_traj).any()}")
-            print(f"[DEBUG] predicted_traj contains nan: {torch.isnan(predicted_traj).any()}")
-            print(f"[DEBUG] predicted_traj min/max: {predicted_traj.min().item()}/{predicted_traj.max().item()}")
-
-            print(
-                f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}")
-        # Compute log probability
-        logpy = distributions.Normal(loc=predicted_traj, scale=self.log_lik_output_scale).log_prob(true_traj_expanded)
-        if self.debug:
-            print(f"Logpy: {logpy[0]}")
-            print(f"True traj expanded: {true_traj_expanded[0]}")
-            print(f"Predicted traj: {predicted_traj[0]}")
-            print(f"Mask shape: {mask.shape}. Expected: [23 x 17]")
-
-        # FIXED: Correct normalization
         if mask is not None:
-            mask_expanded = mask.unsqueeze(1).expand(-1, predicted_traj.shape[1], -1, -1)
-            logpy = logpy * mask_expanded
-
-            # Sum over time and features
-            logpy_sum = logpy.sum(dim=(2, 3))  # [batch, samples]
-
-            # Count total valid elements per sample (time * features)
-            valid_count = mask.sum(dim=(1, 2))  # [batch] - total valid elements
-
-            # Normalize correctly
-            logpy = logpy_sum / valid_count.unsqueeze(1)  # [batch, samples] / [batch, 1]
-            logpy = logpy.mean(dim=1)  # Average over samples
+            logpy = logpy * mask
+            logpy = logpy.sum(dim=(1, 2)) / mask.sum(dim=(1, 2))  # [batch]
         else:
-            logpy = logpy.sum(dim=(2, 3)).mean(dim=1)
-
-        current_kl_weight = self.kl_scheduler.val
-        self.kl_scheduler.step()
+            logpy = logpy.sum(dim=(1, 2))  # [batch]
 
         loss = -logpy.mean()
-
         return loss, -logpy.mean(), logqp.mean()
 
     def _prepare_encoder_input(self, X, init_states):
@@ -714,7 +642,7 @@ class NODE(LightningModule):
             if self.debug: print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
 
             # ode latent head outputs 14 (expert dimensions)
-            predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep)
             if self.debug: print(
                 f"prediction ode latents sigmoid shape: {predicted_ode_latents_sigmoid.shape}. Expect: [23 x 7 x 14]")
 
@@ -722,7 +650,7 @@ class NODE(LightningModule):
             if self.debug: print(f"prediction ode latents (transformed) shape: {predicted_ode_latents.shape}")
 
             # neural embedding head outputs: 4
-            neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            neural_embedding = self.neural_embedding_head(fused_rep)
             if self.debug: print(f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]")
             z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
 
@@ -734,8 +662,7 @@ class NODE(LightningModule):
             )
 
         else:  # No encoder
-            initial_condition = self._prepare_no_encoder_initial_state(init_states, ic_mask)
-            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
+            z1_for_sde  = self._prepare_no_encoder_initial_state(init_states, ic_mask)
             logqp0 = 0
             ic_consistency_loss = 0
 
@@ -878,7 +805,7 @@ class NODE(LightningModule):
                                                                  lengths=lengths)
                 # print(f"temporal embedding shape: {temporal_embedding.shape}")
 
-                # breakpoint()
+
                 # temporal_embedding = torch.zeros(X.shape[0], 76, device = X.device, dtype = torch.float32)
                 # print(f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]")
                 logqp0 = 0
@@ -907,7 +834,7 @@ class NODE(LightningModule):
             if self.debug: print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
 
             # ode latent head outputs 14 (expert dimensions)
-            predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep)
             if self.debug: print(
                 f"prediction ode latents sigmoid shape: {predicted_ode_latents_sigmoid.shape}. Expect: [23 x 7 x 14]")
 
@@ -915,7 +842,7 @@ class NODE(LightningModule):
             if self.debug: print(f"prediction ode latents (transformed) shape: {predicted_ode_latents.shape}")
 
             # neural embedding head outputs: 4
-            neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            neural_embedding = self.neural_embedding_head(fused_rep)
             # Prepare the SDE initial state
             z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
             if self.debug: print(f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]")
@@ -937,8 +864,7 @@ class NODE(LightningModule):
             )
 
         else:  # No encoder
-            initial_condition = self._prepare_no_encoder_initial_state(init_states, ic_mask)
-            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
+            z1_for_sde = self._prepare_no_encoder_initial_state(init_states, ic_mask)
             logqp0 = 0
             ic_consistency_loss = 0
 
@@ -1055,7 +981,7 @@ class NODE(LightningModule):
             if self.debug: print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
 
             # ode latent head outputs 14 (expert dimensions)
-            predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep)
             if self.debug: print(
                 f"prediction ode latents sigmoid shape: {predicted_ode_latents_sigmoid.shape}. Expect: [23 x 7 x 14]")
 
@@ -1063,7 +989,7 @@ class NODE(LightningModule):
             if self.debug: print(f"prediction ode latents (transformed) shape: {predicted_ode_latents.shape}")
 
             # neural embedding head outputs: 4
-            neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            neural_embedding = self.neural_embedding_head(fused_rep)
             if self.debug: print(f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]")
 
             # Add IC consistency loss (only where we have real data)
@@ -1075,8 +1001,7 @@ class NODE(LightningModule):
             z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding, init_states, ic_mask)
 
         else:  # No encoder
-            initial_condition = self._prepare_no_encoder_initial_state(init_states, ic_mask)
-            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
+            z1_for_sde = self._prepare_no_encoder_initial_state(init_states, ic_mask)
             logqp0 = 0
             ic_consistency_loss = 0
 
@@ -1126,8 +1051,8 @@ class NODE(LightningModule):
         self.log('test_KL', kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         with torch.no_grad():
-            mse_per_sample = ((decoded_traj.mean(1) - Y) ** 2) * combined_mask
-            mae_per_sample = torch.abs(decoded_traj.mean(1) - Y) * combined_mask
+            mse_per_sample = ((decoded_traj - Y) ** 2) * combined_mask
+            mae_per_sample = torch.abs(decoded_traj - Y) * combined_mask
 
             # Normalize by total valid elements
             valid_elements = combined_mask.sum()
@@ -1139,7 +1064,7 @@ class NODE(LightningModule):
 
         if batch_idx < 3:  # Plot first 3 batches
             self.plot_nature_style_with_uncertainty(
-                decoded_traj,  # Full tensor with samples dimension [batch, samples, time, features]
+                decoded_traj.unsqueeze(1),  # Full tensor with samples dimension [batch, samples, time, features]
                 Y,  # Targets [batch, time, features]
                 combined_mask,  # Mask [batch, time, features]
                 batch_idx
@@ -1156,12 +1081,6 @@ class NODE(LightningModule):
             'true_traj': Y,
             'mask': time_mask
         }
-        # Add Zenker metrics if computed
-        if self.test_zenker:
-            return_dict.update({
-                'test_zenker_mse': zenker_mse,
-                'test_zenker_mae': zenker_mae
-            })
         return return_dict
 
     def on_test_epoch_end(self):
@@ -1175,11 +1094,6 @@ class NODE(LightningModule):
                 'final_test_nll': self.trainer.callback_metrics.get('test_NLL', 0),
                 'final_test_kl': self.trainer.callback_metrics.get('test_KL', 0)
             }
-            if self.test_zenker:
-                test_results.update({
-                    'final_test_zenker_mse': self.trainer.callback_metrics.get('test_zenker_mse', 0),
-                    'final_test_zenker_mae': self.trainer.callback_metrics.get('test_zenker_mae', 0)
-                })
 
             # Log final summary
             wandb.log(test_results)
@@ -1193,11 +1107,6 @@ class NODE(LightningModule):
                 ['NLL', f"{test_results['final_test_nll']:.4f}"],
                 ['KL Divergence', f"{test_results['final_test_kl']:.4f}"]
             ]
-            if self.test_zenker:
-                test_summary.extend([
-                    ['Zenker MSE', f"{test_results['final_test_zenker_mse']:.4f}"],
-                    ['Zenker MAE', f"{test_results['final_test_zenker_mae']:.4f}"]
-                ])
 
             wandb.log({"test_summary_table": wandb.Table(data=test_summary[1:], columns=test_summary[0])})
 
@@ -1244,8 +1153,12 @@ class NODE(LightningModule):
         colors = self._setup_plot_style()
         os.makedirs(os.path.join(self.train_dir, 'nature_plots'), exist_ok=True)
 
-        pred_mean = predictions_full.mean(1)
-        pred_std = predictions_full.std(1)
+        if predictions_full.dim() == 4:
+            pred_mean = predictions_full.squeeze(1)  # Remove fake samples dim
+            pred_std = torch.zeros_like(pred_mean)  # No uncertainty for deterministic NODE
+        else:
+            pred_mean = predictions_full
+            pred_std = torch.zeros_like(pred_mean)
 
         for patient_idx in range(min(3, predictions_full.shape[0])):
             patient_mask = combined_mask[patient_idx]
