@@ -1,12 +1,13 @@
-import pandas as pd
-import numpy as np
-import torch
-from pathlib import Path
-import pickle
-from datetime import datetime, timedelta
-from tqdm import tqdm
-from typing import Dict, List, Tuple, Optional
 import os
+import pickle
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
 
 
 def load_and_prepare_data(parquet_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -18,23 +19,29 @@ def load_and_prepare_data(parquet_path: str) -> Tuple[pd.DataFrame, pd.DataFrame
     df_full = pd.read_parquet(parquet_path)
 
     # Ensure start_time is datetime
-    if not pd.api.types.is_datetime64_any_dtype(df_full['start_time']):
-        df_full['start_time'] = pd.to_datetime(df_full['start_time'])
+    if not pd.api.types.is_datetime64_any_dtype(df_full["start_time"]):
+        df_full["start_time"] = pd.to_datetime(df_full["start_time"])
 
     print(f"Loaded {len(df_full)} total medication rows")
     print(f"Unique hadm_ids: {df_full['hadm_id'].nunique()}")
     print(f"Unique item_labels: {df_full['item_label'].nunique()}")
 
     # Create filtered dataset for trajectory identification (only non-NaN action_cluster_id)
-    df_triggers = df_full.dropna(subset=['action_cluster_id'])
+    df_triggers = df_full.dropna(subset=["action_cluster_id"])
 
-    print(f"Rows with action_cluster_id (for trajectory identification): {len(df_triggers)}")
+    print(
+        f"Rows with action_cluster_id (for trajectory identification): {len(df_triggers)}"
+    )
     print(f"Unique action_cluster_ids: {df_triggers['action_cluster_id'].nunique()}")
 
     return df_full, df_triggers
 
 
-def identify_trajectories(df_full: pd.DataFrame, df_triggers: pd.DataFrame, trajectory_duration_minutes: int = 20) -> Dict:
+def identify_trajectories(
+    df_full: pd.DataFrame,
+    df_triggers: pd.DataFrame,
+    trajectory_duration_minutes: int = 20,
+) -> Dict:
     """
     Group by hadm_id and action_cluster_id to identify trajectories.
     Each trajectory lasts trajectory_duration_minutes OR until the start of the next action_cluster_id.
@@ -44,68 +51,83 @@ def identify_trajectories(df_full: pd.DataFrame, df_triggers: pd.DataFrame, traj
     trajectories = {}
 
     # First, get all action_cluster_ids per hadm_id with their t0 times
-    action_starts = df_triggers.groupby(['hadm_id', 'action_cluster_id'])['start_time'].min().reset_index()
-    action_starts.columns = ['hadm_id', 'action_cluster_id', 't0_time']
+    action_starts = (
+        df_triggers.groupby(["hadm_id", "action_cluster_id"])["start_time"]
+        .min()
+        .reset_index()
+    )
+    action_starts.columns = ["hadm_id", "action_cluster_id", "t0_time"]
 
     # Sort by hadm_id and t0_time to find next action starts
-    action_starts = action_starts.sort_values(['hadm_id', 't0_time'])
+    action_starts = action_starts.sort_values(["hadm_id", "t0_time"])
 
     print(f"Found {len(action_starts)} unique action_cluster_ids across all patients")
 
     # For each hadm_id, determine trajectory end times
-    for hadm_id in tqdm(action_starts['hadm_id'].unique(), desc="Processing patients"):
-        patient_actions = action_starts[action_starts['hadm_id'] == hadm_id].copy()
+    for hadm_id in tqdm(action_starts["hadm_id"].unique(), desc="Processing patients"):
+        patient_actions = action_starts[action_starts["hadm_id"] == hadm_id].copy()
 
         for idx, row in patient_actions.iterrows():
-            action_cluster_id = row['action_cluster_id']
-            t0_time = row['t0_time']
+            action_cluster_id = row["action_cluster_id"]
+            t0_time = row["t0_time"]
 
             # Calculate trajectory end time
             # Option 1: configurable minutes after t0
             end_time_20min = t0_time + pd.Timedelta(minutes=trajectory_duration_minutes)
 
             # Option 2: Start of next action_cluster_id
-            next_actions = patient_actions[patient_actions['t0_time'] > t0_time]
+            next_actions = patient_actions[patient_actions["t0_time"] > t0_time]
             if len(next_actions) > 0:
-                next_action_start = next_actions['t0_time'].min()
+                next_action_start = next_actions["t0_time"].min()
                 trajectory_end_time = min(end_time_20min, next_action_start)
             else:
                 trajectory_end_time = end_time_20min
 
             # Get all data for this patient within the trajectory window
-            patient_data = df_full[df_full['hadm_id'] == hadm_id].copy()
+            patient_data = df_full[df_full["hadm_id"] == hadm_id].copy()
             trajectory_data = patient_data[
-                (patient_data['end_time'] > t0_time) &  # Still ongoing at/after t0
-                (patient_data['start_time'] < trajectory_end_time)  # Starts before trajectory ends
-                ]
+                (patient_data["end_time"] > t0_time)  # Still ongoing at/after t0
+                & (
+                    patient_data["start_time"] < trajectory_end_time
+                )  # Starts before trajectory ends
+            ]
 
             # Store trajectory info
             traj_key = f"{hadm_id}_{int(action_cluster_id)}"
             trajectories[traj_key] = {
-                'hadm_id': hadm_id,
-                'action_cluster_id': action_cluster_id,
-                't0_time': t0_time,
-                'trajectory_end_time': trajectory_end_time,
-                'duration_minutes': (trajectory_end_time - t0_time).total_seconds() / 60,
-                'data': trajectory_data
+                "hadm_id": hadm_id,
+                "action_cluster_id": action_cluster_id,
+                "t0_time": t0_time,
+                "trajectory_end_time": trajectory_end_time,
+                "duration_minutes": (trajectory_end_time - t0_time).total_seconds()
+                / 60,
+                "data": trajectory_data,
             }
 
     print(f"Created {len(trajectories)} trajectories")
 
     # Print some statistics about trajectory durations
-    durations = [t['duration_minutes'] for t in trajectories.values()]
-    print(f"Trajectory duration statistics:")
+    durations = [t["duration_minutes"] for t in trajectories.values()]
+    print("Trajectory duration statistics:")
     print(f"  Mean: {np.mean(durations):.2f} minutes")
     print(f"  Std: {np.std(durations):.2f} minutes")
     print(f"  Min: {np.min(durations):.2f} minutes")
     print(f"  Max: {np.max(durations):.2f} minutes")
-    print(f"  Full {trajectory_duration_minutes}min trajectories: {sum(1 for d in durations if d >= (trajectory_duration_minutes - 0.1))}")
-    print(f"  Truncated trajectories: {sum(1 for d in durations if d < (trajectory_duration_minutes - 0.1))}")
+    print(
+        f"  Full {trajectory_duration_minutes}min trajectories: {sum(1 for d in durations if d >= (trajectory_duration_minutes - 0.1))}"
+    )
+    print(
+        f"  Truncated trajectories: {sum(1 for d in durations if d < (trajectory_duration_minutes - 0.1))}"
+    )
 
     return trajectories
 
 
-def create_time_grid(trajectories: Dict, interval_seconds: int = 10, trajectory_duration_minutes: int = 20) -> Dict:
+def create_time_grid(
+    trajectories: Dict,
+    interval_seconds: int = 10,
+    trajectory_duration_minutes: int = 20,
+) -> Dict:
     """
     Create time grid parameters using the configured maximum forward duration.
     """
@@ -116,25 +138,31 @@ def create_time_grid(trajectories: Dict, interval_seconds: int = 10, trajectory_
     n_intervals = int(np.ceil(max_duration_seconds / interval_seconds))
 
     # Verify this covers all trajectories
-    actual_max_duration = max(traj['duration_minutes'] for traj in trajectories.values()) * 60
+    actual_max_duration = (
+        max(traj["duration_minutes"] for traj in trajectories.values()) * 60
+    )
 
-    print(f"Fixed trajectory duration: {max_duration_seconds} seconds ({trajectory_duration_minutes} minutes)")
+    print(
+        f"Fixed trajectory duration: {max_duration_seconds} seconds ({trajectory_duration_minutes} minutes)"
+    )
     print(f"Actual max trajectory duration: {actual_max_duration:.1f} seconds")
-    print(f"Time grid will have {n_intervals} intervals of {interval_seconds} seconds each")
+    print(
+        f"Time grid will have {n_intervals} intervals of {interval_seconds} seconds each"
+    )
 
     return {
-        'n_intervals': n_intervals,
-        'interval_seconds': interval_seconds,
-        'max_duration': max_duration_seconds
+        "n_intervals": n_intervals,
+        "interval_seconds": interval_seconds,
+        "max_duration": max_duration_seconds,
     }
 
 
 def process_single_trajectory(
-        traj_key: str,
-        traj_info: Dict,
-        item_labels: List[str],
-        n_intervals: int,
-        interval_seconds: int
+    traj_key: str,
+    traj_info: Dict,
+    item_labels: List[str],
+    n_intervals: int,
+    interval_seconds: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Process a single trajectory and create medication tensor.
@@ -144,9 +172,9 @@ def process_single_trajectory(
         values_array: (n_intervals, n_medications) array of medication rates
         mask_array: (n_intervals, n_medications) array indicating data presence
     """
-    data = traj_info['data']
-    t0_time = traj_info['t0_time']
-    trajectory_end_time = traj_info['trajectory_end_time']
+    data = traj_info["data"]
+    t0_time = traj_info["t0_time"]
+    trajectory_end_time = traj_info["trajectory_end_time"]
 
     # Initialize arrays
     n_medications = len(item_labels)
@@ -158,7 +186,9 @@ def process_single_trajectory(
 
     # Calculate the trajectory duration in intervals
     trajectory_duration_seconds = (trajectory_end_time - t0_time).total_seconds()
-    max_interval_for_trajectory = min(n_intervals, int(np.ceil(trajectory_duration_seconds / interval_seconds)))
+    max_interval_for_trajectory = min(
+        n_intervals, int(np.ceil(trajectory_duration_seconds / interval_seconds))
+    )
 
     # Process each medication type separately to handle overlaps correctly
     for item_label in item_labels:
@@ -168,12 +198,14 @@ def process_single_trajectory(
         item_idx = item_to_idx[item_label]
 
         # Get all infusions for this medication, sorted by start_time
-        item_infusions = data[data['item_label'] == item_label].sort_values('start_time')
+        item_infusions = data[data["item_label"] == item_label].sort_values(
+            "start_time"
+        )
 
         for _, row in item_infusions.iterrows():
             # Get rate value
             rate_value = 0.0
-            for rate_col in ['rate/weight_normalized']:
+            for rate_col in ["rate/weight_normalized"]:
                 if rate_col in row and pd.notna(row[rate_col]):
                     rate_value = float(row[rate_col])
                     break
@@ -182,8 +214,8 @@ def process_single_trajectory(
                 continue
 
             # Clip infusion to trajectory window
-            effective_start = max(t0_time, row['start_time'])
-            effective_end = min(trajectory_end_time, row['end_time'])
+            effective_start = max(t0_time, row["start_time"])
+            effective_end = min(trajectory_end_time, row["end_time"])
 
             # Convert to intervals (round down start, round up end)
             start_seconds = (effective_start - t0_time).total_seconds()
@@ -202,12 +234,12 @@ def process_single_trajectory(
 
 
 def save_trajectory_tensor(
-        traj_key: str,
-        values_array: np.ndarray,
-        mask_array: np.ndarray,
-        n_intervals: int,
-        interval_seconds: int,
-        output_dir: Path
+    traj_key: str,
+    values_array: np.ndarray,
+    mask_array: np.ndarray,
+    n_intervals: int,
+    interval_seconds: int,
+    output_dir: Path,
 ) -> str:
     """
     Save a trajectory tensor to disk.
@@ -228,19 +260,25 @@ def save_trajectory_tensor(
 
     # Save tensor
     torch.save(
-        (values_tensor, mask_tensor, time_seconds_tensor, time_hours_tensor, n_intervals),
-        filepath
+        (
+            values_tensor,
+            mask_tensor,
+            time_seconds_tensor,
+            time_hours_tensor,
+            n_intervals,
+        ),
+        filepath,
     )
 
     return str(filepath)
 
 
 def create_med_tensors_from_parquet(
-        parquet_path: str,
-        output_dir: str = "./med_tensors_output",
-        interval_seconds: int = 10,
-        trajectory_duration_minutes: int = 20,
-        n_workers: int = 1
+    parquet_path: str,
+    output_dir: str = "./med_tensors_output",
+    interval_seconds: int = 10,
+    trajectory_duration_minutes: int = 20,
+    n_workers: int = 1,
 ) -> Dict:
     """
     Main function to create med_tensors from mv_filtered_10min.parquet file.
@@ -270,7 +308,7 @@ def create_med_tensors_from_parquet(
     )
 
     # Step 3: Get unique item labels from FULL dataset (all medications)
-    unique_item_labels = sorted(df_full['item_label'].unique().tolist())
+    unique_item_labels = sorted(df_full["item_label"].unique().tolist())
     print(f"Found {len(unique_item_labels)} unique item labels:")
     for i, label in enumerate(unique_item_labels):
         print(f"  {i}: {label}")
@@ -281,7 +319,7 @@ def create_med_tensors_from_parquet(
         interval_seconds,
         trajectory_duration_minutes=trajectory_duration_minutes,
     )
-    n_intervals = grid_params['n_intervals']
+    n_intervals = grid_params["n_intervals"]
 
     # Step 5: Process each trajectory
     print(f"\nProcessing {len(trajectories)} trajectories...")
@@ -296,7 +334,7 @@ def create_med_tensors_from_parquet(
             traj_info=traj_info,
             item_labels=unique_item_labels,
             n_intervals=n_intervals,
-            interval_seconds=interval_seconds
+            interval_seconds=interval_seconds,
         )
 
         # Save tensor
@@ -306,54 +344,54 @@ def create_med_tensors_from_parquet(
             mask_array=mask_array,
             n_intervals=n_intervals,
             interval_seconds=interval_seconds,
-            output_dir=output_path
+            output_dir=output_path,
         )
 
         # Store metadata
         trajectory_metadata[traj_key] = {
-            'hadm_id': traj_info['hadm_id'],
-            'action_cluster_id': traj_info['action_cluster_id'],
-            't0_time': traj_info['t0_time'],
-            'n_intervals': n_intervals,
-            'interval_seconds': interval_seconds,
-            'trajectory_end_time': traj_info['trajectory_end_time'],
-            'duration_minutes': traj_info['duration_minutes'],
-            'n_medications': len(unique_item_labels),
-            'file_path': filepath,
-            'has_data': np.any(mask_array > 0),
-            'total_nonzero_values': int(np.sum(mask_array))
+            "hadm_id": traj_info["hadm_id"],
+            "action_cluster_id": traj_info["action_cluster_id"],
+            "t0_time": traj_info["t0_time"],
+            "n_intervals": n_intervals,
+            "interval_seconds": interval_seconds,
+            "trajectory_end_time": traj_info["trajectory_end_time"],
+            "duration_minutes": traj_info["duration_minutes"],
+            "n_medications": len(unique_item_labels),
+            "file_path": filepath,
+            "has_data": np.any(mask_array > 0),
+            "total_nonzero_values": int(np.sum(mask_array)),
         }
 
         saved_files.append(filepath)
 
     # Step 6: Save metadata
     metadata = {
-        'trajectories': trajectory_metadata,
-        'item_labels': unique_item_labels,
-        'n_intervals': n_intervals,
-        'interval_seconds': interval_seconds,
-        'total_trajectories': len(trajectories),
-        'created_at': datetime.now().isoformat(),
-        'source_file': parquet_path
+        "trajectories": trajectory_metadata,
+        "item_labels": unique_item_labels,
+        "n_intervals": n_intervals,
+        "interval_seconds": interval_seconds,
+        "total_trajectories": len(trajectories),
+        "created_at": datetime.now().isoformat(),
+        "source_file": parquet_path,
     }
 
     metadata_file = output_path / "med_tensors_metadata.pkl"
-    with open(metadata_file, 'wb') as f:
+    with open(metadata_file, "wb") as f:
         pickle.dump(metadata, f)
 
     # Step 7: Save summary statistics
     summary_stats = {
-        'total_trajectories': len(trajectories),
-        'total_tensor_files': len(saved_files),
-        'unique_hadm_ids': df_triggers['hadm_id'].nunique(),
-        'unique_action_cluster_ids': df_triggers['action_cluster_id'].nunique(),
-        'unique_item_labels': len(unique_item_labels),
-        'time_grid_intervals': n_intervals,
-        'interval_seconds': interval_seconds,
-        'max_duration_hours': grid_params['max_duration'] / 3600.0
+        "total_trajectories": len(trajectories),
+        "total_tensor_files": len(saved_files),
+        "unique_hadm_ids": df_triggers["hadm_id"].nunique(),
+        "unique_action_cluster_ids": df_triggers["action_cluster_id"].nunique(),
+        "unique_item_labels": len(unique_item_labels),
+        "time_grid_intervals": n_intervals,
+        "interval_seconds": interval_seconds,
+        "max_duration_hours": grid_params["max_duration"] / 3600.0,
     }
 
-    print(f"\n=== Summary ===")
+    print("\n=== Summary ===")
     for key, value in summary_stats.items():
         print(f"{key}: {value}")
 
@@ -369,14 +407,18 @@ def load_and_inspect_tensor(tensor_path: str) -> None:
     """
     print(f"Loading tensor from: {tensor_path}")
 
-    values_tensor, mask_tensor, time_seconds_tensor, time_hours_tensor, n_intervals = torch.load(tensor_path)
+    values_tensor, mask_tensor, time_seconds_tensor, time_hours_tensor, n_intervals = (
+        torch.load(tensor_path)
+    )
 
     print(f"Values tensor shape: {values_tensor.shape}")
     print(f"Mask tensor shape: {mask_tensor.shape}")
     print(f"Time intervals: {n_intervals}")
     print(f"Duration: {time_hours_tensor[-1]:.2f} hours")
     print(f"Non-zero values: {torch.sum(mask_tensor).item()}")
-    print(f"Medications with data: {torch.sum(torch.any(mask_tensor > 0, dim=0)).item()}")
+    print(
+        f"Medications with data: {torch.sum(torch.any(mask_tensor > 0, dim=0)).item()}"
+    )
 
 
 # Example usage
@@ -387,16 +429,14 @@ if __name__ == "__main__":
 
     if os.path.exists(parquet_path):
         metadata = create_med_tensors_from_parquet(
-            parquet_path=parquet_path,
-            output_dir=output_dir,
-            interval_seconds=10
+            parquet_path=parquet_path, output_dir=output_dir, interval_seconds=10
         )
 
         # Inspect a sample tensor
-        if metadata['trajectories']:
-            sample_traj_key = list(metadata['trajectories'].keys())[0]
-            sample_file = metadata['trajectories'][sample_traj_key]['file_path']
-            print(f"\n=== Sample Tensor Inspection ===")
+        if metadata["trajectories"]:
+            sample_traj_key = list(metadata["trajectories"].keys())[0]
+            sample_file = metadata["trajectories"][sample_traj_key]["file_path"]
+            print("\n=== Sample Tensor Inspection ===")
             load_and_inspect_tensor(sample_file)
     else:
         print(f"Please ensure {parquet_path} exists in the current directory")

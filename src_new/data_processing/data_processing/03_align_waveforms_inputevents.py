@@ -1,18 +1,19 @@
-import pandas as pd
 import numpy as np
-from config import MIMIC_DATA_DIR, WAVEFORM_DIR, PROCESSED_DATA_DIR, HELPFUL_DF_DIR
+import pandas as pd
+from config import PROCESSED_DATA_DIR
 from data_utils import _ensure_hadm_column, _to_utc
 
 
-def align_triggers_with_waveforms(combined_waveform_df, 
-                                  input_event_cv_df_trigger_meds, 
-                                  input_mv_triggers):
+def align_triggers_with_waveforms(
+    combined_waveform_df, input_event_cv_df_trigger_meds, input_mv_triggers
+):
     # waveform ranges per hadm_id
     wf = combined_waveform_df.copy()
     wf["absolute_timestamp"] = _to_utc(wf["absolute_timestamp"])
 
-    wf_ranges = (wf.groupby("hadm_id", as_index=False)["absolute_timestamp"]
-                .agg(first="min", last="max"))
+    wf_ranges = wf.groupby("hadm_id", as_index=False)["absolute_timestamp"].agg(
+        first="min", last="max"
+    )
 
     # CV
     cv = _ensure_hadm_column(input_event_cv_df_trigger_meds.copy())
@@ -20,8 +21,8 @@ def align_triggers_with_waveforms(combined_waveform_df,
 
     cv_aligned = cv.merge(wf_ranges, on="hadm_id", how="inner")
     cv_aligned = cv_aligned[
-        (cv_aligned["charttime"] >= cv_aligned["first"]) &
-        (cv_aligned["charttime"] <= cv_aligned["last"])
+        (cv_aligned["charttime"] >= cv_aligned["first"])
+        & (cv_aligned["charttime"] <= cv_aligned["last"])
     ]
 
     # MV
@@ -30,19 +31,18 @@ def align_triggers_with_waveforms(combined_waveform_df,
 
     mv_aligned = mv.merge(wf_ranges, on="hadm_id", how="inner")
     mv_aligned = mv_aligned[
-        (mv_aligned["start_time"] >= mv_aligned["first"]) &
-        (mv_aligned["start_time"] <= mv_aligned["last"])
+        (mv_aligned["start_time"] >= mv_aligned["first"])
+        & (mv_aligned["start_time"] <= mv_aligned["last"])
     ]
 
     summary = {
         "CV_before": int(cv_aligned.shape[0]),
-        "CV_after":  int(cv_aligned.shape[0]),
+        "CV_after": int(cv_aligned.shape[0]),
         "MV_before": int(mv_aligned.shape[0]),
-        "MV_after":  int(mv_aligned.shape[0]),
+        "MV_after": int(mv_aligned.shape[0]),
     }
     return cv_aligned, mv_aligned, summary
 
-    
 
 def coerce_hadm_id_to_int(df: pd.DataFrame, col="hadm_id") -> pd.DataFrame:
     """
@@ -63,9 +63,8 @@ def coerce_hadm_id_to_int(df: pd.DataFrame, col="hadm_id") -> pd.DataFrame:
     return df
 
 
-
 import pandas as pd
-import numpy as np
+
 
 def filter_mv_triggers_by_waveform_groupwise(
     mv_df: pd.DataFrame,
@@ -106,8 +105,14 @@ def filter_mv_triggers_by_waveform_groupwise(
     )
 
     for hid in common_ids:
-        mv_g = mv.loc[mv[hadm_col] == hid].sort_values(mv_time_col).reset_index(drop=True)
-        wf_g = wf_valid.loc[wf_valid[hadm_col] == hid].sort_values(wf_time_col).reset_index(drop=True)
+        mv_g = (
+            mv.loc[mv[hadm_col] == hid].sort_values(mv_time_col).reset_index(drop=True)
+        )
+        wf_g = (
+            wf_valid.loc[wf_valid[hadm_col] == hid]
+            .sort_values(wf_time_col)
+            .reset_index(drop=True)
+        )
 
         if mv_g.empty or wf_g.empty:
             continue
@@ -123,29 +128,34 @@ def filter_mv_triggers_by_waveform_groupwise(
         )
 
         matched = matched[matched[wf_time_col].notna()].copy()
-        matched["wf_time_delta_s"] = (matched[wf_time_col] - matched[mv_time_col]).dt.total_seconds()
+        matched["wf_time_delta_s"] = (
+            matched[wf_time_col] - matched[mv_time_col]
+        ).dt.total_seconds()
         results.append(matched)
 
     if results:
         return pd.concat(results, ignore_index=True)
     else:
         # return empty frame with same columns if no matches
-        return mv.iloc[0:0].assign(**{wf_time_col: pd.NaT, "wf_time_delta_s": pd.Series(dtype="float")})
+        return mv.iloc[0:0].assign(
+            **{wf_time_col: pd.NaT, "wf_time_delta_s": pd.Series(dtype="float")}
+        )
 
 
 # Calculate min and max for each group instead of mean and std
 
+
 # Apply min-max normalization for each group
 def normalize_by_group(row):
-    item = row['item_label']
-    value = row['rate/weight']
-    
+    item = row["item_label"]
+    value = row["rate/weight"]
+
     if pd.isna(value) or item not in stats.index:
         return np.nan
-    
-    min_val = stats.loc[item, 'min']
-    max_val = stats.loc[item, 'max']
-    
+
+    min_val = stats.loc[item, "min"]
+    max_val = stats.loc[item, "max"]
+
     # Avoid division by zero (when min equals max)
     if max_val == min_val:
         return 0
@@ -154,38 +164,41 @@ def normalize_by_group(row):
 
 
 def clean_smooth_waveforms(df_clean, save_dir=None):
-    
-    abp_valid = df_clean['ABP MEAN'].dropna()
-    cvp_valid = df_clean['CVP'].dropna()
+    abp_valid = df_clean["ABP MEAN"].dropna()
+    cvp_valid = df_clean["CVP"].dropna()
 
 
-
-
-def main(df_clean, input_event_cv_df_trigger_meds, input_mv_triggers, args=None, save_dir=None):
+def main(
+    df_clean,
+    input_event_cv_df_trigger_meds,
+    input_mv_triggers,
+    args=None,
+    save_dir=None,
+):
     df_clean = coerce_hadm_id_to_int(df_clean, "hadm_id")
-    input_event_cv_df_trigger_meds = coerce_hadm_id_to_int(input_event_cv_df_trigger_meds, "hadm_id")
+    input_event_cv_df_trigger_meds = coerce_hadm_id_to_int(
+        input_event_cv_df_trigger_meds, "hadm_id"
+    )
     input_mv_triggers = coerce_hadm_id_to_int(input_mv_triggers, "hadm_id")
 
-
-
     cv_aligned, mv_aligned, summary = align_triggers_with_waveforms(
-        df_clean,
-        input_event_cv_df_trigger_meds,
-        input_mv_triggers
+        df_clean, input_event_cv_df_trigger_meds, input_mv_triggers
     )
 
     mv_filtered_10min = filter_mv_triggers_by_waveform_groupwise(
         mv_aligned,
         df_clean,
-        required_signals=("ABP MEAN","CVP"),
+        required_signals=("ABP MEAN", "CVP"),
         tolerance=args.tolerance,
     )
     print(f"MV triggers before: {len(mv_aligned)}  after: {len(mv_filtered_10min)}")
 
-    mv_filtered_10min['rate/weight_normalized'] = mv_filtered_10min.apply(normalize_by_group, axis=1)
+    mv_filtered_10min["rate/weight_normalized"] = mv_filtered_10min.apply(
+        normalize_by_group, axis=1
+    )
 
     if save_dir is not None:
-        mv_filtered_10min.to_parquet(save_dir/'mv_filtered_10min.parquet')
+        mv_filtered_10min.to_parquet(save_dir / "mv_filtered_10min.parquet")
 
     hadm_trigger_counts = (
         mv_filtered_10min[mv_filtered_10min["trigger"] == True]
@@ -195,19 +208,20 @@ def main(df_clean, input_event_cv_df_trigger_meds, input_mv_triggers, args=None,
         .sort_values("n_triggers", ascending=False)
     )
     if save_dir is not None:
-        hadm_trigger_counts.to_csv(save_dir/'hadm_trigger_counts.csv', index=False)
-
-
+        hadm_trigger_counts.to_csv(save_dir / "hadm_trigger_counts.csv", index=False)
 
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--tolerance", type=str, default="10min")
     args = parser.parse_args()
 
-    df_clean = pd.read_parquet(PROCESSED_DATA_DIR/'combined_waveforms.parquet')
-    input_event_cv_df_trigger_meds = pd.read_csv(PROCESSED_DATA_DIR/'input_event_cv_df_trigger_meds.csv')
-    input_mv_triggers = pd.read_csv(PROCESSED_DATA_DIR/'input_mv_triggers.csv')
+    df_clean = pd.read_parquet(PROCESSED_DATA_DIR / "combined_waveforms.parquet")
+    input_event_cv_df_trigger_meds = pd.read_csv(
+        PROCESSED_DATA_DIR / "input_event_cv_df_trigger_meds.csv"
+    )
+    input_mv_triggers = pd.read_csv(PROCESSED_DATA_DIR / "input_mv_triggers.csv")
 
     main(df_clean, input_event_cv_df_trigger_meds, input_mv_triggers, args)

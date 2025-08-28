@@ -1,28 +1,38 @@
-from torch.nn.parameter import Parameter
-from torch_geometric.nn.inits import uniform, glorot, zeros, ones, reset
-from torch.nn import init
 import math
-from typing import Union, Tuple, Optional
-from torch_geometric.typing import PairTensor, Adj, OptTensor
+from typing import Optional, Tuple, Union, cast
+
 import torch
-from torch import Tensor
 import torch.nn.functional as F
-from torch.nn import Linear
-from torch_sparse import SparseTensor
+from torch import Tensor
+from torch.nn import Linear, init
+from torch.nn.parameter import Parameter
 from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.nn.inits import glorot
+from torch_geometric.typing import Adj, OptTensor, PairTensor
 from torch_geometric.utils import softmax
-from torch_scatter import gather_csr, scatter, segment_csr
+from torch_scatter import scatter
+from torch_sparse import SparseTensor
 
 
 class Observation_progation(MessagePassing):
     _alpha: OptTensor
 
-    def __init__(self, in_channels: Union[int, Tuple[int,int]], out_channels: int,
-                 n_nodes: int, ob_dim: int,
-                 heads: int = 1, concat: bool = True, beta: bool = False,
-                 dropout: float = 0., edge_dim: Optional[int] = None,
-                 bias: bool = True, root_weight: bool = True, **kwargs):
-        kwargs.setdefault('aggr', 'add')
+    def __init__(
+        self,
+        in_channels: Union[int, Tuple[int, int]],
+        out_channels: int,
+        n_nodes: int,
+        ob_dim: int,
+        heads: int = 1,
+        concat: bool = True,
+        beta: bool = False,
+        dropout: float = 0.0,
+        edge_dim: Optional[int] = None,
+        bias: bool = True,
+        root_weight: bool = True,
+        **kwargs,
+    ):
+        kwargs.setdefault("aggr", "add")
         super().__init__(node_dim=0, **kwargs)
 
         self.in_channels = in_channels
@@ -43,36 +53,37 @@ class Observation_progation(MessagePassing):
         if edge_dim is not None:
             self.lin_edge = Linear(edge_dim, heads * out_channels, bias=False)
         else:
-            self.lin_edge = self.register_parameter('lin_edge', None)
+            self.lin_edge = self.register_parameter("lin_edge", None)
 
         if concat:
-            self.lin_skip = Linear(in_channels[1], heads * out_channels,
-                                   bias=bias)
+            self.lin_skip = Linear(in_channels[1], heads * out_channels, bias=bias)
             if self.beta:
                 self.lin_beta = Linear(3 * heads * out_channels, 1, bias=False)
             else:
-                self.lin_beta = self.register_parameter('lin_beta', None)
+                self.lin_beta = self.register_parameter("lin_beta", None)
         else:
             self.lin_skip = Linear(in_channels[1], out_channels, bias=bias)
             if self.beta:
                 self.lin_beta = Linear(3 * out_channels, 1, bias=False)
             else:
-                self.lin_beta = self.register_parameter('lin_beta', None)
+                self.lin_beta = self.register_parameter("lin_beta", None)
 
         self.weight = Parameter(torch.Tensor(in_channels[1], heads * out_channels))
         self.bias = Parameter(torch.Tensor(heads * out_channels))
 
         self.n_nodes = n_nodes
-        self.nodewise_weights = Parameter(torch.Tensor(self.n_nodes, heads * out_channels))
+        self.nodewise_weights = Parameter(
+            torch.Tensor(self.n_nodes, heads * out_channels)
+        )
 
-        self.increase_dim = Linear(in_channels[1],  heads * out_channels*8)
+        self.increase_dim = Linear(in_channels[1], heads * out_channels * 8)
         self.map_weights = Parameter(torch.Tensor(self.n_nodes, heads * 16))
 
         self.ob_dim = ob_dim
         self.index = None
-        
+
         # Initialize residual projection as None, will be lazily initialized if needed
-        self.residual_proj = None
+        self.residual_proj: Optional[Linear] = None
 
         self.reset_parameters()
 
@@ -85,7 +96,7 @@ class Observation_progation(MessagePassing):
         self.lin_skip.reset_parameters()
         if self.beta:
             self.lin_beta.reset_parameters()
-        
+
         # Avoid division by zero in glorot initialization
         if self.weight.size(-2) > 0 and self.weight.size(-1) > 0:
             glorot(self.weight)
@@ -93,30 +104,38 @@ class Observation_progation(MessagePassing):
             # Handle zero-sized dimensions
             with torch.no_grad():
                 self.weight.fill_(0)
-        
+
         if self.bias is not None:
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
             bound = 1 / math.sqrt(max(fan_in, 1))  # Ensure fan_in is at least 1
             init.uniform_(self.bias, -bound, bound)
-        
+
         # Avoid division by zero for other parameters
         if self.nodewise_weights.size(-2) > 0 and self.nodewise_weights.size(-1) > 0:
             glorot(self.nodewise_weights)
         else:
             with torch.no_grad():
                 self.nodewise_weights.fill_(0)
-            
+
         if self.map_weights.size(-2) > 0 and self.map_weights.size(-1) > 0:
             glorot(self.map_weights)
         else:
             with torch.no_grad():
                 self.map_weights.fill_(0)
-            
+
         self.increase_dim.reset_parameters()
 
-    def forward(self, x: Union[Tensor, PairTensor], p_t: Tensor, edge_index: Adj, edge_weights=None, use_beta=False,
-                edge_attr: OptTensor = None, return_attention_weights=None, residual: bool = True):
-
+    def forward(
+        self,
+        x: Union[Tensor, PairTensor],
+        p_t: Tensor,
+        edge_index: Adj,
+        edge_weights=None,
+        use_beta=False,
+        edge_attr: OptTensor = None,
+        return_attention_weights=None,
+        residual: bool = True,
+    ):
         r"""
         Args:
             return_attention_weights (bool, optional): If set to :obj:`True`,
@@ -129,36 +148,36 @@ class Observation_progation(MessagePassing):
 
         # Ensure all tensors are on the same device as x
         device = x.device if isinstance(x, Tensor) else x[0].device
-        
+
         # Ensure consistent dtype (Float32)
         if isinstance(x, Tensor) and x.dtype == torch.float64:
             x = x.to(torch.float32)
         elif isinstance(x, tuple):
             if x[0].dtype == torch.float64:
                 x = (x[0].to(torch.float32), x[1].to(torch.float32))
-                
+
         if p_t.dtype == torch.float64:
             p_t = p_t.to(torch.float32)
-            
+
         if isinstance(edge_index, Tensor):
             if edge_index.device != device:
                 edge_index = edge_index.to(device)
             if edge_index.dtype == torch.float64:
                 edge_index = edge_index.to(torch.float32)
-            
+
         if p_t.device != device:
             p_t = p_t.to(device)
-            
+
         if edge_weights is not None:
-            if hasattr(edge_weights, 'device') and edge_weights.device != device:
+            if hasattr(edge_weights, "device") and edge_weights.device != device:
                 edge_weights = edge_weights.to(device)
-            if hasattr(edge_weights, 'dtype') and edge_weights.dtype == torch.float64:
+            if hasattr(edge_weights, "dtype") and edge_weights.dtype == torch.float64:
                 edge_weights = edge_weights.to(torch.float32)
-            
+
         if edge_attr is not None:
-            if hasattr(edge_attr, 'device') and edge_attr.device != device:
+            if hasattr(edge_attr, "device") and edge_attr.device != device:
                 edge_attr = edge_attr.to(device)
-            if hasattr(edge_attr, 'dtype') and edge_attr.dtype == torch.float64:
+            if hasattr(edge_attr, "dtype") and edge_attr.dtype == torch.float64:
                 edge_attr = edge_attr.to(torch.float32)
 
         # Ensure model parameters are Float32
@@ -171,11 +190,15 @@ class Observation_progation(MessagePassing):
         self.use_beta = use_beta
 
         original_x = x
+        x_pair: PairTensor = cast(PairTensor, (x, x) if isinstance(x, Tensor) else x)
 
-        if isinstance(x, Tensor):
-            x: PairTensor = (x, x)
-
-        out = self.propagate(edge_index, x=x, edge_weights=edge_weights, edge_attr=edge_attr, size=None)
+        out = self.propagate(
+            edge_index,
+            x=x_pair,
+            edge_weights=edge_weights,
+            edge_attr=edge_attr,
+            size=None,
+        )
 
         alpha = self._alpha
         self._alpha = None
@@ -186,29 +209,44 @@ class Observation_progation(MessagePassing):
         else:
             out = out.mean(dim=1)
 
-        
         if residual == True:
+            # Ensure we have a tensor for residual path (take target-side features if PairTensor)
+            original_x_tensor: Tensor = (
+                original_x if isinstance(original_x, Tensor) else original_x[1]
+            )
             # Make sure dimensions match
-            if out.size(-1) == original_x.size(-1):
-                out = out + original_x
+            if out.size(-1) == original_x_tensor.size(-1):
+                out = out + original_x_tensor
             else:
                 # If dimensions don't match, use a projection
-                if self.residual_proj is None:
-                    self.residual_proj = Linear(original_x.size(-1), out.size(-1))
-                out = out + self.residual_proj(original_x)
+                proj = self.residual_proj
+                if proj is None:
+                    self.residual_proj = Linear(
+                        original_x_tensor.size(-1), out.size(-1)
+                    )
+                    proj = self.residual_proj
+                assert proj is not None
+                out = out + proj(original_x_tensor)
 
         if isinstance(return_attention_weights, bool):
             assert alpha is not None
             if isinstance(edge_index, Tensor):
                 return out, (edge_index, alpha)
             elif isinstance(edge_index, SparseTensor):
-                return out, edge_index.set_value(alpha, layout='coo')
+                return out, edge_index.set_value(alpha, layout="coo")
         else:
             return out
 
-    def message_selfattention(self, x_i: Tensor, x_j: Tensor,edge_weights: Tensor, edge_attr: OptTensor,
-                index: Tensor, ptr: OptTensor,
-                size_i: Optional[int]) -> Tensor:
+    def message_selfattention(
+        self,
+        x_i: Tensor,
+        x_j: Tensor,
+        edge_weights: Tensor,
+        edge_attr: OptTensor,
+        index: Tensor,
+        ptr: OptTensor,
+        size_i: Optional[int],
+    ) -> Tensor:
         query = self.lin_query(x_i).view(-1, self.heads, self.out_channels)
         key = self.lin_key(x_j).view(-1, self.heads, self.out_channels)
 
@@ -229,9 +267,16 @@ class Observation_progation(MessagePassing):
         out *= alpha.view(-1, self.heads, 1)
         return out
 
-    def message(self, x_i: Tensor, x_j: Tensor, edge_weights: Tensor, edge_attr: OptTensor,
-                index: Tensor, ptr: OptTensor,
-                size_i: Optional[int]) -> Tensor:
+    def message(
+        self,
+        x_i: Tensor,
+        x_j: Tensor,
+        edge_weights: Tensor,
+        edge_attr: OptTensor,
+        index: Tensor,
+        ptr: OptTensor,
+        size_i: Optional[int],
+    ) -> Tensor:
         use_beta = self.use_beta
         if use_beta == True:
             n_step = self.p_t.shape[0]
@@ -242,12 +287,22 @@ class Observation_progation(MessagePassing):
 
             p_emb = self.p_t.unsqueeze(0)
 
-            aa = torch.cat([w_v.repeat(1, n_step, 1,), p_emb.repeat(n_edges, 1, 1)], dim=-1)
+            aa = torch.cat(
+                [
+                    w_v.repeat(
+                        1,
+                        n_step,
+                        1,
+                    ),
+                    p_emb.repeat(n_edges, 1, 1),
+                ],
+                dim=-1,
+            )
             beta = torch.mean(h_W * aa, dim=-1)
 
         if edge_weights is not None:
             if use_beta == True:
-                gamma = beta*(edge_weights.unsqueeze(-1))
+                gamma = beta * (edge_weights.unsqueeze(-1))
                 gamma = torch.repeat_interleave(gamma, self.ob_dim, dim=-1)
 
                 # edge prune, prune out half of edges
@@ -278,16 +333,22 @@ class Observation_progation(MessagePassing):
             target_nodes = self.edge_index[1]
             w1 = self.nodewise_weights[source_nodes].unsqueeze(-1)
             w2 = self.nodewise_weights[target_nodes].unsqueeze(1)
-            out = torch.bmm(x_i.view(-1, self.heads, self.out_channels), torch.bmm(w1, w2))
+            out = torch.bmm(
+                x_i.view(-1, self.heads, self.out_channels), torch.bmm(w1, w2)
+            )
         if use_beta == True:
             out = out * gamma.view(-1, self.heads, out.shape[-1])
         else:
             out = out * gamma.view(-1, self.heads, 1)
         return out
 
-    def aggregate(self, inputs: Tensor, index: Tensor,
-                  ptr: Optional[Tensor] = None,
-                  dim_size: Optional[int] = None) -> Tensor:
+    def aggregate(
+        self,
+        inputs: Tensor,
+        index: Tensor,
+        ptr: Optional[Tensor] = None,
+        dim_size: Optional[int] = None,
+    ) -> Tensor:
         r"""Aggregates messages from neighbors as
         :math:`\square_{j \in \mathcal{N}(i)}`.
 
@@ -299,10 +360,11 @@ class Observation_progation(MessagePassing):
         :meth:`__init__` by the :obj:`aggr` argument.
         """
         index = self.index
-        return scatter(inputs, index, dim=self.node_dim, dim_size=dim_size,
-                           reduce=self.aggr)
+        return scatter(
+            inputs, index, dim=self.node_dim, dim_size=dim_size, reduce=self.aggr
+        )
 
     def __repr__(self):
-        return '{}({}, {}, heads={})'.format(self.__class__.__name__,
-                                             self.in_channels,
-                                             self.out_channels, self.heads)
+        return "{}({}, {}, heads={})".format(
+            self.__class__.__name__, self.in_channels, self.out_channels, self.heads
+        )

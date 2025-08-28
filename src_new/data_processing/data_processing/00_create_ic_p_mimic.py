@@ -6,23 +6,23 @@ Uses efficient patient-batch processing to minimize network calls
 Updated with IC-anchored validation and strict per-minute density requirements
 """
 
-import pandas as pd
-import numpy as np
-import torch
-import pickle
-import wfdb
-import os
-import requests
-from bs4 import BeautifulSoup
-from pathlib import Path
-from datetime import datetime, timedelta
-from tqdm import tqdm
-from scipy.interpolate import interp1d
-import warnings
-from collections import defaultdict
 import concurrent.futures
-import time
+import os
+import pickle
 import random
+import time
+import warnings
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+import torch
+import wfdb
+from bs4 import BeautifulSoup
+from scipy.interpolate import interp1d
+from tqdm import tqdm
 
 # --- Project Root and Data Directories ---
 # Establish a reliable project root assuming a standard src layout
@@ -603,7 +603,7 @@ def extract_ic_and_create_predictions_with_clean_separation(
     else:
         ic_values["R_TPR"] = 0.0
         ic_mask["R_TPR"] = 0.0
-        print(f"      ✗ IC R_TPR: Cannot calculate (missing MAP/CVP/CO)")
+        print("      ✗ IC R_TPR: Cannot calculate (missing MAP/CVP/CO)")
 
     # Step 2: Find the latest IC timestamp from PREDICTION signals only (this becomes our separation point)
     # Step 2: Use the closest point to t₀ as our reference timepoint for prediction start
@@ -622,7 +622,7 @@ def extract_ic_and_create_predictions_with_clean_separation(
     print(
         f"      ✓ Reference timepoint: {reference_time - t0_offset_seconds:.1f}s from t₀"
     )
-    print(f"      ✓ Predictions will start from this timepoint")
+    print("      ✓ Predictions will start from this timepoint")
 
     # Step 3: Extract prediction data starting from reference timepoint
     prediction_end = reference_timestamp + timedelta(minutes=prediction_minutes)
@@ -631,10 +631,10 @@ def extract_ic_and_create_predictions_with_clean_separation(
     )
 
     if not prediction_signals_data:
-        print(f"      ✗ No prediction data available from reference timepoint")
+        print("      ✗ No prediction data available from reference timepoint")
         return None
 
-    print(f"      ✓ Extracted prediction data from reference timepoint")
+    print("      ✓ Extracted prediction data from reference timepoint")
 
     # Step 4: Check data density per minute for prediction window (full duration expected)
     actual_prediction_duration = prediction_minutes
@@ -1150,11 +1150,11 @@ def process_patient_and_save(
             f"  [Worker PID: {os.getpid()}] Saving IC tensor for traj {traj_num}"
         )
         physio_values = [
-            ic_result['ic_values']['ABP Mean'],  # p_a
-            ic_result['ic_values']['CVP'],  # p_v
+            ic_result["ic_values"]["ABP Mean"],  # p_a
+            ic_result["ic_values"]["CVP"],  # p_v
             0,  # s_reflex (baroreflex sensitivity - normal baseline)
-            ic_result['ic_values'].get('SV', 0),  # sv
-            0.0  # r_tpr_mod (TPR modifier starts at 0)
+            ic_result["ic_values"].get("SV", 0),  # sv
+            0.0,  # r_tpr_mod (TPR modifier starts at 0)
         ]
 
         physio_masks = [
@@ -1335,11 +1335,11 @@ def create_integrated_waveform_tensors(
     interval_minutes = traj_metadata["interval_minutes"]
     debug_print(f"Loaded metadata for {len(all_trajectories)} patients.")
 
-    print(f"Data quality requirements:")
+    print("Data quality requirements:")
     print(f"- Min {min_points_per_minute} data points required in EVERY minute")
-    print(f"- ANY minute with insufficient data = trajectory rejected")
-    print(f"- IC values used as anchor points for interpolation")
-    print(f"- Zero tolerance for NaN values after interpolation")
+    print("- ANY minute with insufficient data = trajectory rejected")
+    print("- IC values used as anchor points for interpolation")
+    print("- Zero tolerance for NaN values after interpolation")
 
     all_ics = {}
     all_predictions = {}
@@ -1459,12 +1459,12 @@ def create_integrated_waveform_tensors(
     with open(pred_metadata_file, "wb") as f:
         pickle.dump(prediction_metadata, f)
 
-    print(f"\n✅ IC-ANCHORED INTEGRATED PROCESSING COMPLETE:")
+    print("\n✅ IC-ANCHORED INTEGRATED PROCESSING COMPLETE:")
     print(f"  New patients processed: {len(all_ics)}")
     print(f"  Patients skipped: {skipped_patients}")
     print(f"  IC tensors created: {sum(len(ics) for ics in all_ics.values())}")
-    print(f"  Strategy: IC closest to t₀ → predictions chronologically after")
-    print(f"  Quality: ZERO overlap, strict per-minute density, no NaN tolerance")
+    print("  Strategy: IC closest to t₀ → predictions chronologically after")
+    print("  Quality: ZERO overlap, strict per-minute density, no NaN tolerance")
     print(
         f"  Validation method: Clean separation with {min_points_per_minute} points/min"
     )

@@ -6,10 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
+from create_context_tensors import create_baseline_tensors, create_context_tensors
+from create_ic_targets import create_physiological_tensors
+
 # Local imports (modules live in the same directory)
 from create_med_tensors import create_med_tensors_from_parquet
-from create_ic_targets import create_physiological_tensors
-from create_context_tensors import create_context_tensors, create_baseline_tensors
 
 
 def _configure_logging(verbosity: int) -> None:
@@ -41,6 +42,7 @@ def generate_all_tensors(
     context_interval_minutes: int = 10,
     hosp_input_dir: str | None = None,
     force_reload: bool = False,
+    context_workers: int = 6,
 ) -> Dict[str, Any]:
     """Generate medication tensors, physiological IC/target tensors, and context tensors.
 
@@ -66,7 +68,9 @@ def generate_all_tensors(
     """
     # Validate inputs
     if not os.path.exists(waveforms_parquet_path):
-        raise FileNotFoundError(f"Waveforms parquet not found: {waveforms_parquet_path}")
+        raise FileNotFoundError(
+            f"Waveforms parquet not found: {waveforms_parquet_path}"
+        )
     if not os.path.exists(med_parquet_path):
         raise FileNotFoundError(f"Medication parquet not found: {med_parquet_path}")
 
@@ -84,7 +88,9 @@ def generate_all_tensors(
     med_metadata_path = med_out_dir / "med_tensors_metadata.pkl"
     med_metadata: Dict[str, Any] | None = None
     if med_metadata_path.exists() and not force_reload:
-        logging.info("Step 1/4: Medication tensors already exist. Skipping (use --force-reload to regenerate).")
+        logging.info(
+            "Step 1/4: Medication tensors already exist. Skipping (use --force-reload to regenerate)."
+        )
         with open(med_metadata_path, "rb") as f:
             med_metadata = pickle.load(f)
     else:
@@ -103,11 +109,15 @@ def generate_all_tensors(
     physio_metadata_path = physio_out_dir / "physio_tensors_metadata.pkl"
     physio_metadata: Dict[str, Any] | None = None
     if physio_metadata_path.exists() and not force_reload:
-        logging.info("Step 2/4: Physiological tensors already exist. Skipping (use --force-reload to regenerate).")
+        logging.info(
+            "Step 2/4: Physiological tensors already exist. Skipping (use --force-reload to regenerate)."
+        )
         with open(physio_metadata_path, "rb") as f:
             physio_metadata = pickle.load(f)
     else:
-        logging.info("Step 2/4: Generating physiological IC and prediction target tensors ...")
+        logging.info(
+            "Step 2/4: Generating physiological IC and prediction target tensors ..."
+        )
         physio_metadata = create_physiological_tensors(
             waveforms_parquet_path=str(waveforms_parquet_path),
             med_tensors_metadata_path=str(med_metadata_path),
@@ -118,7 +128,9 @@ def generate_all_tensors(
     context_metadata_path = context_out_dir / "context_tensors_metadata.pkl"
     context_metadata: Dict[str, Any] | None = None
     if context_metadata_path.exists() and not force_reload:
-        logging.info("Step 3/4: Context tensors already exist. Skipping (use --force-reload to regenerate).")
+        logging.info(
+            "Step 3/4: Context tensors already exist. Skipping (use --force-reload to regenerate)."
+        )
         with open(context_metadata_path, "rb") as f:
             context_metadata = pickle.load(f)
     else:
@@ -130,16 +142,23 @@ def generate_all_tensors(
             output_dir=str(context_out_dir),
             context_duration_minutes=context_duration_minutes,
             context_interval_minutes=context_interval_minutes,
+            n_workers=context_workers,
         )
 
     # Optional Step 4/4: Baseline tensors
     baseline_metadata_obj: Dict[str, Any] | None = None
-    baseline_metadata_file = baseline_out_dir / "baseline_tensors" / "baseline_metadata.pkl"
+    baseline_metadata_file = (
+        baseline_out_dir / "baseline_tensors" / "baseline_metadata.pkl"
+    )
     if hosp_input_dir is None:
-        logging.info("Step 4/4: Baseline tensors skipped (no --hosp-input-dir provided).")
+        logging.info(
+            "Step 4/4: Baseline tensors skipped (no --hosp-input-dir provided)."
+        )
     else:
         if baseline_metadata_file.exists() and not force_reload:
-            logging.info("Step 4/4: Baseline tensors already exist. Skipping (use --force-reload to regenerate).")
+            logging.info(
+                "Step 4/4: Baseline tensors already exist. Skipping (use --force-reload to regenerate)."
+            )
         else:
             logging.info("Step 4/4: Generating baseline tensors ...")
             create_baseline_tensors(
@@ -160,7 +179,9 @@ def generate_all_tensors(
         "inputs": {
             "waveforms_parquet_path": str(waveforms_parquet_path),
             "med_parquet_path": str(med_parquet_path),
-            "hosp_input_dir": str(hosp_input_dir) if hosp_input_dir is not None else None,
+            "hosp_input_dir": str(hosp_input_dir)
+            if hosp_input_dir is not None
+            else None,
         },
         "params": {
             "interval_seconds": interval_seconds,
@@ -249,6 +270,12 @@ def _parse_args() -> argparse.Namespace:
         help="Bin size in minutes for context tensors (default: 10).",
     )
     parser.add_argument(
+        "--context-workers",
+        type=int,
+        default=6,
+        help="Number of worker processes for context generation (default: 1).",
+    )
+    parser.add_argument(
         "--mimic-III-input-dir",
         type=str,
         default=None,
@@ -287,10 +314,9 @@ def main() -> None:
         context_interval_minutes=args.context_interval_minutes,
         hosp_input_dir=args.mimic_III_input_dir,
         force_reload=args.force_reload,
+        context_workers=args.context_workers,
     )
 
 
 if __name__ == "__main__":
     main()
-
-

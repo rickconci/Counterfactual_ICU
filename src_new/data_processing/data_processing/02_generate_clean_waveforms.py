@@ -1,33 +1,44 @@
-import os
 import argparse
+import os
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from tqdm.auto import tqdm
-from data_config import WAVEFORM_DIR, PROCESSED_DATA_DIR, TARGET_COLUMNS, TARGET_SCHEMA
+from data_config import PROCESSED_DATA_DIR, TARGET_COLUMNS, TARGET_SCHEMA, WAVEFORM_DIR
 from data_utils import _enforce_pandas_dtypes
-
+from tqdm.auto import tqdm
 
 
 def build_combined_waveform_df_streaming(
     waveform_dir_path: str,
     prefix: str = "full_waveform_",
     suffix: str = ".parquet",
-    cols_to_keep_pretty = (
-        'hadm_id','record_name','absolute_timestamp',
-        'ABP MEAN','NBP MEAN','CVP','HR','RESP',
-        'record_start_time','record_end_time','icu_admission_time','time_seconds'
+    cols_to_keep_pretty=(
+        "hadm_id",
+        "record_name",
+        "absolute_timestamp",
+        "ABP MEAN",
+        "NBP MEAN",
+        "CVP",
+        "HR",
+        "RESP",
+        "record_start_time",
+        "record_end_time",
+        "icu_admission_time",
+        "time_seconds",
     ),
     require_both_abp_cvp: bool = True,
-    output_path: str = None,          # if given, writes a fresh parquet
+    output_path: Optional[str] = None,  # if given, writes a fresh parquet
     return_dataframe: bool = True,
     max_rows_in_memory: int = 2_000_000,
     progress: bool = True,
     verbose: bool = True,
 ):
     files = sorted(
-        f for f in os.listdir(waveform_dir_path)
+        f
+        for f in os.listdir(waveform_dir_path)
         if f.startswith(prefix) and f.endswith(suffix)
     )
 
@@ -108,10 +119,16 @@ def build_combined_waveform_df_streaming(
                 if fname not in filled_missing and missing_lower:
                     filled_missing[fname] = list(missing_lower)
 
-            if ("absolute_timestamp" not in df.columns) or df["absolute_timestamp"].isna().all():
-                if ("record_start_time" in df.columns) and ("time_seconds" in df.columns):
-                    rstart = pd.to_datetime(df["record_start_time"], errors="coerce", utc=True)
-                    tsecs  = pd.to_numeric(df["time_seconds"], errors="coerce")
+            if ("absolute_timestamp" not in df.columns) or df[
+                "absolute_timestamp"
+            ].isna().all():
+                if ("record_start_time" in df.columns) and (
+                    "time_seconds" in df.columns
+                ):
+                    rstart = pd.to_datetime(
+                        df["record_start_time"], errors="coerce", utc=True
+                    )
+                    tsecs = pd.to_numeric(df["time_seconds"], errors="coerce")
                     df["absolute_timestamp"] = rstart + pd.to_timedelta(tsecs, unit="s")
                 else:
                     df["absolute_timestamp"] = pd.NaT
@@ -119,7 +136,9 @@ def build_combined_waveform_df_streaming(
             if "hadm_id" in df.columns:
                 s = pd.to_numeric(df["hadm_id"], errors="coerce").astype("float64")
                 s_np = s.to_numpy()
-                is_whole = np.isfinite(s_np) & np.isclose(s_np, np.floor(s_np), rtol=0, atol=1e-9)
+                is_whole = np.isfinite(s_np) & np.isclose(
+                    s_np, np.floor(s_np), rtol=0, atol=1e-9
+                )
                 s_np[~is_whole] = np.nan
                 df["hadm_id"] = pd.Series(s_np, index=df.index).astype("Int64")
 
@@ -136,7 +155,9 @@ def build_combined_waveform_df_streaming(
             # >>> WRITE ONLY IF output_path IS PROVIDED
             if output_path:  # <<< add guard
                 if writer is None:
-                    writer = pq.ParquetWriter(output_path, TARGET_SCHEMA, compression="snappy")
+                    writer = pq.ParquetWriter(
+                        output_path, TARGET_SCHEMA, compression="snappy"
+                    )
                 if not tbl.schema.equals(TARGET_SCHEMA):
                     tbl = tbl.cast(TARGET_SCHEMA, safe=False)
                 writer.write_table(tbl)
@@ -147,7 +168,8 @@ def build_combined_waveform_df_streaming(
                 if frames_row_count >= max_rows_in_memory:
                     combined_df = (
                         pd.concat([combined_df, *frames], ignore_index=True)
-                        if combined_df is not None else pd.concat(frames, ignore_index=True)
+                        if combined_df is not None
+                        else pd.concat(frames, ignore_index=True)
                     )
                     frames.clear()
                     frames_row_count = 0
@@ -163,8 +185,11 @@ def build_combined_waveform_df_streaming(
 
     if return_dataframe:
         if frames:
-            combined_df = (pd.concat([combined_df, *frames], ignore_index=True)
-                           if combined_df is not None else pd.concat(frames, ignore_index=True))
+            combined_df = (
+                pd.concat([combined_df, *frames], ignore_index=True)
+                if combined_df is not None
+                else pd.concat(frames, ignore_index=True)
+            )
         if combined_df is None:
             combined_df = pd.DataFrame(columns=cols_to_keep_pretty)
 
@@ -188,13 +213,13 @@ def clean_waveform_df(df: pd.DataFrame) -> pd.DataFrame:
     if "RESP" in df:
         df.loc[(df["RESP"] < 8) | (df["RESP"] > 40), "RESP"] = np.nan
     if "ABP MEAN" in df:
-        df.loc[(df["ABP MEAN"] > 190 )| (df["ABP MEAN"] < 40) , "ABP MEAN"] = np.nan
-    
+        df.loc[(df["ABP MEAN"] > 190) | (df["ABP MEAN"] < 40), "ABP MEAN"] = np.nan
 
     keep_cols = [c for c in ["ABP MEAN", "CVP"] if c in df.columns]
     if keep_cols:
         df = df.dropna(subset=keep_cols, how="all")
     return df
+
 
 def clean_parquet_in_chunks(
     input_path: str,
@@ -222,7 +247,9 @@ def clean_parquet_in_chunks(
         rgs = tqdm(rgs, desc="Cleaning in chunks")
 
     for rg in rgs:
-        table = pf.read_row_group(rg)  # read all columns; it's already column-pruned upstream
+        table = pf.read_row_group(
+            rg
+        )  # read all columns; it's already column-pruned upstream
         df = table.to_pandas()
         total_in += len(df)
 
@@ -250,7 +277,9 @@ def clean_parquet_in_chunks(
 
             tbl = pa.Table.from_pandas(chunk, preserve_index=False)
             if writer is None:
-                writer = pq.ParquetWriter(output_clean_path, TARGET_SCHEMA, compression="snappy")
+                writer = pq.ParquetWriter(
+                    output_clean_path, TARGET_SCHEMA, compression="snappy"
+                )
             if not tbl.schema.equals(TARGET_SCHEMA):
                 tbl = tbl.cast(TARGET_SCHEMA, safe=False)
             writer.write_table(tbl)
@@ -261,7 +290,9 @@ def clean_parquet_in_chunks(
         chunk = pd.concat(batch_frames, ignore_index=True)
         tbl = pa.Table.from_pandas(chunk, preserve_index=False)
         if writer is None:
-            writer = pq.ParquetWriter(output_clean_path, TARGET_SCHEMA, compression="snappy")
+            writer = pq.ParquetWriter(
+                output_clean_path, TARGET_SCHEMA, compression="snappy"
+            )
         if not tbl.schema.equals(TARGET_SCHEMA):
             tbl = tbl.cast(TARGET_SCHEMA, safe=False)
         writer.write_table(tbl)
@@ -281,25 +312,28 @@ def clean_parquet_in_chunks(
 ## Smoothing functions
 
 
-
-def _smooth_1d_nanaware(arr: np.ndarray, neighbors: int,
-                        keep_nan_center: bool = True,
-                        min_valid: int = 1) -> np.ndarray:
+def _smooth_1d_nanaware(
+    arr: np.ndarray, neighbors: int, keep_nan_center: bool = True, min_valid: int = 1
+) -> np.ndarray:
     if neighbors <= 0 or arr.size == 0:
         return arr.astype(float, copy=True)
-    win = 2*neighbors + 1
+    win = 2 * neighbors + 1
     s = pd.Series(arr, dtype="float64")
     sm = s.rolling(win, center=True, min_periods=min_valid).mean()
     if keep_nan_center:
         sm[s.isna()] = np.nan
     return sm.to_numpy()
 
+
 def _clip_inplace(g: pd.DataFrame):
     if "ABP MEAN" in g:
-        g["ABP MEAN"] = pd.to_numeric(g["ABP MEAN"], errors="coerce").clip(lower=40, upper=180)
+        g["ABP MEAN"] = pd.to_numeric(g["ABP MEAN"], errors="coerce").clip(
+            lower=40, upper=180
+        )
     if "CVP" in g:
         g["CVP"] = pd.to_numeric(g["CVP"], errors="coerce").clip(lower=0, upper=40)
     return g
+
 
 def _zero_center_cols(g: pd.DataFrame, cols, suffix="_zc"):
     for c in cols:
@@ -308,13 +342,17 @@ def _zero_center_cols(g: pd.DataFrame, cols, suffix="_zc"):
             g[f"{c}{suffix}"] = g[c] - mu
     return g
 
+
 def _zscore_cols(g: pd.DataFrame, cols, suffix="_zn"):
     for c in cols:
         if c in g:
             mu = g[c].mean(skipna=True)
             sd = g[c].std(skipna=True)
-            g[f"{c}{suffix}"] = (g[c] - mu) / sd if (pd.notna(sd) and sd > 0) else np.nan
+            g[f"{c}{suffix}"] = (
+                (g[c] - mu) / sd if (pd.notna(sd) and sd > 0) else np.nan
+            )
     return g
+
 
 def _smooth_cols_multi(g: pd.DataFrame, cols, neighbors, source_suffixes, out_suffix):
     """
@@ -327,21 +365,27 @@ def _smooth_cols_multi(g: pd.DataFrame, cols, neighbors, source_suffixes, out_su
             if base in g:
                 g[f"{base}{out_suffix}"] = _smooth_1d_nanaware(
                     pd.to_numeric(g[base], errors="coerce").to_numpy(),
-                    neighbors=neighbors, keep_nan_center=True, min_valid=1
+                    neighbors=neighbors,
+                    keep_nan_center=True,
+                    min_valid=1,
                 )
     return g
 
-# goes thru wf database, choose z_score or z_center. Keep signal, abs timestamp, zero_center false, z-score false. 
+
+# goes thru wf database, choose z_score or z_center. Keep signal, abs timestamp, zero_center false, z-score false.
 def run_waveform_pipeline(
     df: pd.DataFrame,
-    signals=("ABP MEAN","CVP","HR","RESP"),
+    signals=("ABP MEAN", "CVP", "HR", "RESP"),
     time_col="absolute_timestamp",
-    group_cols=("hadm_id","record_name"),
+    group_cols=("hadm_id", "record_name"),
     *,
     do_zero_center: bool = True,
     do_zscore: bool = True,
     smooth_neighbors: int = 120,
-    smooth_variants=("zc","zn"),   # <- choose any of {"raw","zc","zn"}; e.g. ("zc","zn")
+    smooth_variants=(
+        "zc",
+        "zn",
+    ),  # <- choose any of {"raw","zc","zn"}; e.g. ("zc","zn")
     out_suffix: str = "_ma120",
     flush_every_rows: int = 2_000_000,
 ):
@@ -376,8 +420,13 @@ def run_waveform_pipeline(
 
         # 3) smoothing for any requested variants
         if smooth_neighbors and smooth_neighbors > 0 and src_suffixes:
-            g = _smooth_cols_multi(g, signals, neighbors=smooth_neighbors,
-                                   source_suffixes=src_suffixes, out_suffix=out_suffix)
+            g = _smooth_cols_multi(
+                g,
+                signals,
+                neighbors=smooth_neighbors,
+                source_suffixes=src_suffixes,
+                out_suffix=out_suffix,
+            )
 
         out_frames.append(g)
         acc_rows += len(g)
@@ -390,15 +439,25 @@ def run_waveform_pipeline(
         yield pd.concat(out_frames, ignore_index=True)
 
 
-
-
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Combine, clean, smooth ICU waveforms")
-    parser.add_argument("--waveform_dir", type=str, default=str(WAVEFORM_DIR), help="Directory with full_waveform_*.parquet files")
-    parser.add_argument("--neighbors", type=int, default=120, help="Smoothing neighbors each side (window=2*n+1)")
-    parser.add_argument("--require_both", action="store_true", help="Require both ABP MEAN and CVP to include a file")
+    parser.add_argument(
+        "--waveform_dir",
+        type=str,
+        default=str(WAVEFORM_DIR),
+        help="Directory with full_waveform_*.parquet files",
+    )
+    parser.add_argument(
+        "--neighbors",
+        type=int,
+        default=120,
+        help="Smoothing neighbors each side (window=2*n+1)",
+    )
+    parser.add_argument(
+        "--require_both",
+        action="store_true",
+        help="Require both ABP MEAN and CVP to include a file",
+    )
     args = parser.parse_args()
 
     waveform_root = args.waveform_dir
@@ -418,7 +477,9 @@ if __name__ == "__main__":
 
     # 2) Clean out-of-range values -> NaN and drop rows with both ABP MEAN and CVP missing
     cleaned_path = PROCESSED_DATA_DIR / "combined_waveforms_cleaned.parquet"
-    stats = clean_parquet_in_chunks(str(combined_path), str(cleaned_path), chunk_rows=10_000_000)
+    stats = clean_parquet_in_chunks(
+        str(combined_path), str(cleaned_path), chunk_rows=10_000_000
+    )
     print(stats)
 
     # 3) Smooth and create normalized variants (zc/zn), then write final parquet
@@ -446,9 +507,3 @@ if __name__ == "__main__":
         writer.close()
 
     print("Saved final:", final_path, "exists?", os.path.exists(final_path))
-
-
-        
-
-
-

@@ -1,0 +1,9 @@
+exclude = [
+  "**/*.ipynb",
+]
+
+[lint]
+extend-select = ["E", "F", "I"]
+# Keep other defaults; project can extend this as needed.
+
+

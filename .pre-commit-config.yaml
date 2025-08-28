@@ -1,0 +1,27 @@
+repos:
+  # Ruff: lint + format
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9   # Use the latest release
+    hooks:
+      - id: ruff
+        args: [--fix]   # auto-fix lint issues where possible
+      - id: ruff-format
+
+  # Black (optional, only if you prefer it over ruff-format)
+  # - repo: https://github.com/psf/black
+  #   rev: 24.8.0
+  #   hooks:
+  #     - id: black
+
+  # Mypy: static type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-requests, types-PyYAML]  # add stubs you need
+
+  # Pylint (optional, for deeper style checks beyond Ruff)
+  # - repo: https://github.com/PyCQA/pylint
+  #   rev: v3.2.6
+  #   hooks:
+  #     - id: pylint
