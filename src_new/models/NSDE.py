@@ -7,7 +7,7 @@ import wandb
 from lightning import LightningModule
 from raindrop import Raindrop_v2
 from torch import distributions, nn
-from torchdiffeq import odeint, odeint_adjoint
+import torchsde
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
 from utils_beta import (
@@ -23,14 +23,14 @@ from utils_beta import (
 DEBUG = False
 
 
-class NODE(LightningModule):
+class NSDE(LightningModule):
     def __init__(
         self,
         use_encoder,
         # Encoder
         encoder_input_dim,
         encoder_hidden_dim,
-        encoder_ODENN_dims,
+        encoder_SDENN_dims,
         expert_latent_dims,
         encoder_num_layers,
         encoder_w_time,
@@ -40,14 +40,14 @@ class NODE(LightningModule):
         static_input_dim,
         static_hidden_dim,
         fusion_hidden_dim,
-        # ODE params
+        # SDE params
         prior_tx_sigma,
         prior_tx_mu,
         include_time,
-        # ODE model params
+        # SDE model params
         num_samples,
-        ODEnet_hidden_dim,
-        ODEnet_depth,
+        SDEnet_hidden_dim,
+        SDEnet_depth,
         final_activation,
         use_batch_norm,
         integration_step_size,
@@ -81,8 +81,6 @@ class NODE(LightningModule):
                 f"[DEBUG] ODE __init__: Initializing... adjoint={adjoint}, use_encoder={use_encoder}, normalise_for_ODENN={normalise_for_ODENN}"
             )
 
-        self.odeint_fn = odeint_adjoint if adjoint else odeint
-
         ### ADMIN
         self.train_dir = train_dir
         self.learning_rate = learning_rate
@@ -94,10 +92,12 @@ class NODE(LightningModule):
         self.include_time = include_time
 
         ### Encoder model
-        self.encoder_ODENN_dims = encoder_ODENN_dims
-        self.encoder_output_dim = encoder_ODENN_dims + expert_latent_dims
+        self.encoder_SDENN_dims = encoder_SDENN_dims
+        self.encoder_output_dim = encoder_SDENN_dims + expert_latent_dims
 
         self.start_dec_at_treatment = start_dec_at_treatment
+
+        self.noise_scale = prior_tx_sigma
 
         temporal_embedding_dim = 0  # To store the output dim of the temporal encoder
 
@@ -160,7 +160,7 @@ class NODE(LightningModule):
             self.ode_latent_head = nn.Sequential(
                 nn.Linear(fusion_hidden_dim, expert_latent_dims), nn.Sigmoid()
             )
-            # Head 2: Predicts the separate embedding for the neural ODE component
+            # Head 2: Predicts the separate embedding for the neural SDE component
             self.neural_embedding_head = nn.Linear(
                 fusion_hidden_dim, encoder_ODENN_dims
             )
@@ -176,9 +176,9 @@ class NODE(LightningModule):
         self.num_samples = num_samples
         self.expert_latent_dims = expert_latent_dims
 
-        self.ODEnet_hidden_dim = ODEnet_hidden_dim
-        self.ODEnet_depth = ODEnet_depth
-        self.ODEnet_out_dims = 2
+        self.SDEnet_hidden_dim = SDEnet_hidden_dim
+        self.SDEnet_depth = SDEnet_depth
+        self.SDEnet_out_dims = 2
 
         net_input_dims = self.encoder_output_dim
         net_input_dims = net_input_dims + 2 if include_time else net_input_dims
@@ -198,20 +198,20 @@ class NODE(LightningModule):
 
         # TODO change net input dims to be 14 + number of meds if there is no encoder, else encoder dim + 14 + meds
 
-        self.ODEnet = MLPSimple(
+        self.SDEnet = MLPSimple(
             input_dim=net_input_dims,
             output_dim=2,
-            hidden_dim=ODEnet_hidden_dim,
-            depth=ODEnet_depth,
-            activations=[nn.Tanh() for _ in range(ODEnet_depth)],
+            hidden_dim=SDEnet_hidden_dim,
+            depth=SDEnet_depth,
+            activations=[nn.Tanh() for _ in range(SDEnet_depth)],
             final_activation=final_activation_real,
             use_batch_norm=use_batch_norm,
             debug=self.debug,
         )
 
         # Initialization trick from Glow.
-        # self.ODEnet.output_layer[0].weight.data.fill_(0.)
-        # self.ODEnet.output_layer[0].bias.data.fill_(0.)
+        # self.SDEnet.output_layer[0].weight.data.fill_(0.)
+        # self.SDEnet.output_layer[0].bias.data.fill_(0.)
 
         ### DECODER
         self.decoder_output_dims = decoder_output_dims
@@ -233,7 +233,7 @@ class NODE(LightningModule):
         self.save_hyperparameters()
         if self.debug:
             print(
-                f"[DEBUG] Hybrid_ODE __init__: Initialization complete. Encoder output dim: {self.encoder_output_dim}, ODEnet input dims: {net_input_dims}"
+                f"[DEBUG] Hybrid_SDE __init__: Initialization complete. Encoder output dim: {self.encoder_output_dim}, SDEnet input dims: {net_input_dims}"
             )
 
         # check baroreflex sensitivity
@@ -348,7 +348,7 @@ class NODE(LightningModule):
     def forward_enc(self, input_vals, time_in, static=None, lengths=None):
         if self.debug:
             print(
-                f"[DEBUG] Hybrid_ODE forward_enc: input_vals_shape={input_vals.shape}, time_in_shape={time_in.shape}, use_encoder={self.use_encoder}"
+                f"[DEBUG] Hybrid_SDE forward_enc: input_vals_shape={input_vals.shape}, time_in_shape={time_in.shape}, use_encoder={self.use_encoder}"
             )
 
         if self.use_encoder == "raindrop":
@@ -370,7 +370,7 @@ class NODE(LightningModule):
                     z1 = self.temporal_encoder(input_vals, time_in)
                     if self.debug:
                         print(
-                            f"[DEBUG] Hybrid_ODE forward_enc (non-variational): Encoder output z1_shape (before repeat): {z1.shape}"
+                            f"[DEBUG] Hybrid_SDE forward_enc (non-variational): Encoder output z1_shape (before repeat): {z1.shape}"
                         )
                     # The following line seems incorrect as sigmoid_scale is not a method of this class. Assuming it's a typo from original code.
                     z1 = z1.unsqueeze(1).repeat(1, self.num_samples, 1)
@@ -384,14 +384,14 @@ class NODE(LightningModule):
             z1 = input_vals.unsqueeze(1).repeat(1, self.num_samples, 1)
             if self.debug:
                 print(
-                    f"[DEBUG] Hybrid_ODE forward_enc (no encoder, no variational sampling): z1_shape={z1.shape}"
+                    f"[DEBUG] Hybrid_SDE forward_enc (no encoder, no variational sampling): z1_shape={z1.shape}"
                 )
             logqp0 = 0
             z1_logvar = None
 
         if self.debug:
             print(
-                f"[DEBUG] Hybrid_ODE forward_enc: Returning z1_shape={z1.shape}, z1_logvar_type={type(z1_logvar)}, logqp0_type={type(logqp0)}"
+                f"[DEBUG] Hybrid_SDE forward_enc: Returning z1_shape={z1.shape}, z1_logvar_type={type(z1_logvar)}, logqp0_type={type(logqp0)}"
             )
         return z1, z1_logvar, logqp0
 
@@ -457,7 +457,7 @@ class NODE(LightningModule):
         samples_per_batch = expanded_batch_size // batch_size
         return result.repeat_interleave(samples_per_batch, dim=0)
 
-    def f_ode(self, t, y):
+    def f(self, t, y):
         batch_size = y.shape[0]
 
         # y structure: [expert_latents (14), neural_embedding (4)]
@@ -470,7 +470,7 @@ class NODE(LightningModule):
         ]
 
         # Normalize expert latents (which include current pressures)
-        normalized_expert_latents = self.normalise_ode_inputs(expert_latents)
+        normalized_expert_latents = self.normalise_sde_inputs(expert_latents)
 
         # Get medication context
         med_context = self.get_medication_context(t, batch_size)
@@ -487,14 +487,28 @@ class NODE(LightningModule):
         nn_input = torch.cat([nn_input, med_context], dim=-1)
 
         # Get derivatives for only p_a, p_v (first 2 elements)
-        pressure_derivatives = self.ODEnet(nn_input)  # [batch, 2]
+        pressure_derivatives = self.SDEnet(nn_input)  # [batch, 2]
 
         # Only the first 2 elements (p_a, p_v) have non-zero derivatives
         full_derivatives = torch.zeros_like(y)
         full_derivatives[:, :2] = pressure_derivatives
         return full_derivatives
 
-    def normalise_ode_inputs(self, expert_vars):
+    def g(self, t, y):
+        """Diffusion function - adds stochasticity"""
+        batch_size = y.shape[0]
+
+        # Create diffusion matrix
+        diffusion = torch.zeros_like(y)
+
+        # Add noise only to pressure variables (first 2 dimensions)
+        diffusion[:, 0] = self.noise_scale  # p_a noise
+        diffusion[:, 1] = self.noise_scale
+        # diffusion[:, 2:] = 0  # No noise on other states
+
+        return diffusion
+
+    def normalise_sde_inputs(self, expert_vars):
         """
         Normalize expert variables with different strategies:
         - First two variables: (x - mu) / sigma
@@ -542,11 +556,11 @@ class NODE(LightningModule):
             X_for_encoder = select_tensor_by_index_list_advanced(X, [0, 1, 2, 3])
         else:
             # When not using an encoder, we manually construct the initial latent state.
-            # This state must match the dimensions expected by the ODE dynamics.
+            # This state must match the dimensions expected by the SDE dynamics.
             # It consists of the control signal (i_ext, starts at 0) and the expert variables.
             batch_size = X.shape[0]
             zeros_for_i_ext = torch.zeros(
-                batch_size, self.ODEnet_out_dims, device=self.device
+                batch_size, self.SDEnet_out_dims, device=self.device
             )
             expert_inits = init_states[:, : self.expert_latent_dims]
             X_for_encoder = torch.cat([zeros_for_i_ext, expert_inits], dim=1)
@@ -632,12 +646,14 @@ class NODE(LightningModule):
         assert y0.dim() == 2, f"Expected [batch, features], got {y0.shape}"
 
         # Integrate ODE
-        trajectory = self.odeint_fn(
-            self.f_ode,
-            y0,
-            ts,
+        trajectory = self.sdeint_fn(
+            sde=self,
+            y0=y0,
+            ts=ts,
             method=self.integration_method,
-            options={"step_size": self.integration_step_size},
+            dt=self.integration_step_size,
+            rtol=self.rtol,
+            atol=self.atol
         )
 
         # Reshape and extract pressure trajectory
@@ -669,8 +685,6 @@ class NODE(LightningModule):
 
         # Get the number of IC variables we have
         num_ic_vars = init_states.shape[-1]
-
-        # TODO compute loss over normalized values
 
         # predicted_ode_latents are already sigmoided, so use them directly
         sigmoid_predicted = predicted_ode_latents_sigmoid[
@@ -709,11 +723,11 @@ class NODE(LightningModule):
         true_traj_expanded = true_traj.unsqueeze(1)
         if self.debug:
             print(
-                f"[DEBUG] Hybrid_ODE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}, logqp_mean={logqp.mean().item() if logqp.numel() > 0 else 'N/A'}"
+                f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}, logqp_mean={logqp.mean().item() if logqp.numel() > 0 else 'N/A'}"
             )
 
             print(
-                f"[DEBUG] Hybrid_ODE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}"
+                f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}"
             )
 
             # ADD THESE DEBUG CHECKS:
@@ -732,7 +746,7 @@ class NODE(LightningModule):
             )
 
             print(
-                f"[DEBUG] Hybrid_ODE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}"
+                f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}"
             )
         # Compute log probability
         logpy = distributions.Normal(
@@ -774,15 +788,15 @@ class NODE(LightningModule):
         current_kl_weight = self.kl_scheduler.val
         self.kl_scheduler.step()
 
-        loss = -logpy.mean()
+        loss = -logpy.mean() + self.KL_weighting_SDE * current_kl_weight * logqp.mean()
 
         return loss, -logpy.mean(), logqp.mean()
 
-    def _prepare_ode_initial_state(
+    def _prepare_sde_initial_state(
         self, predicted_ode_latents, neural_embedding, init_states, ic_mask
     ):
         """
-        Prepares the initial state for the ODE by combining the interpolated initial
+        Prepares the initial state for the SDE by combining the interpolated initial
         conditions with the encoder's two-headed output.
         """
         # Number of variables provided by the IC tensor
@@ -817,29 +831,29 @@ class NODE(LightningModule):
         # Part 3: The separate neural embedding
         neural_part = neural_embedding
 
-        # Concatenate to form the full initial state for the ODE.
+        # Concatenate to form the full initial state for the SDE.
         # Note: The neural part comes *after* the expert ODE part.
         # expert_part = torch.cat([expert_part, inferred_part], dim=-1)
-        z1_for_ode = torch.cat([expert_part, neural_part], dim=-1)
+        z1_for_sde = torch.cat([expert_part, neural_part], dim=-1)
 
         if self.debug:
-            print(f"Z1 for ODE dim: {z1_for_ode.shape}. Expect: [23 x 7 x 18]")
+            print(f"Z1 for SDE dim: {z1_for_sde.shape}. Expect: [23 x 7 x 18]")
 
         if self.debug:
             print(
-                f"  final z1_for_ode shape: {z1_for_ode.shape}, snippet:\n{z1_for_ode[0, 0, :6]}"
+                f"  final z1_for_sde shape: {z1_for_sde.shape}, snippet:\n{z1_for_sde[0, 0, :6]}"
             )
 
-        if torch.isnan(z1_for_ode).any():
-            print("[ERROR] NaN in final z1_for_ode!")
-            nan_locs = torch.where(torch.isnan(z1_for_ode))
-            print(f"NaN locations in z1_for_ode: {nan_locs}")
+        if torch.isnan(z1_for_sde).any():
+            print("[ERROR] NaN in final z1_for_sde!")
+            nan_locs = torch.where(torch.isnan(z1_for_sde))
+            print(f"NaN locations in z1_for_sde: {nan_locs}")
 
-        return z1_for_ode
+        return z1_for_sde
 
     def common_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_ODE validation_step: batch_idx={batch_idx}")
+            print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
         if self.dataset == "mimic":
             (
                 rd_src,
@@ -896,7 +910,7 @@ class NODE(LightningModule):
                 .unsqueeze(1)
                 .repeat(1, self.num_samples, 1)
             )
-            z1_for_ode = self._prepare_ode_initial_state(
+            z1_for_sde = self._prepare_sde_initial_state(
                 predicted_ode_latents, neural_embedding, init_states, ic_mask
             )
 
@@ -909,14 +923,14 @@ class NODE(LightningModule):
             initial_condition = self._prepare_no_encoder_initial_state(
                 init_states, ic_mask
             )
-            z1_for_ode = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
+            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
             logqp0 = 0
             ic_consistency_loss = 0
 
         valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
 
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
-            init_latents=z1_for_ode,
+            init_latents=z1_for_sde,
             ts=ts,
             Tx=torch.ones(batch_size, device=self.device),
             time_to_tx=torch.zeros(batch_size, device=self.device),
@@ -961,12 +975,12 @@ class NODE(LightningModule):
             "Y": Y,
             "combined_mask": combined_mask,
             "i_ext_path": i_ext_path,
-            "z1_for_ode": z1_for_ode,
+            "z1_for_sde": z1_for_sde,
         }
 
     def training_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_ODE validation_step: batch_idx={batch_idx}")
+            print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
         result = self.common_step(batch, batch_idx)
 
         total_loss = result["total_loss"]
@@ -1011,7 +1025,7 @@ class NODE(LightningModule):
                     result["combined_mask"],
                     result["i_ext_path"],
                     batch_idx,
-                    result["z1_for_ode"],
+                    result["z1_for_sde"],
                 )
             except Exception as e:
                 if self.debug:
@@ -1068,7 +1082,7 @@ class NODE(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_ODE validation_step: batch_idx={batch_idx}")
+            print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
 
         result = self.common_step(batch, batch_idx)
 
@@ -1125,7 +1139,7 @@ class NODE(LightningModule):
 
     def test_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_ODE validation_step: batch_idx={batch_idx}")
+            print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
 
         result = self.common_step(batch, batch_idx)
 
@@ -1206,7 +1220,7 @@ class NODE(LightningModule):
                 combined_mask,
                 result["i_ext_path"],
                 batch_idx,
-                result["z1_for_ode"],
+                result["z1_for_sde"],
             )
 
         return_dict = {
