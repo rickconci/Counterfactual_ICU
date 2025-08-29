@@ -181,6 +181,10 @@ def main(args):
 
     if DEBUG:
         print("[DEBUG] main_beta.py: Initializing Hybrid_VAE_SDE model.")
+    # Determine final train_dir
+    train_dir_final = (
+        args.train_dir if getattr(args, "train_dir", None) else os.path.join(saving_dir, unique_dir_name)
+    )
     model = Hybrid_SDE(
         use_encoder=args.use_encoder,
         start_dec_at_treatment=args.start_dec_at_treatment,
@@ -209,7 +213,7 @@ def main(args):
         # SDE params
         num_samples=args.num_samples,
         normalise_for_SDENN=args.normalise_for_SDENN,
-        self_reverting_prior_control=args.self_reverting_prior_control,
+        self_reverting_prior_control=False,
         prior_tx_sigma=args.prior_tx_sigma,
         prior_tx_mu=args.prior_tx_mu,
         theta=args.theta,
@@ -227,7 +231,7 @@ def main(args):
         normalised_data=dataset_params["normalize"],
         log_lik_output_scale=args.output_scale,
         # admin
-        train_dir=os.path.join(saving_dir, unique_dir_name),
+        train_dir=train_dir_final,
         KL_weighting_SDE=args.KL_weighting_SDE,
         learning_rate=args.learning_rate,
         log_wandb=args.log_wandb,
@@ -240,6 +244,15 @@ def main(args):
         force_no_controls=args.force_no_controls,
         plot_outputs_train=args.plot_outputs_train,
     )
+    # Optionally disable specific control heads for ablation
+    if args.disable_controls:
+        try:
+            disabled = [int(x) for x in args.disable_controls.split(",") if x.strip() != ""]
+            model.disabled_control_indices = disabled
+            if DEBUG:
+                print(f"[DEBUG] main: Disabled control indices = {disabled}")
+        except Exception as e:
+            print(f"[WARN] Failed to parse --disable_controls='{args.disable_controls}': {e}")
     os.makedirs(model.train_dir, exist_ok=True)
     if DEBUG:
         print("[DEBUG] main_beta.py: Hybrid_VAE_SDE model initialized.")
@@ -282,6 +295,11 @@ def main(args):
         callbacks=callbacks,
         gradient_clip_val=1,  # Start with 1.0, adjust if needed
         gradient_clip_algorithm="norm",
+        overfit_batches=args.overfit_batches,
+        num_sanity_val_steps=0 if args.disable_sanity_check else 2,
+        # Keep this >=1 to avoid modulo by zero; use limit_val_batches=0 to disable
+        check_val_every_n_epoch=1,
+        limit_val_batches=0 if args.disable_sanity_check else 1.0,
         # fast_dev_run = True,
         # overfit_batches = 1
         # deterministic=True,
@@ -506,7 +524,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=3,
+        default=1,
         help="Number of SDE samples- is affected if sigma >0 ",
     )
     parser.add_argument(
@@ -529,7 +547,9 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--force_no_controls", action="store_true", help="Whether to force the SDE to not use controls",
+        "--force_no_controls",
+        action="store_true",
+        help="Whether to force the SDE to not use controls",
     )
 
     parser.add_argument(
@@ -585,7 +605,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--final_activation",
         type=str,
-        default="none",
+        default="tanh",
         choices=["relu", "none", "tanh"],
         help="Which nonlinearity to add as a final layer to the NN!",
     )
@@ -629,7 +649,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--batch_size", type=int, default=2, help="Training batch size")
     parser.add_argument(
-        "--max_epochs", type=int, default=3, help="Maximum number of epochs to train"
+        "--max_epochs", type=int, default=100, help="Maximum number of epochs to train"
     )
     parser.add_argument(
         "--accelerator",
@@ -641,7 +661,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_samples",
         type=str,
-        default=14,
+        default=2,
         help="Max dataset length (None for production)",
     )
     parser.add_argument(
@@ -653,6 +673,31 @@ if __name__ == "__main__":
         type=bool,
         default=False,
         help="Run the pure Zenker baseline as comparison?",
+    )
+
+    # Overfitting/debug controls
+    parser.add_argument(
+        "--overfit_batches",
+        type=float,
+        default=0.0,
+        help="Lightning overfit_batches setting: 0.0=disabled, 0.01=1%, 1=single batch, 10=ten batches",
+    )
+    parser.add_argument(
+        "--disable_controls",
+        type=str,
+        default="",
+        help="Comma-separated zero-based indices of control heads to disable (e.g., '0,3').",
+    )
+    parser.add_argument(
+        "--train_dir",
+        type=str,
+        default="",
+        help="Override output directory for plots and logs (default: results/<unique_dir>).",
+    )
+    parser.add_argument(
+        "--disable_sanity_check",
+        action="store_true",
+        help="Disable sanity validation to start training immediately (sets num_sanity_val_steps=0).",
     )
 
     args = parser.parse_args()
