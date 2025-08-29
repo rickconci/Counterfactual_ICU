@@ -534,7 +534,29 @@ class NODE(LightningModule):
             normalized_expert_vars = normalized_first_two
 
         return normalized_expert_vars
+    def _prepare_encoder_input(self, X, init_states):
+        """Prepares the input for the `forward_enc` method based on whether an encoder is used."""
+        if self.use_encoder != "none":
+            # When using an encoder, provide only the observable variables.
+            # The encoder will infer the full latent state.
+            X_for_encoder = select_tensor_by_index_list_advanced(X, [0, 1, 2, 3])
+        else:
+            # When not using an encoder, we manually construct the initial latent state.
+            # This state must match the dimensions expected by the SDE dynamics.
+            # It consists of the control signal (i_ext, starts at 0) and the expert variables.
+            batch_size = X.shape[0]
+            zeros_for_i_ext = torch.zeros(
+                batch_size, self.SDEnet_out_dims, device=self.device
+            )
+            expert_inits = init_states[:, : self.expert_latent_dims]
+            X_for_encoder = torch.cat([zeros_for_i_ext, expert_inits], dim=1)
 
+        if self.debug:
+            print(
+                f"[DEBUG] _prepare_encoder_input: use_encoder='{self.use_encoder}', output_shape={X_for_encoder.shape}"
+            )
+
+        return X_for_encoder
     def _prepare_no_encoder_initial_state(self, init_states, ic_mask):
         """
         Prepares safe initial conditions for the no-encoder case.
@@ -602,6 +624,11 @@ class NODE(LightningModule):
 
         y0 = init_latents  # [batch, 14]
 
+        if init_latents.dim() == 3:
+            y0 = init_latents[:, 0, :]  # [batch, features]
+        else:
+            y0 = init_latents
+
         assert y0.dim() == 2, f"Expected [batch, features], got {y0.shape}"
 
         # Integrate ODE
@@ -616,6 +643,9 @@ class NODE(LightningModule):
         # Reshape and extract pressure trajectory
         trajectory = trajectory.permute(1, 0, 2)  # [batch, time, features]
         pressure_traj = trajectory[:, :, :2]  # Only p_a, p_v: [batch, time, 2]
+
+        # Add samples dimension for compatibility
+        pressure_traj = pressure_traj.unsqueeze(1)
 
         return pressure_traj, torch.zeros(batch_size), None
 
@@ -640,7 +670,7 @@ class NODE(LightningModule):
         # Get the number of IC variables we have
         num_ic_vars = init_states.shape[-1]
 
-        # TODO compute loss over normlized values
+        # TODO compute loss over normalized values
 
         # predicted_ode_latents are already sigmoided, so use them directly
         sigmoid_predicted = predicted_ode_latents_sigmoid[
@@ -676,263 +706,77 @@ class NODE(LightningModule):
         return ic_consistency_loss
 
     def compute_factual_loss(self, predicted_traj, true_traj, logqp, mask=None):
-        # predicted_traj is [batch, time, 2], no need to expand true_traj
-        # true_traj_expanded = true_traj.unsqueeze(1)  # Remove this line
+        true_traj_expanded = true_traj.unsqueeze(1)
+        if self.debug:
+            print(
+                f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}, logqp_mean={logqp.mean().item() if logqp.numel() > 0 else 'N/A'}"
+            )
 
+            print(
+                f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}"
+            )
+
+            # ADD THESE DEBUG CHECKS:
+            print(f"[DEBUG] log_lik_output_scale: {self.log_lik_output_scale}")
+            print(
+                f"[DEBUG] log_lik_output_scale type: {type(self.log_lik_output_scale)}"
+            )
+            print(
+                f"[DEBUG] predicted_traj contains inf: {torch.isinf(predicted_traj).any()}"
+            )
+            print(
+                f"[DEBUG] predicted_traj contains nan: {torch.isnan(predicted_traj).any()}"
+            )
+            print(
+                f"[DEBUG] predicted_traj min/max: {predicted_traj.min().item()}/{predicted_traj.max().item()}"
+            )
+
+            print(
+                f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}"
+            )
+        # Compute log probability
         logpy = distributions.Normal(
             loc=predicted_traj, scale=self.log_lik_output_scale
-        ).log_prob(true_traj)
+        ).log_prob(true_traj_expanded)
+        if self.debug:
+            print(f"Logpy: {logpy[0]}")
+            print(f"True traj expanded: {true_traj_expanded[0]}")
+            print(f"Predicted traj: {predicted_traj[0]}")
+            print(
+                f"Mask shape: {mask.shape if mask is not None else None} (expected [B, T, C])"
+            )
 
+        # FIXED: Correct normalization
         if mask is not None:
-            logpy = logpy * mask
-            logpy = logpy.sum(dim=(1, 2)) / mask.sum(dim=(1, 2))  # [batch]
+            # Ensure mask dtype/device compatibility
+            mask = mask.to(device=logpy.device, dtype=logpy.dtype)
+            mask_expanded = mask.unsqueeze(1).expand(
+                -1, predicted_traj.shape[1], -1, -1
+            )
+            logpy = logpy * mask_expanded
+
+            # Sum over time and features
+            logpy_sum = logpy.sum(dim=(2, 3))  # [batch, samples]
+
+            # Count total valid elements per sample (time * features)
+            valid_count = mask.sum(dim=(1, 2))  # [batch] - total valid elements
+            # Avoid division by zero
+            valid_count = torch.clamp(valid_count, min=1.0)
+
+            # Normalize correctly
+            logpy = logpy_sum / valid_count.unsqueeze(
+                1
+            )  # [batch, samples] / [batch, 1]
+            logpy = logpy.mean(dim=1)  # Average over samples
         else:
-            logpy = logpy.sum(dim=(1, 2))  # [batch]
+            logpy = logpy.sum(dim=(2, 3)).mean(dim=1)
+
+        current_kl_weight = self.kl_scheduler.val
+        self.kl_scheduler.step()
 
         loss = -logpy.mean()
+
         return loss, -logpy.mean(), logqp.mean()
-
-    def _prepare_encoder_input(self, X, init_states):
-        """Prepares the input for the `forward_enc` method based on whether an encoder is used."""
-        if self.use_encoder != "none":
-            # When using an encoder, provide only the observable variables.
-            # The encoder will infer the full latent state.
-            X_for_encoder = select_tensor_by_index_list_advanced(X, [0, 1, 2, 3])
-        else:
-            # When not using an encoder, we manually construct the initial latent state.
-            # This state must match the dimensions expected by the SDE dynamics.
-            # It consists of the control signal (i_ext, starts at 0) and the expert variables.
-            batch_size = X.shape[0]
-            zeros_for_i_ext = torch.zeros(
-                batch_size, self.SDEnet_out_dims, device=self.device
-            )
-            expert_inits = init_states[:, : self.expert_latent_dims]
-            X_for_encoder = torch.cat([zeros_for_i_ext, expert_inits], dim=1)
-
-        if self.debug:
-            print(
-                f"[DEBUG] _prepare_encoder_input: use_encoder='{self.use_encoder}', output_shape={X_for_encoder.shape}"
-            )
-
-        return X_for_encoder
-
-    def training_step(self, batch, batch_idx):
-        if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
-
-        if self.dataset == "mimic":
-            # Unpack with valid_lengths
-            (
-                X,
-                X_mask,
-                Y,
-                Y_mask,
-                T,
-                Y_cf,
-                p,
-                init_states,
-                ic_mask,
-                time_pre,
-                time_post,
-                time_FULL,
-                full_fact_traj,
-                full_cf_traj,
-                valid_lengths,
-                med_trajectory_values,
-                med_trajectory_mask,
-                med_trajectory_time,
-                meds_context_values,
-                meds_context_mask,
-                meds_context_time,
-                static_features,
-            ) = batch
-        else:
-            # Synthetic data path
-            (
-                X,
-                Y,
-                T,
-                Y_cf,
-                p,
-                init_states,
-                time_pre,
-                time_post,
-                time_FULL,
-                full_fact_traj,
-                full_cf_traj,
-            ) = batch
-            X_mask = torch.ones_like(X)
-            static_features = None
-            valid_lengths = torch.full((X.shape[0],), Y.shape[1], dtype=torch.long)
-
-        batch_size = X.shape[0]
-
-        ts = time_post[0, :]  # Assuming all sequences share the same time grid
-
-        if self.use_encoder != "none":
-            if self.use_encoder == "raindrop":
-                if self.debug:
-                    print(f"X shape: {X.shape}. Should be [23 x 215 x 5]")
-                # Raindrop expects src shape: [seq_len, batch_size, features]
-                X_t = X.permute(1, 0, 2)
-                if self.debug:
-                    print(f"Time pre shape: {time_pre.shape}. Should be [23x125]")
-                time_pre_t = time_pre.permute(1, 0)
-                if self.debug:
-                    print(f"X_Mask shape: {X.shape}. Should be [23 x 215 x 5]")
-                mask_t = X_mask.permute(1, 0, 2)
-                X_with_mask = torch.cat([X_t, mask_t], dim=2)
-                if self.debug:
-                    print(
-                        f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]"
-                    )
-                lengths = get_last_valid_timestep_fast(X_mask)
-                # TODO THiS IS A DEBUgGIng HACK
-                lengths = torch.ones_like(lengths)
-                if self.debug:
-                    print(f"[FIXED LENGTHS] New lengths: {lengths}")
-                # temporal encoder is raindrop
-                temporal_embedding, _, _ = self.temporal_encoder(
-                    X_with_mask, static=None, times=time_pre_t, lengths=lengths
-                )
-                # temporal_embedding = torch.zeros(X.shape[0], 76, device=X.device, dtype=torch.float32)
-                if self.debug:
-                    print(
-                        f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]"
-                    )
-                logqp0 = 0
-            else:  # GRU Encoder
-                X_for_encoder = self._prepare_encoder_input(X, init_states)
-                temporal_embedding, z1_logvar, logqp0 = self.forward_enc(
-                    X_for_encoder, time_pre
-                )
-
-            if self.debug:
-                print(f"Static features shape: {static_features.shape}")
-            static_embedding = self.static_encoder(static_features)
-            fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
-            if self.debug:
-                print(
-                    f"Fused embedding shape: {fused_embedding.shape}: Expect 76 + 16 = 92. [23 x 92]"
-                )
-            fused_rep = self.fusion_mlp(fused_embedding)
-            if self.debug:
-                print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
-
-            # ode latent head outputs 14 (expert dimensions)
-            predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep)
-            if self.debug:
-                print(
-                    f"prediction ode latents sigmoid shape: {predicted_ode_latents_sigmoid.shape}. Expect: [23 x 7 x 14]"
-                )
-
-            predicted_ode_latents = self.transform_sigmoid_to_physiological_ranges(
-                predicted_ode_latents_sigmoid
-            )
-            if self.debug:
-                print(
-                    f"prediction ode latents (transformed) shape: {predicted_ode_latents.shape}"
-                )
-
-            # neural embedding head outputs: 4
-            neural_embedding = self.neural_embedding_head(fused_rep)
-            if self.debug:
-                print(
-                    f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]"
-                )
-            z1_for_sde = self._prepare_sde_initial_state(
-                predicted_ode_latents, neural_embedding, init_states, ic_mask
-            )
-
-            # Add IC consistency loss (only where we have real data)
-            ic_consistency_loss = self.compute_ic_consistency_loss(
-                predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
-                init_states=init_states,  # The real IC values
-                ic_mask=ic_mask,  # The mask indicating where we have real data
-            )
-
-        else:  # No encoder
-            z1_for_sde = self._prepare_no_encoder_initial_state(init_states, ic_mask)
-            logqp0 = 0
-            ic_consistency_loss = 0
-
-        latent_traj, logqp_path, i_ext_path = self.forward_latent(
-            init_latents=z1_for_sde,
-            ts=ts,
-            Tx=T,
-            time_to_tx=torch.zeros(batch_size).to(self.device),
-            valid_lengths=valid_lengths,
-            med_traj_values=med_trajectory_values,
-            med_traj_mask=med_trajectory_mask,
-            med_traj_time=med_trajectory_time,
-        )
-
-        # Decode
-        decoded_traj = self.forward_dec(latent_traj)
-
-        # Create mask for loss computation
-        # Y = Y[:, :17]
-        seq_len = Y.shape[1]
-        time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(
-            0
-        ) < valid_lengths.unsqueeze(1)
-        combined_mask = time_mask.unsqueeze(-1) * Y_mask
-        if self.debug:
-            print(
-                f"Y_mask stats: min={Y_mask.min()}, max={Y_mask.max()}, mean={Y_mask.mean()}"
-            )
-        if self.debug:
-            print(f"Combined mask sum per sample: {combined_mask.sum(dim=(1, 2))}")
-        if self.debug:
-            print(
-                f"Valid timesteps per sample: {combined_mask.sum(dim=(1, 2)) / Y.shape[-1]}"
-            )
-
-        # After computing the main loss:
-        total_logqp = logqp0 + logqp_path
-        loss, nll, kl_div = self.compute_factual_loss(
-            predicted_traj=decoded_traj,
-            true_traj=Y,
-            logqp=total_logqp,
-            mask=combined_mask,
-        )
-
-        # Combine losses
-        total_loss = loss + self.ic_consistency_weight * ic_consistency_loss
-
-        # Log the individual components
-        self.log(
-            "train_total_loss",
-            total_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "train_main_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "train_ic_consistency_loss",
-            ic_consistency_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "train_NLL", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
-        self.log(
-            "train_KL", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
-
-        return total_loss  # Return the combined loss
 
     def _prepare_sde_initial_state(
         self, predicted_ode_latents, neural_embedding, init_states, ic_mask
@@ -993,208 +837,99 @@ class NODE(LightningModule):
 
         return z1_for_sde
 
-    def validation_step(self, batch, batch_idx):
+    def common_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
             print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
-
         if self.dataset == "mimic":
-            # Unpack with valid_lengths
             (
-                X,
-                X_mask,
-                Y,
-                Y_mask,
-                T,
-                Y_cf,
-                p,
+                rd_src,
+                rd_times,
+                rd_length,
+                static_features,
                 init_states,
                 ic_mask,
-                time_pre,
-                time_post,
-                time_FULL,
-                full_fact_traj,
-                full_cf_traj,
-                valid_lengths,
+                Y,
+                Y_mask,
+                t_Y,
                 med_trajectory_values,
                 med_trajectory_mask,
                 med_trajectory_time,
-                meds_context_values,
-                meds_context_mask,
-                meds_context_time,
-                static_features,
             ) = batch
         else:
-            # Synthetic data path
-            (
-                X,
-                Y,
-                T,
-                Y_cf,
-                p,
-                init_states,
-                time_pre,
-                time_post,
-                time_FULL,
-                full_fact_traj,
-                full_cf_traj,
-            ) = batch
-            X_mask = torch.ones_like(X)
-            static_features = None
-            valid_lengths = torch.full((X.shape[0],), Y.shape[1], dtype=torch.long)
+            raise NotImplementedError(
+                "Synthetic path not supported in simplified pipeline"
+            )
 
-        batch_size = X.shape[0]
-
-        # Use the full time grid - we'll handle variable lengths in forward_latent
-        ts = time_post[
-            0, :
-        ]  # Assuming all sequences share the same time gridn (A given in our MIMIC-III setup)
+        batch_size = Y.shape[0]
+        ts = t_Y[0, :]
 
         if self.use_encoder != "none":
             if self.use_encoder == "raindrop":
-                if self.debug:
-                    print(f"X shape: {X.shape}. Should be [23 x MAX_LEN x 5]")
-                # Raindrop expects src shape: [seq_len, batch_size, features]
-                X_t = X.permute(1, 0, 2)
-                if self.debug:
-                    print(f"Time pre shape: {time_pre.shape}. Should be [23xMAX_LEN]")
-                time_pre_t = time_pre.permute(1, 0)
-                if self.debug:
-                    print(f"X_Mask shape: {X.shape}. Should be [23 x 215 x 5]")
-                mask_t = X_mask.permute(1, 0, 2)
-                X_with_mask = torch.cat([X_t, mask_t], dim=2)
-                if self.debug:
-                    print(
-                        f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]"
-                    )
-                lengths = get_last_valid_timestep_fast(X_mask)
-                # TODO THIS IS A DEBUGGING HACK
-                lengths = torch.ones_like(lengths)
-                # temporal encoder is raindrop
-                if self.debug:
-                    print(f"static shape: {static_features.shape}")
+                src = rd_src.permute(1, 0, 2)
+                times = rd_times.permute(1, 0)
+                lengths = rd_length
                 temporal_embedding, _, _ = self.temporal_encoder(
-                    X_with_mask, static=None, times=time_pre_t, lengths=lengths
+                    src=src, static=None, times=times, lengths=lengths
                 )
-                # print(f"temporal embedding shape: {temporal_embedding.shape}")
-
-                # temporal_embedding = torch.zeros(X.shape[0], 76, device = X.device, dtype = torch.float32)
-                # print(f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]")
                 logqp0 = 0
-            else:  # GRU Encoder
-                X_for_encoder = self._prepare_encoder_input(X, init_states)
-                temporal_embedding, z1_logvar, logqp0 = self.forward_enc(
-                    X_for_encoder, time_pre
+            else:
+                raise NotImplementedError(
+                    "Only raindrop encoder supported in MIMIC pipeline"
                 )
 
             if self.debug:
                 print(f"Static features shape: {static_features.shape}")
             static_embedding = self.static_encoder(static_features)
             fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
-            if self.debug:
-                print(
-                    f"Fused embedding shape: {fused_embedding.shape}: Expect 76 + 16 = 92. [23 x 92]"
-                )
-            if self.debug:
-                print("[DEBUG] fused_embedding stats before fusion_mlp:")
-            if self.debug:
-                print(f"  Contains NaN: {torch.isnan(fused_embedding).any()}")
-            if self.debug:
-                print(
-                    f"  Min/Max: {fused_embedding.min().item()}/{fused_embedding.max().item()}"
-                )
-            # print(f"  Patient 9 values: {fused_embedding[9, :5]}")
-
             fused_rep = self.fusion_mlp(fused_embedding)
 
-            # Right after fusion_mlp
-            if self.debug:
-                print("[DEBUG] fused_rep stats after fusion_mlp:")
-            if self.debug:
-                print(f"  Contains NaN: {torch.isnan(fused_rep).any()}")
-            if torch.isnan(fused_rep).any():
-                nan_patients = torch.where(torch.isnan(fused_rep))[0].unique()
-                if self.debug:
-                    print(f"  Patients with NaN: {nan_patients.tolist()}")
-                # print(f"  Patient 9 fused_rep: {fused_rep[9]}")
-            if self.debug:
-                print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
-
-            # ode latent head outputs 14 (expert dimensions)
-            predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep)
-            if self.debug:
-                print(
-                    f"prediction ode latents sigmoid shape: {predicted_ode_latents_sigmoid.shape}. Expect: [23 x 7 x 14]"
-                )
-
+            predicted_ode_latents_sigmoid = (
+                self.ode_latent_head(fused_rep)
+                .unsqueeze(1)
+                .repeat(1, self.num_samples, 1)
+            )
             predicted_ode_latents = self.transform_sigmoid_to_physiological_ranges(
                 predicted_ode_latents_sigmoid
             )
-            if self.debug:
-                print(
-                    f"prediction ode latents (transformed) shape: {predicted_ode_latents.shape}"
-                )
-
-            # neural embedding head outputs: 4
-            neural_embedding = self.neural_embedding_head(fused_rep)
-            # Prepare the SDE initial state
+            neural_embedding = (
+                self.neural_embedding_head(fused_rep)
+                .unsqueeze(1)
+                .repeat(1, self.num_samples, 1)
+            )
             z1_for_sde = self._prepare_sde_initial_state(
                 predicted_ode_latents, neural_embedding, init_states, ic_mask
             )
-            if self.debug:
-                print(
-                    f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]"
-                )
 
-            if self.debug:
-                print(f"[DEBUG] fused_rep contains NaN: {torch.isnan(fused_rep).any()}")
-
-            # After the ODE head:
-            if torch.isnan(predicted_ode_latents_sigmoid).any():
-                print("[ERROR] NaN in ODE head output!")
-
-            # After the neural embedding head:
-            if torch.isnan(neural_embedding).any():
-                print("[ERROR] NaN in neural embedding head output!")
-                # Add IC consistency loss (only where we have real data)
             ic_consistency_loss = self.compute_ic_consistency_loss(
                 predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
-                init_states=init_states,  # The real IC values
-                ic_mask=ic_mask,  # The mask indicating where we have real data
+                init_states=init_states,
+                ic_mask=ic_mask,
             )
-
-        else:  # No encoder
-            z1_for_sde = self._prepare_no_encoder_initial_state(init_states, ic_mask)
+        else:
+            initial_condition = self._prepare_no_encoder_initial_state(
+                init_states, ic_mask
+            )
+            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
             logqp0 = 0
             ic_consistency_loss = 0
 
-        # Run SDE with variable lengths
+        valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
+
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
             ts=ts,
-            Tx=T,
-            time_to_tx=torch.zeros(batch_size).to(self.device),
+            Tx=torch.ones(batch_size, device=self.device),
+            time_to_tx=torch.zeros(batch_size, device=self.device),
             valid_lengths=valid_lengths,
             med_traj_values=med_trajectory_values,
             med_traj_mask=med_trajectory_mask,
             med_traj_time=med_trajectory_time,
         )
 
-        # Decode
-        if self.debug:
-            print(f"Latent traj shape: {latent_traj.shape}")
         decoded_traj = self.forward_dec(latent_traj)
-        if self.debug:
-            print(
-                f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]"
-            )
 
-        # Create mask for loss computation
-        # Y = Y[:, :17]
-        seq_len = Y.shape[1]
-        time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(
-            0
-        ) < valid_lengths.unsqueeze(1)
-        combined_mask = time_mask.unsqueeze(-1) * Y_mask
+        # Mask for loss computation (already respects valid lengths)
+        combined_mask = Y_mask
         if self.debug:
             print(
                 f"Y_mask stats: min={Y_mask.min()}, max={Y_mask.max()}, mean={Y_mask.mean()}"
@@ -1206,7 +941,6 @@ class NODE(LightningModule):
                 f"Valid timesteps per sample: {combined_mask.sum(dim=(1, 2)) / Y.shape[-1]}"
             )
 
-        # After computing the main loss:
         total_logqp = logqp0 + logqp_path
         loss, nll, kl_div = self.compute_factual_loss(
             predicted_traj=decoded_traj,
@@ -1215,12 +949,92 @@ class NODE(LightningModule):
             mask=combined_mask,
         )
 
-        # Combine losses
         total_loss = loss + self.ic_consistency_weight * ic_consistency_loss
 
-        # Log the individual components
+        return {
+            "loss": loss,
+            "nll": nll,
+            "kl_div": kl_div,
+            "total_loss": total_loss,
+            "ic_consistency_loss": ic_consistency_loss,
+            "decoded_traj": decoded_traj,
+            "Y": Y,
+            "combined_mask": combined_mask,
+            "i_ext_path": i_ext_path,
+            "z1_for_sde": z1_for_sde,
+        }
+
+    def training_step(self, batch, batch_idx):
+        if self.debug and batch_idx == 0:
+            print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
+        result = self.common_step(batch, batch_idx)
+
+        total_loss = result["total_loss"]
+        loss = result["loss"]
+        ic_consistency_loss = result["ic_consistency_loss"]
+        nll = result["nll"]
+        kl_div = result["kl_div"]
+
+        # If graph is degenerate (e.g., encoder='none' and force_no_controls=True), attach a zero-sum reg to create a grad path
+        if not total_loss.requires_grad:
+            if self.debug:
+                print(
+                    "[WARN] total_loss has no grad_fn. Likely no trainable path active (encoder='none' with force_no_controls=True)."
+                )
+            zero_reg = None
+            for p in self.parameters():
+                if p.requires_grad:
+                    zero_reg = (
+                        (0.0 * p.sum())
+                        if zero_reg is None
+                        else zero_reg + 0.0 * p.sum()
+                    )
+            if zero_reg is None:
+                zero_reg = 0.0 * total_loss
+            total_loss = total_loss + zero_reg
+
+        # Optional training plots
+        if (
+            self.plot_outputs_train
+            and (self.global_step % max(int(self.plot_every), 1) == 0)
+        ):
+            try:
+                self.plot_nature_style_with_uncertainty(
+                    result["decoded_traj"],
+                    result["Y"],
+                    result["combined_mask"],
+                    batch_idx,
+                )
+                self.plot_nature_with_controls(
+                    result["decoded_traj"],
+                    result["Y"],
+                    result["combined_mask"],
+                    result["i_ext_path"],
+                    batch_idx,
+                    result["z1_for_sde"],
+                )
+            except Exception as e:
+                if self.debug:
+                    print(f"[WARN] Training plot failed: {e}")
+
+        # Save control CSVs every plot_every steps regardless of plotting success
+        if self.global_step % max(int(self.plot_every), 1) == 0:
+            try:
+                self._save_control_time_series(result["i_ext_path"], batch_idx)
+            except Exception as e:
+                if self.debug:
+                    print(f"[WARN] Control CSV save failed: {e}")
+        # Also save for the first train batch of each step to guarantee at least one CSV
+        if batch_idx == 0:
+            try:
+                self._save_control_time_series(result["i_ext_path"], batch_idx)
+            except Exception as e:
+                if self.debug:
+                    print(f"[WARN] Control CSV save (first-batch) failed: {e}")
+
+        # Log metrics
         self.log(
-            "val_total_loss",
+            "train_total_loss",
             total_loss,
             on_step=False,
             on_epoch=True,
@@ -1228,7 +1042,7 @@ class NODE(LightningModule):
             logger=True,
         )
         self.log(
-            "val_main_loss",
+            "train_main_loss",
             loss,
             on_step=False,
             on_epoch=True,
@@ -1236,7 +1050,7 @@ class NODE(LightningModule):
             logger=True,
         )
         self.log(
-            "val_ic_consistency_loss",
+            "train_ic_consistency_loss",
             ic_consistency_loss,
             on_step=False,
             on_epoch=True,
@@ -1244,212 +1058,81 @@ class NODE(LightningModule):
             logger=True,
         )
         self.log(
-            "val_NLL", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True
+            "train_NLL", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True
         )
         self.log(
-            "val_KL", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True
+            "train_KL", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True
         )
 
-        # Return outputs for potential use in validation_epoch_end
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        if self.debug and batch_idx == 0:
+            print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
+
+        result = self.common_step(batch, batch_idx)
+
+        # Log the individual components
+        self.log(
+            "val_total_loss",
+            result["total_loss"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+        self.log(
+            "val_main_loss",
+            result["loss"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+        self.log(
+            "val_ic_consistency_loss",
+            result["ic_consistency_loss"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+        self.log(
+            "val_NLL",
+            result["nll"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+        self.log(
+            "val_KL",
+            result["kl_div"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+
         return {
-            "val_loss": loss,
-            "val_nll": nll,
-            "val_kl": kl_div,
-            "decoded_traj": decoded_traj,
-            "true_traj": Y,
-            "mask": time_mask,
+            "val_loss": result["loss"],
+            "val_nll": result["nll"],
+            "val_kl": result["kl_div"],
+            "decoded_traj": result["decoded_traj"],
+            "true_traj": result["Y"],
+            "mask": result["combined_mask"],
         }
 
     def test_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
             print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
 
-        if self.dataset == "mimic":
-            # Unpack with valid_lengths
-            (
-                X,
-                X_mask,
-                Y,
-                Y_mask,
-                T,
-                Y_cf,
-                p,
-                init_states,
-                ic_mask,
-                time_pre,
-                time_post,
-                time_FULL,
-                full_fact_traj,
-                full_cf_traj,
-                valid_lengths,
-                med_trajectory_values,
-                med_trajectory_mask,
-                med_trajectory_time,
-                meds_context_values,
-                meds_context_mask,
-                meds_context_time,
-                static_features,
-            ) = batch
-        else:
-            # Synthetic data path
-            (
-                X,
-                Y,
-                T,
-                Y_cf,
-                p,
-                init_states,
-                time_pre,
-                time_post,
-                time_FULL,
-                full_fact_traj,
-                full_cf_traj,
-            ) = batch
-            X_mask = torch.ones_like(X)
-            static_features = None
-            valid_lengths = torch.full((X.shape[0],), Y.shape[1], dtype=torch.long)
+        result = self.common_step(batch, batch_idx)
 
-        batch_size = X.shape[0]
-
-        # Use the full time grid - we'll handle variable lengths in forward_latent
-        ts = time_post[0, :]  # Assuming all sequences share the same time grid
-
-        if self.use_encoder != "none":
-            if self.use_encoder == "raindrop":
-                if self.debug:
-                    print(f"X shape: {X.shape}. Should be [23 x 215 x 5]")
-                # Raindrop expects src shape: [seq_len, batch_size, features]
-                X_t = X.permute(1, 0, 2)
-                if self.debug:
-                    print(f"Time pre shape: {time_pre.shape}. Should be [23x125]")
-                time_pre_t = time_pre.permute(1, 0)
-                if self.debug:
-                    print(f"X_Mask shape: {X.shape}. Should be [23 x 215 x 5]")
-                mask_t = X_mask.permute(1, 0, 2)
-                X_with_mask = torch.cat([X_t, mask_t], dim=2)
-                if self.debug:
-                    print(
-                        f"X_With_Mask shape: {X_with_mask.shape}. Should be [23 x 215 x 10]"
-                    )
-                lengths = get_last_valid_timestep_fast(X_mask)
-                # TODO THiS IS A DEBUgGIng HACK
-                lengths = torch.ones_like(lengths)
-
-                # temporal encoder is raindrop
-                temporal_embedding, _, _ = self.temporal_encoder(
-                    X_with_mask, static=None, times=time_pre_t, lengths=lengths
-                )
-                # temporal_embedding = torch.zeros(X.shape[0], 76,  device=X.device, dtype=torch.float32)
-
-                if self.debug:
-                    print(
-                        f"temporal_embedding shape: {temporal_embedding.shape}. Should be [23 x 76]"
-                    )
-                logqp0 = 0
-            else:  # GRU Encoder
-                X_for_encoder = self._prepare_encoder_input(X, init_states)
-                temporal_embedding, z1_logvar, logqp0 = self.forward_enc(
-                    X_for_encoder, time_pre
-                )
-
-            if self.debug:
-                print(f"Static features shape: {static_features.shape}")
-            static_embedding = self.static_encoder(static_features)
-            fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
-            if self.debug:
-                print(
-                    f"Fused embedding shape: {fused_embedding.shape}: Expect 76 + 16 = 92. [23 x 92]"
-                )
-            fused_rep = self.fusion_mlp(fused_embedding)
-            if self.debug:
-                print(f"Fusion rep dim: {fused_rep.shape}. Expect [23 x 32]")
-
-            # ode latent head outputs 14 (expert dimensions)
-            predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep)
-            if self.debug:
-                print(
-                    f"prediction ode latents sigmoid shape: {predicted_ode_latents_sigmoid.shape}. Expect: [23 x 7 x 14]"
-                )
-
-            predicted_ode_latents = self.transform_sigmoid_to_physiological_ranges(
-                predicted_ode_latents_sigmoid
-            )
-            if self.debug:
-                print(
-                    f"prediction ode latents (transformed) shape: {predicted_ode_latents.shape}"
-                )
-
-            # neural embedding head outputs: 4
-            neural_embedding = self.neural_embedding_head(fused_rep)
-            if self.debug:
-                print(
-                    f"neural embedding shape: {neural_embedding.shape}. Expect: [23 x 7 x 4]"
-                )
-
-            # Add IC consistency loss (only where we have real data)
-            ic_consistency_loss = self.compute_ic_consistency_loss(
-                predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
-                init_states=init_states,  # The real IC values
-                ic_mask=ic_mask,  # The mask indicating where we have real data
-            )
-            z1_for_sde = self._prepare_sde_initial_state(
-                predicted_ode_latents, neural_embedding, init_states, ic_mask
-            )
-
-        else:  # No encoder
-            z1_for_sde = self._prepare_no_encoder_initial_state(init_states, ic_mask)
-            logqp0 = 0
-            ic_consistency_loss = 0
-
-        latent_traj, logqp_path, i_ext_path = self.forward_latent(
-            init_latents=z1_for_sde,
-            ts=ts,
-            Tx=T,
-            time_to_tx=torch.zeros(batch_size).to(self.device),
-            valid_lengths=valid_lengths,
-            med_traj_values=med_trajectory_values,
-            med_traj_mask=med_trajectory_mask,
-            med_traj_time=med_trajectory_time,
-        )
-
-        # Decode
-        if self.debug:
-            print(f"Latent traj shape: {latent_traj.shape}")
-        decoded_traj = self.forward_dec(latent_traj)
-        if self.debug:
-            print(
-                f"Decoded traj shape: {decoded_traj.shape}. Expect: [23 x 7 x 17 x 2]"
-            )
-
-        # Create mask for loss computation
-        # Y = Y[:, :17]
-        seq_len = Y.shape[1]
-        time_mask = torch.arange(seq_len, device=Y.device).unsqueeze(
-            0
-        ) < valid_lengths.unsqueeze(1)
-        combined_mask = time_mask.unsqueeze(-1) * Y_mask
-        if self.debug:
-            print(
-                f"Y_mask stats: min={Y_mask.min()}, max={Y_mask.max()}, mean={Y_mask.mean()}"
-            )
-        if self.debug:
-            print(f"Combined mask sum per sample: {combined_mask.sum(dim=(1, 2))}")
-        if self.debug:
-            print(
-                f"Valid timesteps per sample: {combined_mask.sum(dim=(1, 2)) / Y.shape[-1]}"
-            )
-
-        # After computing the main loss:
-        total_logqp = logqp0 + logqp_path
-        loss, nll, kl_div = self.compute_factual_loss(
-            predicted_traj=decoded_traj,
-            true_traj=Y,
-            logqp=total_logqp,
-            mask=combined_mask,
-        )
-
-        # Combine losses
-        total_loss = loss + self.ic_consistency_weight * ic_consistency_loss
+        total_loss = result["total_loss"]
+        loss = result["loss"]
+        nll = result["nll"]
+        kl_div = result["kl_div"]
 
         # Log the individual components
         self.log(
@@ -1470,7 +1153,7 @@ class NODE(LightningModule):
         )
         self.log(
             "test_ic_consistency_loss",
-            ic_consistency_loss,
+            result["ic_consistency_loss"],
             on_step=False,
             on_epoch=True,
             prog_bar=True,
@@ -1483,11 +1166,15 @@ class NODE(LightningModule):
             "test_KL", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True
         )
 
-        with torch.no_grad():
-            mse_per_sample = ((decoded_traj - Y) ** 2) * combined_mask
-            mae_per_sample = torch.abs(decoded_traj - Y) * combined_mask
+        # Compute additional test metrics
+        decoded_traj = result["decoded_traj"]
+        Y = result["Y"]
+        combined_mask = result["combined_mask"]
 
-            # Normalize by total valid elements
+        with torch.no_grad():
+            mse_per_sample = ((decoded_traj.mean(1) - Y) ** 2) * combined_mask
+            mae_per_sample = torch.abs(decoded_traj.mean(1) - Y) * combined_mask
+
             valid_elements = combined_mask.sum()
             valid_mse = mse_per_sample.sum() / valid_elements
             valid_mae = mae_per_sample.sum() / valid_elements
@@ -1509,17 +1196,19 @@ class NODE(LightningModule):
                 logger=True,
             )
 
-        if batch_idx < 3:  # Plot first 3 batches
+        if batch_idx < 3:
             self.plot_nature_style_with_uncertainty(
-                decoded_traj.unsqueeze(
-                    1
-                ),  # Full tensor with samples dimension [batch, samples, time, features]
-                Y,  # Targets [batch, time, features]
-                combined_mask,  # Mask [batch, time, features]
+                decoded_traj, Y, combined_mask, batch_idx
+            )
+            self.plot_nature_with_controls(
+                decoded_traj,
+                Y,
+                combined_mask,
+                result["i_ext_path"],
                 batch_idx,
+                result["z1_for_sde"],
             )
 
-            # Update the return statement:
         return_dict = {
             "test_loss": loss,
             "test_nll": nll,
@@ -1528,9 +1217,12 @@ class NODE(LightningModule):
             "test_mae": valid_mae,
             "decoded_traj": decoded_traj,
             "true_traj": Y,
-            "mask": time_mask,
+            "mask": combined_mask,
         }
         return return_dict
+
+
+
 
     def on_test_epoch_end(self):
         """Log final test metrics to wandb"""
