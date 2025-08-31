@@ -12,6 +12,7 @@ from raindrop import Raindrop_v2
 from torch import distributions, nn
 from torch.special import erf
 from ZenkerModel import ZenkerODE
+from graph_control_net import GraphControlNet
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
 from train_utils import zenker_derivatives
@@ -94,6 +95,14 @@ class Hybrid_SDE(LightningModule):
         force_no_controls=False,
         # Plotting
         plot_outputs_train=True,
+        # regularization
+        control_energy_weight: float = 1e-4,
+        # controller selection
+        controller_type: str = "mlp",  # or "gat"
+        gat_heads: int = 4,
+        gat_layers: int = 2,
+        gat_hidden: int = 128,
+        gat_dropout: float = 0.0,
     ):
         super().__init__()
         self.debug = debug  # <<< Store debug flag >>>
@@ -266,6 +275,10 @@ class Hybrid_SDE(LightningModule):
             net_input_dims = self.expert_latent_dims + n_medications * 2
             net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
+        # Append physics-derived feature count (ΔP, r_tpr, f_hr, F, dpa_base, dpv_base, sigma, s_dot)
+        self.physics_feat_dims = 8
+        net_input_dims = net_input_dims + self.physics_feat_dims
+
         activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "none": None}
         final_activation_real = activations[final_activation.lower()]
 
@@ -287,7 +300,7 @@ class Hybrid_SDE(LightningModule):
         # Head 1 (dsv_dt): ~0.02 units per time step
         # Head 2 (dt_ca): ~0.01 units per time step
         # Head 3 (dt_r_tpr_mod): ~0.01 units per time step
-        default_scales = torch.tensor([0.1, 0.02, 0.01, 0.01], dtype=torch.float32)
+        default_scales = torch.tensor([1, 1, 1, 1], dtype=torch.float32)
         if SDEnet_out_dims != len(default_scales):
             # Fallback: repeat or truncate to match dims
             repeats = (SDEnet_out_dims + len(default_scales) - 1) // len(default_scales)
@@ -314,6 +327,14 @@ class Hybrid_SDE(LightningModule):
         self.force_no_controls = force_no_controls
         # Plotting flags
         self.plot_outputs_train = plot_outputs_train
+        # Regularization weight for control energy λ·E[||u||^2]
+        self.control_energy_weight = float(control_energy_weight)
+        # Controller config
+        self.controller_type = controller_type.lower()
+        self.gat_heads = int(gat_heads)
+        self.gat_layers = int(gat_layers)
+        self.gat_hidden = int(gat_hidden)
+        self.gat_dropout = float(gat_dropout)
 
         ### LOSS
         self.MSE_loss = nn.MSELoss(reduction="none")
@@ -408,6 +429,27 @@ class Hybrid_SDE(LightningModule):
                 ]
             ),
         )
+
+        # Optional GAT controller (AB test)
+        node_feat_dim = 1 + self.physics_feat_dims + (2 if self.include_time else 0)
+        self.n_medications = int(n_medications)
+        if self.n_medications > 0:
+            self.med_proj = nn.Linear(self.n_medications * 2, 8)
+            node_feat_dim += 8
+        else:
+            self.med_proj = None
+
+        if self.controller_type == "gat":
+            self.gat_controller = GraphControlNet(
+                node_feature_dim=node_feat_dim,
+                hidden_dim=self.gat_hidden,
+                num_layers=self.gat_layers,
+                num_heads=self.gat_heads,
+                dropout=self.gat_dropout,
+                device=self.device,
+            )
+        else:
+            self.gat_controller = None
 
     def transform_sigmoid_to_physiological_ranges(self, sigmoid_values):
         # TODO check this again in encoder setting
@@ -623,6 +665,40 @@ class Hybrid_SDE(LightningModule):
                 :, self.SDEnet_out_dims : self.expert_latent_dims + self.SDEnet_out_dims
             ] / self.divisors.to(self.device)
 
+        # Always get raw expert variables (physical units) for physics features
+        expert_raw = y[:, self.SDEnet_out_dims : self.SDEnet_out_dims + self.expert_latent_dims]
+        pa = expert_raw[:, 0:1]
+        pv = expert_raw[:, 1:2]
+        s = expert_raw[:, 2:3]
+        sv = expert_raw[:, 3:4]
+        r_tpr_mod = expert_raw[:, 4:5]
+        f_hr_max = expert_raw[:, 5:6]
+        f_hr_min = expert_raw[:, 6:7]
+        r_tpr_max = expert_raw[:, 7:8]
+        r_tpr_min = expert_raw[:, 8:9]
+        ca = expert_raw[:, 9:10]
+        cv = expert_raw[:, 10:11]
+        k_width = expert_raw[:, 11:12]
+        p_aset = expert_raw[:, 12:13]
+        tau = expert_raw[:, 13:14]
+
+        # Derived physiology
+        fhr = s * (f_hr_max - f_hr_min) + f_hr_min
+        r_tpr = s * (r_tpr_max - r_tpr_min) + r_tpr_min + r_tpr_mod
+        dP = pa - pv
+        F = -dP / torch.clamp(r_tpr, min=1e-9) + sv * fhr
+        dpa_base = F / torch.clamp(ca, min=1e-9)
+        dpv_base = (dP / (torch.clamp(cv, min=1e-9) * torch.clamp(r_tpr, min=1e-9))) - (sv * fhr / torch.clamp(cv, min=1e-9))
+        sigma = 1.0 / (1.0 + torch.exp(-k_width * (pa - p_aset)))
+        s_dot = (1.0 / torch.clamp(tau, min=1e-9)) * (1.0 - sigma - s)
+
+        physics_feats = torch.cat([dP, r_tpr, fhr, F, dpa_base, dpv_base, sigma, s_dot], dim=-1)
+        # Normalize physics features if we normalize SDEnn inputs (zero-mean, unit-std across batch)
+        if self.normalise_for_SDENN:
+            pf_mean = physics_feats.mean(dim=0, keepdim=True)
+            pf_std = physics_feats.std(dim=0, keepdim=True).clamp_min(1e-6)
+            physics_feats = (physics_feats - pf_mean) / pf_std
+
         # print('SDNN_expert_input_state', SDNN_expert_input_state.shape, SDNN_expert_input_state[0, :])
 
         if self.include_time:
@@ -670,6 +746,48 @@ class Hybrid_SDE(LightningModule):
                     dim=-1,
                 )
 
+        # Medication context (used by either controller)
+        med_context = self.get_medication_context(t, batch_size)  # (batch, 2*n_meds)
+        if self.normalise_for_SDENN and med_context.numel() > 0:
+            mc_mean = med_context.mean(dim=0, keepdim=True)
+            mc_std = med_context.std(dim=0, keepdim=True).clamp_min(1e-6)
+            med_context = (med_context - mc_mean) / mc_std
+
+        # If GAT controller is selected, build node-wise features and branch here
+        if self.controller_type == "gat" and getattr(self, "gat_controller", None) is not None:
+            # Per-node scalar values for the 14 expert variables
+            node_value = expert_raw.unsqueeze(-1)  # [B, 14, 1]
+            # Broadcast physics features to all nodes
+            phys_b = physics_feats.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)  # [B,14,8]
+            parts = [node_value, phys_b]
+            # Optional time features
+            if self.include_time:
+                time_feats = torch.cat([sin_time, cos_time], dim=-1)  # [B,2]
+                time_b = time_feats.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)
+                parts.append(time_b)
+            # Optional medication embedding shared across nodes
+            if getattr(self, "med_proj", None) is not None and med_context.shape[1] == self.n_medications * 2:
+                med_embed = torch.tanh(self.med_proj(med_context))  # [B,8]
+                med_b = med_embed.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)
+                parts.append(med_b)
+            node_features = torch.cat(parts, dim=-1)  # [B,14,F]
+
+            u_raw = self.gat_controller(node_features)  # [B,4]
+            if self.force_no_controls:
+                scaled_output = torch.zeros_like(u_raw)
+            else:
+                # Apply per-head scales and global weighting
+                scaled_output = (u_raw * self.control_scales.to(u_raw.device)) * self.SDE_control_weighting
+
+            if self.debug and t.item() % 10 == 0:
+                print(
+                    f"[DEBUG] Hybrid_SDE apply_SDE_fun (GAT): node_features={node_features.shape}, u_raw={u_raw.shape}, scaled_output={scaled_output.shape}"
+                )
+            return scaled_output
+
+        # Else: MLP controller path — append physics and med context to flat input
+        SDE_NN_input = torch.cat([SDE_NN_input, physics_feats], dim=-1)
+
         # print('SDE_NN_input shape', SDE_NN_input.shape)
         # print('SDE_NN_input example', SDE_NN_input[0,:])
         if torch.isnan(SDE_NN_input).any():
@@ -679,8 +797,6 @@ class Hybrid_SDE(LightningModule):
             if torch.isnan(param).any():
                 print(f"[ERROR] NaN weights in {name}!")
                 breakpoint()
-
-        med_context = self.get_medication_context(t, batch_size)  # (batch, 2*n_meds)
 
         SDE_NN_input = torch.cat([SDE_NN_input, med_context], dim=-1)
 
@@ -714,6 +830,18 @@ class Hybrid_SDE(LightningModule):
                 f"[DEBUG] Hybrid_SDE apply_SDE_fun: SDE_NN_input_shape={SDE_NN_input.shape}, SDE_NN_output_latents_shape={SDE_NN_output_latents.shape}"
             )
             print(f"Scaled output: {scaled_output}")
+            try:
+                print(
+                    f"  inputs: mean={SDE_NN_input.mean().item():.4f}, std={SDE_NN_input.std().item():.4f}, min={SDE_NN_input.min().item():.4f}, max={SDE_NN_input.max().item():.4f}"
+                )
+                print(
+                    f"  physics: mean={physics_feats.mean().item():.4f}, std={physics_feats.std().item():.4f}, min={physics_feats.min().item():.4f}, max={physics_feats.max().item():.4f}"
+                )
+                print(
+                    f"  dt_u: mean={scaled_output.mean().item():.4f}, std={scaled_output.std().item():.4f}, min={scaled_output.min().item():.4f}, max={scaled_output.max().item():.4f}"
+                )
+            except Exception:
+                pass
 
         # Optionally zero specific control heads (debug/ablation support)
         if hasattr(self, "disabled_control_indices") and self.disabled_control_indices:
@@ -869,7 +997,7 @@ class Hybrid_SDE(LightningModule):
             except Exception:
                 pass
 
-        # apply model-specific transformations on Zenker model output
+        # apply model-specific transformations on Zenker model output (use control DERIVATIVES)
         dpv_dt = dpv_dt + i_ext_SDE_dict["i_ext_SDE_1"]
         dsv_dt = i_ext_SDE_dict["i_ext_SDE_2"]
         dt_ca = dt_ca + i_ext_SDE_dict["i_ext_SDE_3"]
@@ -921,20 +1049,14 @@ class Hybrid_SDE(LightningModule):
 
     # 3. Fixed f_aug method:
     def f_aug(self, t, y):
-        if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] Hybrid_SDE f_aug: t={t.item()}, y_shape={y.shape}")
 
         i_ext = y[:, : self.SDEnet_out_dims]
         dt_all_dims = y[
             :,
             : self.SDEnet_out_dims + self.expert_latent_dims + self.encoder_SDENN_dims,
         ]
-        Tx = y[:, -3]
-        time_to_treatment = y[0, -2]
-        valid_time = y[:, -1]
-
-        # Check if this sample should be active
-        active_mask = (t <= valid_time).float().unsqueeze(1)
+        Tx = y[:, -2]
+        time_to_treatment = y[0, -1]
 
         # Get normal dynamics
         f_res = self.f(t, dt_all_dims, Tx, time_to_treatment)
@@ -955,9 +1077,8 @@ class Hybrid_SDE(LightningModule):
             self.mu = None
             f_logqp = torch.zeros_like(y[:, 0]).unsqueeze(1).to(self.device)
 
-        # f_res contains derivatives for: i_ext (2) + expert (16) + neural (4) = 22 dims
+        # f_res contains derivatives for: i_ext (4) + expert (14) + neural (encoder dims)
         # We need to add derivatives for: logqp (1) + Tx (1) + time_to_tx (1) = 3 dims
-        # Total should be 25 dims
 
         # Derivatives for Tx and time_to_tx are zero (they don't change)
         dt_tx = torch.zeros_like(f_logqp)
@@ -970,13 +1091,11 @@ class Hybrid_SDE(LightningModule):
                 f_logqp,
                 dt_tx,
                 dt_time_to_tx,
-                torch.zeros_like(valid_time.unsqueeze(1)),
             ],
             dim=1,
         )
-
-        # Only apply dynamics if still valid
-        f_out[:, :-1] = f_out[:, :-1] * active_mask
+        if self.debug and t.item() % 10 == 0:
+            print(f"[DEBUG] Hybrid_SDE f_aug: t={t.item()}, f_out_shape={f_out.shape}")
 
         return f_out
 
@@ -1032,43 +1151,28 @@ class Hybrid_SDE(LightningModule):
 
     # 6. Fixed g_aug method:
     def g_aug(self, t, y):
-        """Diffusion for augmented dynamics with valid length support."""
+        """Diffusion for augmented dynamics (no valid_time masking)."""
         if self.debug and t.item() % 10 == 0:
             print(f"[DEBUG] g_aug: t={t.item()}, y_shape={y.shape}")
 
         batch_size = y.shape[0]
 
-        # Extract valid_time from augmented state (last component)
-        valid_time = y[:, -1]
-
-        # Check if this sample should have active diffusion
-        active_mask = (t <= valid_time).float().unsqueeze(1)
-
-        # Standard diffusion computation
-
+        # Diffusion only on control states (first 4); zeros elsewhere
         i_ext_1 = y[:, 0].unsqueeze(1)
         g_i_ext_1 = self.g(t, i_ext_1)
-
         i_ext_2 = y[:, 1].unsqueeze(1)
         g_i_ext_2 = self.g(t, i_ext_2)
-
         i_ext_3 = y[:, 2].unsqueeze(1)
         g_i_ext_3 = self.g(t, i_ext_3)
-
         i_ext_4 = y[:, 3].unsqueeze(1)
         g_i_ext_4 = self.g(t, i_ext_4)
 
-        # Build the full diffusion matrix
         g_expert_dims = torch.zeros([batch_size, self.expert_latent_dims]).to(y.device)
         g_neural_dims = torch.zeros([batch_size, self.encoder_SDENN_dims]).to(y.device)
         g_logqp = torch.zeros([batch_size, 1]).to(y.device)
         g_tx = torch.zeros([batch_size, 1]).to(y.device)
         g_time_to_tx = torch.zeros([batch_size, 1]).to(y.device)
-        g_valid_time = torch.zeros([batch_size, 1]).to(
-            y.device
-        )  # No diffusion for valid_time
 
-        # Concatenate all components
         g_out = torch.cat(
             [
                 g_i_ext_1,
@@ -1080,18 +1184,13 @@ class Hybrid_SDE(LightningModule):
                 g_logqp,
                 g_tx,
                 g_time_to_tx,
-                g_valid_time,
             ],
             dim=1,
         )
 
-        # Apply mask to freeze diffusion after valid time
-        # Don't mask the last component (valid_time itself)
-        g_out[:, :-1] = g_out[:, :-1] * active_mask
-
         if self.debug and t.item() % 10 == 0:
             print(
-                f"[DEBUG] g_aug: g_out_shape={g_out.shape} (should be [batch, {self.SDEnet_out_dims + self.expert_latent_dims + self.encoder_SDENN_dims + 4}])"
+                f"[DEBUG] g_aug: g_out_shape={g_out.shape} (should be [batch, {self.SDEnet_out_dims + self.expert_latent_dims + self.encoder_SDENN_dims + 3}])"
             )
 
         return g_out
@@ -1231,16 +1330,7 @@ class Hybrid_SDE(LightningModule):
         )
         log_path = torch.zeros(batch_size, self.num_samples, 1).to(init_latents)
 
-        # Add valid_time to augmented state
-        valid_times_expanded = (
-            (valid_lengths * 10)
-            .unsqueeze(1)
-            .unsqueeze(2)
-            .repeat(1, self.num_samples, 1)
-            .to(init_latents)
-        )
-        if self.debug:
-            print(f"Valid times expanded shape: {valid_times_expanded.shape}")
+        # Legacy valid_time masking removed; training loss masking already restricts supervision window.
 
         # Optionally override initial latents with exact Zenker defaults for diagnostics
         if self.force_zenker_defaults:
@@ -1291,7 +1381,6 @@ class Hybrid_SDE(LightningModule):
                 log_path,
                 Tx_expanded,
                 time_to_tx_expanded,
-                valid_times_expanded,
             ],
             dim=-1,
         )
@@ -1793,6 +1882,19 @@ class Hybrid_SDE(LightningModule):
                 zero_reg = 0.0 * total_loss
             total_loss = total_loss + zero_reg
 
+        # Control energy regularizer: λ · mean(||u||^2) over batch, time, heads
+        try:
+            i_ext_path = result.get("i_ext_path", None)
+            if i_ext_path is not None:
+                control_mean = i_ext_path.mean(1)  # [B, T, D]
+                control_energy = (control_mean ** 2).mean()
+            else:
+                control_energy = torch.tensor(0.0, device=total_loss.device)
+        except Exception:
+            control_energy = torch.tensor(0.0, device=total_loss.device)
+
+        total_loss = total_loss + self.control_energy_weight * control_energy
+
         # Optional training plots
         if (
             self.plot_outputs_train
@@ -1839,6 +1941,14 @@ class Hybrid_SDE(LightningModule):
             on_step=False,
             on_epoch=True,
             prog_bar=True,
+            logger=True,
+        )
+        self.log(
+            "train_control_energy",
+            control_energy.detach(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
             logger=True,
         )
         self.log(
@@ -2256,6 +2366,13 @@ class Hybrid_SDE(LightningModule):
         pred_std = predictions_full.std(1).detach()
         control_mean = i_ext_path.mean(1).detach()
         control_std = i_ext_path.std(1, unbiased=False).detach()
+        # Approximate drift (derivative of control state) using finite differences over 10-second grid
+        control_drift = control_mean.clone()
+        if control_drift.shape[1] > 1:
+            control_drift[:, 1:, :] = (control_mean[:, 1:, :] - control_mean[:, :-1, :]) / 10.0
+            control_drift[:, 0, :] = control_drift[:, 1, :]
+        else:
+            control_drift[:] = 0.0
 
         for patient_idx in range(min(3, predictions_full.shape[0])):
             patient_mask = combined_mask[patient_idx]
@@ -2309,12 +2426,12 @@ class Hybrid_SDE(LightningModule):
             if sde_derivatives.shape[0] > 1:
                 sde_derivatives[0] = sde_derivatives[1]
 
-            # Create 1 + num_controls subplots stacked vertically
+            # Create 1 + 2*num_controls subplots stacked vertically: state then derivative per control
             num_controls = (
                 control_mean_patient.shape[1] if control_mean_patient.ndim == 2 else 1
             )
-            nrows = 1 + num_controls
-            fig, axes = plt.subplots(nrows, 1, figsize=(8, 2.6 * nrows + 3), sharex=True)
+            nrows = 1 + 2 * num_controls
+            fig, axes = plt.subplots(nrows, 1, figsize=(8, 2.0 * nrows + 3), sharex=True)
             if nrows == 1:
                 axes = [axes]
             ax1 = axes[0]
@@ -2414,11 +2531,10 @@ class Hybrid_SDE(LightningModule):
             # === Controls: one subplot per control dimension ===
             control_cmap = plt.cm.get_cmap("tab10", num_controls)
             for control_idx in range(num_controls):
-                axc = axes[1 + control_idx]
-
-                deriv_values = sde_derivatives[:, control_idx].copy()
+                axc = axes[1 + 2 * control_idx]
+                # Integrated control state and its finite-difference derivative
+                deriv_values = control_drift[patient_idx, :, control_idx].detach().cpu().numpy().copy()
                 deriv_values[~bp_available_mask] = np.nan
-
                 control_values = control_mean_patient[:, control_idx].copy()
                 control_std_values = control_std_patient[:, control_idx].copy()
                 control_values[~bp_available_mask] = np.nan
@@ -2453,6 +2569,20 @@ class Hybrid_SDE(LightningModule):
                 axc.set_ylabel(f"Ctrl {control_idx + 1}")
                 axc.grid(True, alpha=0.2)
                 axc.axhline(y=0, color="black", linestyle=":", alpha=0.4)
+                # Separate derivative subplot directly under the control state
+                axd = axes[1 + 2 * control_idx + 1]
+                axd.plot(
+                    time_seconds,
+                    deriv_values,
+                    color=color,
+                    linewidth=1.0,
+                    linestyle="-",
+                    alpha=0.9,
+                    label=f"d(Control {control_idx + 1})/dt",
+                )
+                axd.set_ylabel(f"dCtrl {control_idx + 1}/dt")
+                axd.grid(True, alpha=0.2)
+                axd.axhline(y=0, color="black", linestyle=":", alpha=0.4)
 
             axes[-1].set_xlabel("Time (seconds)", fontweight="bold")
             # Single legend for last controls axis

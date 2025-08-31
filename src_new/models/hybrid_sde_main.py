@@ -243,6 +243,12 @@ def main(args):
         debug=args.debug,  # <<< Pass debug flag >>>
         force_no_controls=args.force_no_controls,
         plot_outputs_train=args.plot_outputs_train,
+        # Controller selection (MLP vs GAT)
+        controller_type=args.controller_type,
+        gat_heads=args.gat_heads,
+        gat_layers=args.gat_layers,
+        gat_hidden=args.gat_hidden,
+        gat_dropout=args.gat_dropout,
     )
     # Optionally disable specific control heads for ablation
     if args.disable_controls:
@@ -335,7 +341,7 @@ if __name__ == "__main__":
         "--HPC_work", type=bool, default=False, help="Where to save if HPC"
     )
     parser.add_argument(
-        "--seed", type=int, default=96, help="Random seed for initialization"
+        "--seed", type=int, default=42, help="Random seed for initialization"
     )
     parser.add_argument(
         "--project_name",
@@ -359,7 +365,7 @@ if __name__ == "__main__":
         help="Enable model checkpointing",
     )
     parser.add_argument(
-        "--plot_every", type=int, default=14, help="Plot every how many global steps? "
+        "--plot_every", type=int, default=1, help="Plot every how many global steps? "
     )
 
     # Data specific args
@@ -605,7 +611,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--final_activation",
         type=str,
-        default="tanh",
+        default="none",
         choices=["relu", "none", "tanh"],
         help="Which nonlinearity to add as a final layer to the NN!",
     )
@@ -673,6 +679,27 @@ if __name__ == "__main__":
         type=bool,
         default=False,
         help="Run the pure Zenker baseline as comparison?",
+    )
+
+    # Controller selection
+    parser.add_argument(
+        "--controller_type",
+        type=str,
+        default="mlp",
+        choices=["mlp", "gat"],
+        help="Controller type: standard MLP or GAT-based",
+    )
+    parser.add_argument(
+        "--gat_heads", type=int, default=4, help="Number of attention heads in GAT"
+    )
+    parser.add_argument(
+        "--gat_layers", type=int, default=2, help="Number of GAT layers"
+    )
+    parser.add_argument(
+        "--gat_hidden", type=int, default=128, help="Hidden size per GAT layer"
+    )
+    parser.add_argument(
+        "--gat_dropout", type=float, default=0.0, help="Dropout in GAT layers"
     )
 
     # Overfitting/debug controls
