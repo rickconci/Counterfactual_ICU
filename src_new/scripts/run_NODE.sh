@@ -26,7 +26,7 @@ nohup python ../models/NODE_main.py \
     --num_samples 1 \
     --batch_size 16 \
     --seed 14 \
-    --max_epochs 50 \
+    --max_epochs 5 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \
@@ -34,6 +34,7 @@ nohup python ../models/NODE_main.py \
     --integration_step_size 2 \
     --HPC_work True \
     --output_scale 1 \
+    --final_activation tanh \
     --run_eval \
     --learning_rate 0.001 \
     --early_stopping_patience 10 \

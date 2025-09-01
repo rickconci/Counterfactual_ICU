@@ -24,7 +24,7 @@ nohup python ../models/NSDE_main.py \
     --dataset_type mimic \
     --use_encoder none \
     --num_samples 3 \
-    --batch_size 16 \
+    --batch_size 32 \
     --seed 14 \
     --max_epochs 50 \
     --data_root '../../data/mimic_3_data/processed_data' \
@@ -35,7 +35,7 @@ nohup python ../models/NSDE_main.py \
     --output_scale 1 \
     --run_eval \
     --log_wandb True \
-    --learning_rate 0.001 \
+    --learning_rate 0.0005 \
     --early_stopping_patience 10 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 

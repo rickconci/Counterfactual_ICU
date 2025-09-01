@@ -67,6 +67,7 @@ class NODE(LightningModule):
         adjoint,
         plot_every,
         dataset,
+        KL_weighting_ODE,
         debug=False,  # <<< Add debug flag >>>
     ):
         super().__init__()
@@ -230,6 +231,7 @@ class NODE(LightningModule):
         self.kl_scheduler = LinearScheduler(
             start=70, iters=600, startval=1.0, endval=0.01
         )
+        self.KL_weighting_ODE = KL_weighting_ODE
         self.save_hyperparameters()
         if self.debug:
             print(
@@ -861,7 +863,7 @@ class NODE(LightningModule):
         current_kl_weight = self.kl_scheduler.val
         self.kl_scheduler.step()
 
-        loss = -logpy.mean()
+        loss = -logpy.mean() + self.KL_weighting_ODE * current_kl_weight * logqp.mean()
 
         return loss, -logpy.mean(), logqp.mean()
 

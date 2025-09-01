@@ -186,7 +186,7 @@ def main(args):
         encoder_input_dim=data_module.encoder_input_dim,
         encoder_hidden_dim=args.encoder_hidden_dim,
         expert_latent_dims=14,  # Fixed by the ODE model #todo check that
-        encoder_ODENN_dims=0 if args.use_encoder == "none" else args.encoder_SDENN_dims,
+        encoder_ODENN_dims=0 if args.use_encoder == "none" else args.encoder_ODENN_dims,
         n_medications=22,
         encoder_num_layers=args.encoder_num_layers,
         encoder_w_time=args.encoder_w_time,
@@ -220,6 +220,7 @@ def main(args):
         adjoint=args.adjoint,
         plot_every=args.plot_every,
         dataset=args.dataset_type,
+        KL_weighting_ODE=args.KL_weighting_SDE,
         debug=args.debug,  # <<< Pass debug flag >>>
     )
     os.makedirs(model.train_dir, exist_ok=True)
@@ -261,9 +262,9 @@ def main(args):
         accelerator=args.accelerator,
         logger=wandb_logger,
         log_every_n_steps=6,
-        callbacks=callbacks,
-        gradient_clip_val=1,  # Start with 1.0, adjust if needed
-        gradient_clip_algorithm="norm",
+        callbacks=callbacks
+        #gradient_clip_val=1,  # Start with 1.0, adjust if needed
+        #gradient_clip_algorithm="norm",
         # fast_dev_run = True,
         # overfit_batches = 1
         # deterministic=True,
@@ -462,6 +463,12 @@ if __name__ == "__main__":
         type=int,
         default=64,
         help="Encoder output used by SDENN",
+    )
+    parser.add_argument(
+        "--KL_weighting_ODE",
+        type=float,
+        default=0.0001,
+        help="Defines the weighting to the KL loss for the SDE",
     )
 
     # Default args _not be changed_
