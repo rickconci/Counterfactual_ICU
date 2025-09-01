@@ -260,7 +260,7 @@ class MIMICDataset(Dataset):
             "med_mask": med_traj_mask,  # [T_fwd, M]
             "med_time": med_traj_time_sec,  # [T_fwd]
             # Precomputed med context per time [T_fwd, 2*M]
-            "med_context": med_context,
+            "med_tensors": med_context,
         }
 
 
@@ -300,7 +300,12 @@ class MIMICDataModule(L.LightningDataModule):
         return min(8, max(6, cpu_count // 2))
 
     def _loader_common_kwargs(self) -> dict:
-        eff_workers = self._resolve_num_workers()
+        # Honor explicit num_workers if provided; otherwise, use heuristic
+        eff_workers = (
+            int(self.num_workers)
+            if self.num_workers is not None
+            else self._resolve_num_workers()
+        )
         # Pin memory if using CUDA; persistent workers when >0 workers
         use_pin = torch.cuda.is_available() and platform.system() != "Darwin"
         return {
@@ -436,7 +441,7 @@ class MIMICDataModule(L.LightningDataModule):
             "med_values",
             "med_mask",
             "med_time",
-            "med_context",
+            "med_tensors",
         ]
         # Context keys derived from raindrop context
         pad_context_keys = []  # no legacy X/X_mask/t_X
@@ -567,5 +572,5 @@ class MIMICDataModule(L.LightningDataModule):
             collated["med_values"],  # [B, T_fwd, M]
             collated["med_mask"],  # [B, T_fwd, M]
             collated["med_time"],  # [B, T_fwd]
-            collated["med_context"],  # [B, T_fwd, 2*M]
+            collated["med_tensors"],  # [B, T_fwd, 2*M]
         )

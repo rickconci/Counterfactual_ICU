@@ -28,9 +28,5 @@ outputs/
 outputs_cluster_types/
 temp_df/
 OldScripts/
-temp_plots
-temp_plots_idx0_off
-temp_plots_new 
-temp_plots_gat
-temp_plots_gat_2
-temp_plots_smooth_mlp
+temp_debug/
+experiments/
