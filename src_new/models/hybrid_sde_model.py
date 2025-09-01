@@ -62,6 +62,12 @@ class Hybrid_SDE(LightningModule):
         include_time,
         theta,
         SDE_control_weighting,
+        # Control smoothness/inductive-bias flags
+        use_control_lowpass,
+        control_lowpass_tau,
+        use_control_tv_loss,
+        control_tv_weight,
+        override_control_scales,
         # SDE model params
         num_samples,
         SDEnet_hidden_dim,
@@ -257,6 +263,15 @@ class Hybrid_SDE(LightningModule):
         self.SDEnet_depth = SDEnet_depth
         self.SDEnet_out_dims = SDEnet_out_dims
         self.SDE_control_weighting = SDE_control_weighting
+        # Smoothness flags
+        self.use_control_lowpass = bool(use_control_lowpass)
+        self.control_lowpass_tau = float(control_lowpass_tau)
+        self.use_control_tv_loss = bool(use_control_tv_loss)
+        self.control_tv_weight = float(control_tv_weight)
+        override_scales = override_control_scales
+        # Blend between pure low-pass derivative and raw control derivative
+        # 1.0 -> pure low-pass du=(u_hat-u)/tau; 0.0 -> raw du=u_hat (interpreted as direct derivative)
+        self.control_lowpass_blend = 0.1
 
         net_input_dims = (
             self.encoder_output_dim
@@ -300,11 +315,27 @@ class Hybrid_SDE(LightningModule):
         # Head 1 (dsv_dt): ~0.02 units per time step
         # Head 2 (dt_ca): ~0.01 units per time step
         # Head 3 (dt_r_tpr_mod): ~0.01 units per time step
-        default_scales = torch.tensor([1, 1, 1, 1], dtype=torch.float32)
+        default_scales = torch.tensor([0.1, 0.02, 0.01, 0.01], dtype=torch.float32)
         if SDEnet_out_dims != len(default_scales):
             # Fallback: repeat or truncate to match dims
             repeats = (SDEnet_out_dims + len(default_scales) - 1) // len(default_scales)
             default_scales = default_scales.repeat(repeats)[:SDEnet_out_dims]
+        # Allow override via CLI
+        if isinstance(override_scales, str) and override_scales.strip() != "":
+            try:
+                pieces = [float(x) for x in override_scales.split(",")]
+                ov = torch.tensor(pieces, dtype=torch.float32)
+                if ov.numel() < SDEnet_out_dims:
+                    reps = (SDEnet_out_dims + ov.numel() - 1) // ov.numel()
+                    ov = ov.repeat(reps)[:SDEnet_out_dims]
+                else:
+                    ov = ov[:SDEnet_out_dims]
+                default_scales = ov
+                if self.debug:
+                    print(f"[DEBUG] Override control scales -> {default_scales.tolist()}")
+            except Exception as e:
+                if self.debug:
+                    print(f"[WARN] Failed to parse override_control_scales '{override_scales}': {e}")
         self.register_buffer("control_scales", default_scales)
 
         # Initialization trick from Glow.
@@ -561,66 +592,93 @@ class Hybrid_SDE(LightningModule):
         return z1, z1_logvar, logqp0
 
     def get_medication_context(self, t, expanded_batch_size):
-        # TODO check this again
-        """Fully vectorized medication context handling intermittent availability"""
-        batch_size, time_steps, n_meds = self.current_med_values.shape
+        """Medication context at time t, using precomputed per-time tensors when available."""
+        batch_size, _, n_meds = self.current_med_values.shape
 
-        # Create valid mask: time ≤ t AND medication is actually present
-        time_valid = self.current_med_time <= t.item()  # (batch, time)
+        # Fast path: precomputed per-time context
+        if hasattr(self, "med_context_by_time") and hasattr(self, "_dt_grid"):
+            t_tensor = (
+                t
+                if torch.is_tensor(t)
+                else torch.tensor(t, dtype=self._t0.dtype, device=self._t0.device)
+            )
+            idx = torch.round((t_tensor - self._t0) / self._dt_grid).to(torch.long)
+            idx = torch.clamp(idx, 0, self._time_len - 1)
+            ctx_bt = self.med_context_by_time[:, idx, :]  # [B, 2*M]
+            samples_per_batch = expanded_batch_size // batch_size
+            return ctx_bt.repeat_interleave(samples_per_batch, dim=0)
+
+        # Fallback: on-the-fly computation (slower)
+        time_steps = self.current_med_values.shape[1]
+        t_tensor = (
+            t
+            if torch.is_tensor(t)
+            else torch.tensor(
+                t, dtype=self.current_med_time.dtype, device=self.current_med_time.device
+            )
+        )
+        time_valid = self.current_med_time <= t_tensor  # (batch, time)
         med_present = self.current_med_mask > 0  # (batch, time, meds)
         valid_mask = time_valid.unsqueeze(-1) & med_present  # (batch, time, meds)
 
-        # Create time indices for argmax trick
-        time_indices = torch.arange(time_steps, device=self.device).float()  # (time,)
-        time_indices = time_indices.unsqueeze(0).unsqueeze(-1)  # (1, time, 1)
-        time_indices = time_indices.expand(
+        time_indices = torch.arange(time_steps, device=self.device).float()
+        time_indices = time_indices.view(1, time_steps, 1).expand(
             batch_size, -1, n_meds
-        )  # (batch, time, meds)
-
-        # Where invalid, set to large negative number so argmax ignores them
+        )
         masked_indices = torch.where(
             valid_mask, time_indices, torch.full_like(time_indices, -1e6)
-        )  # (batch, time, meds)
-
-        # Find last valid time index for each (batch, med) pair
-        last_valid_indices = masked_indices.argmax(dim=1)  # (batch, meds)
-
-        # Check if any valid data exists (max index > -1e6 means we found valid data)
-        has_valid_data = masked_indices.max(dim=1)[0] > -1e5  # (batch, meds)
-
-        # Gather the values using advanced indexing
-        batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(
-            1
-        )  # (batch, 1)
-        med_idx = torch.arange(n_meds, device=self.device).unsqueeze(0)  # (1, meds)
-
-        # Get last rates and times
-        last_rates = self.current_med_values[
-            batch_idx, last_valid_indices, med_idx
-        ]  # (batch, meds)
-        last_times = self.current_med_time[
-            batch_idx, last_valid_indices
-        ]  # (batch, meds)
-
-        # Calculate recency weights
-        time_since = t.item() - last_times
-        recency_weights = torch.clamp(time_since / 1200 - 1 / 1200, min=0)
-
-        # Set defaults where no valid data exists
-        last_rates = torch.where(
-            has_valid_data, last_rates, torch.zeros_like(last_rates)
         )
+        last_valid_indices = masked_indices.argmax(dim=1)
+        has_valid_data = masked_indices.max(dim=1)[0] > -1e5
+        batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(1)
+        med_idx = torch.arange(n_meds, device=self.device).unsqueeze(0)
+        last_rates = self.current_med_values[batch_idx, last_valid_indices, med_idx]
+        last_times = self.current_med_time[batch_idx, last_valid_indices]
+        time_since = t_tensor - last_times
+        recency_weights = torch.clamp(time_since / 1200 - 1 / 1200, min=0)
+        last_rates = torch.where(has_valid_data, last_rates, torch.zeros_like(last_rates))
         recency_weights = torch.where(
             has_valid_data, recency_weights, torch.ones_like(recency_weights)
         )
-
-        # Interleave rates and weights: [rate1, weight1, rate2, weight2, ...]
-        result = torch.stack([last_rates, recency_weights], dim=-1)  # (batch, meds, 2)
-        result = result.flatten(start_dim=1)  # (batch, meds*2)
-
-        # Expand for multiple samples per batch element
+        result = torch.stack([last_rates, recency_weights], dim=-1).flatten(start_dim=1)
         samples_per_batch = expanded_batch_size // batch_size
         return result.repeat_interleave(samples_per_batch, dim=0)
+
+    def _precompute_med_context(self, ts: torch.Tensor) -> None:
+        """Precompute medication context [rate, recency] for each time step.
+
+        Creates `self.med_context_by_time` with shape [B, T, 2*M] and stores
+        time grid params `_t0`, `_dt_grid`, `_time_len` for fast indexing.
+        """
+        B, T, M = self.current_med_values.shape
+        device = self.current_med_values.device
+        dtype = self.current_med_values.dtype
+
+        ts_dev = ts.to(device=device, dtype=dtype)
+        self._t0 = ts_dev[0]
+        self._time_len = int(ts_dev.shape[0])
+        self._dt_grid = (ts_dev[1] - ts_dev[0]).clamp_min(1e-6) if T > 1 else torch.tensor(1.0, device=device, dtype=dtype)
+
+        valid = (self.current_med_mask > 0)  # [B,T,M]
+        idxs = torch.arange(T, device=device).view(1, T, 1).expand(B, T, M)
+        valid_idxs = torch.where(valid, idxs + 1, torch.zeros_like(idxs))  # +1 sentinel
+        last_idx_plus1 = torch.cummax(valid_idxs, dim=1).values  # [B,T,M]
+        has_valid = last_idx_plus1 > 0
+        last_idx = torch.clamp(last_idx_plus1 - 1, min=0).to(torch.long)
+
+        last_rates = torch.gather(self.current_med_values, dim=1, index=last_idx)  # [B,T,M]
+        time_bt = self.current_med_time.unsqueeze(-1).expand(B, T, M)
+        last_times = torch.gather(time_bt, dim=1, index=last_idx)  # [B,T,M]
+
+        t_grid = ts_dev.view(1, T, 1).expand(B, T, M)
+        time_since = t_grid - last_times
+        recency = torch.clamp(time_since / 1200.0 - 1.0 / 1200.0, min=0.0)
+
+        last_rates = torch.where(has_valid, last_rates, torch.zeros_like(last_rates))
+        recency = torch.where(has_valid, recency, torch.ones_like(recency))
+
+        ctx = torch.stack([last_rates, recency], dim=-1)  # [B,T,M,2]
+        self.med_context_by_time = ctx.view(B, T, 2 * M).contiguous()
 
     def apply_SDE_fun(self, t, y):
         """
@@ -647,10 +705,12 @@ class Hybrid_SDE(LightningModule):
 
         batch_size = y.shape[0]
 
-        if self.debug and t.item() % 10 == 0:  # Avoid excessive printing
-            print(
-                f"[DEBUG] Hybrid_SDE apply_SDE_fun: t={t.item()}, y_shape={y.shape}, normalise_for_SDENN={self.normalise_for_SDENN}, include_time={self.include_time}, SDE_input_state={self.SDE_input_state}"
-            )
+        if self.debug:
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            if (t_idx.remainder(10) == 0).item():
+                print(
+                    f"[DEBUG] Hybrid_SDE apply_SDE_fun: t_idx={int(t_idx)}, y_shape={y.shape}, normalise_for_SDENN={self.normalise_for_SDENN}, include_time={self.include_time}, SDE_input_state={self.SDE_input_state}"
+                )
 
         if self.normalise_for_SDENN:
             SDNN_expert_input_state = self.normalise_sde_inputs(
@@ -699,6 +759,7 @@ class Hybrid_SDE(LightningModule):
         physics_feats = torch.cat(
             [dP, r_tpr, fhr, F, dpa_base, dpv_base, sigma, s_dot], dim=-1
         )
+        physics_feats = torch.nan_to_num(physics_feats, nan=0.0, posinf=0.0, neginf=0.0)
         # Normalize physics features if we normalize SDEnn inputs (zero-mean, unit-std across batch)
         if self.normalise_for_SDENN:
             pf_mean = physics_feats.mean(dim=0, keepdim=True)
@@ -753,7 +814,21 @@ class Hybrid_SDE(LightningModule):
                 )
 
         # Medication context (used by either controller)
-        med_context = self.get_medication_context(t, batch_size)  # (batch, 2*n_meds)
+        if hasattr(self, "current_med_context") and self.current_med_context is not None:
+            # Index precomputed med context by time step
+            if not hasattr(self, "_t0"):
+                self._t0 = torch.tensor(0.0, device=self.device)
+            if not hasattr(self, "_dt_grid"):
+                self._dt_grid = torch.tensor(float(self.integration_step_size), device=self.device)
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            t_idx = torch.clamp(t_idx, 0, self.current_med_context.shape[1] - 1)
+            med_context = self.current_med_context[:, t_idx, :]
+            # expand over samples if needed
+            samples_per_batch = batch_size // med_context.shape[0]
+            med_context = med_context.repeat_interleave(samples_per_batch, dim=0)
+        else:
+            med_context = self.get_medication_context(t, batch_size)  # (batch, 2*n_meds)
+        med_context = torch.nan_to_num(med_context, nan=0.0, posinf=0.0, neginf=0.0)
         if self.normalise_for_SDENN and med_context.numel() > 0:
             mc_mean = med_context.mean(dim=0, keepdim=True)
             mc_std = med_context.std(dim=0, keepdim=True).clamp_min(1e-6)
@@ -785,6 +860,26 @@ class Hybrid_SDE(LightningModule):
                 med_b = med_embed.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)
                 parts.append(med_b)
             node_features = torch.cat(parts, dim=-1)  # [B,14,F]
+            node_features = torch.nan_to_num(node_features, nan=0.0, posinf=0.0, neginf=0.0)
+            # Additional stabilization for attention: clamp and layer-normalize features per node
+            node_features = torch.clamp(node_features, -50.0, 150.0)
+            try:
+                import torch.nn.functional as F  # already imported at top, safe
+                node_features = F.layer_norm(node_features, node_features.shape[-1:])
+            except Exception:
+                pass
+
+            # Sanitize GAT controller parameters if any NaN/Inf is detected
+            bad_params = False
+            with torch.no_grad():
+                for name, param in self.gat_controller.named_parameters():
+                    if param is None:
+                        continue
+                    if torch.isnan(param).any() or torch.isinf(param).any():
+                        bad_params = True
+                        if self.debug:
+                            print(f"[WARN] GAT parameter has non-finite values: {name}")
+                        param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
 
             u_raw = self.gat_controller(node_features)  # [B,4]
             if self.force_no_controls:
@@ -794,11 +889,29 @@ class Hybrid_SDE(LightningModule):
                 scaled_output = (
                     u_raw * self.control_scales.to(u_raw.device)
                 ) * self.SDE_control_weighting
+            scaled_output = torch.nan_to_num(scaled_output, nan=0.0, posinf=0.0, neginf=0.0)
+            scaled_output = torch.clamp(scaled_output, -5.0, 5.0)
 
-            if self.debug and t.item() % 10 == 0:
-                print(
-                    f"[DEBUG] Hybrid_SDE apply_SDE_fun (GAT): node_features={node_features.shape}, u_raw={u_raw.shape}, scaled_output={scaled_output.shape}"
-                )
+            if self.debug:
+                t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+                if (t_idx.remainder(10) == 0).item():
+                    print(
+                        f"[DEBUG] Hybrid_SDE apply_SDE_fun (GAT): node_features={node_features.shape}, u_raw={u_raw.shape}, scaled_output={scaled_output.shape}"
+                    )
+                    try:
+                        nf = node_features
+                        clamp_frac = (scaled_output.abs() >= 5.0).float().mean().item()
+                        print(
+                            f"  node_features stats: mean={nf.mean().item():.4f}, std={nf.std().item():.4f}, min={nf.min().item():.4f}, max={nf.max().item():.4f}"
+                        )
+                        print(
+                            f"  u_raw stats: mean={u_raw.mean().item():.4f}, std={u_raw.std().item():.4f}, min={u_raw.min().item():.4f}, max={u_raw.max().item():.4f}"
+                        )
+                        print(
+                            f"  scaled_output stats: mean={scaled_output.mean().item():.4f}, std={scaled_output.std().item():.4f}, min={scaled_output.min().item():.4f}, max={scaled_output.max().item():.4f}, clamp|x|>=5 frac={clamp_frac:.3f}"
+                        )
+                    except Exception:
+                        pass
             return scaled_output
 
         # Else: MLP controller path — append physics and med context to flat input
@@ -832,6 +945,21 @@ class Hybrid_SDE(LightningModule):
                 SDE_NN_output_latents
                 * self.control_scales.to(SDE_NN_output_latents.device)
             ) * self.SDE_control_weighting
+        scaled_output = torch.nan_to_num(scaled_output, nan=0.0, posinf=0.0, neginf=0.0)
+        scaled_output = torch.clamp(scaled_output, -5.0, 5.0)
+
+        # Optional: apply low-pass to controls before returning (du/dt=(u_hat - u)/tau)
+        if getattr(self, "use_control_lowpass", False):
+            # y contains current control states at indices [:, :SDEnet_out_dims]
+            u_current = y[:, : self.SDEnet_out_dims]
+            tau = max(self.control_lowpass_tau, 1e-3)
+            du_lowpass = (scaled_output - u_current) / tau
+            # raw derivative interpretation: use scaled_output directly as du
+            du_raw = scaled_output
+            alpha = float(self.control_lowpass_blend)
+            alpha = 0.0 if alpha < 0.0 else (1.0 if alpha > 1.0 else alpha)
+            du = alpha * du_lowpass + (1.0 - alpha) * du_raw
+            scaled_output = du
 
         if torch.isnan(SDE_NN_output_latents).any():
             print("SDE_NN_output contains NaN!")
@@ -842,32 +970,36 @@ class Hybrid_SDE(LightningModule):
         # print('SDE_NN_output_latents example', SDE_NN_output_latents[0, :])
         has_nonzero = SDE_NN_output_latents.ne(0.0).any()
         # print('SDE_NN Has non-0 OUTPUT??', has_nonzero)
-        if self.debug and t.item() % 10 == 0:
-            print(
-                f"[DEBUG] Hybrid_SDE apply_SDE_fun: SDE_NN_input_shape={SDE_NN_input.shape}, SDE_NN_output_latents_shape={SDE_NN_output_latents.shape}"
-            )
-            print(f"Scaled output: {scaled_output}")
-            try:
+        if self.debug:
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            if (t_idx.remainder(10) == 0).item():
                 print(
-                    f"  inputs: mean={SDE_NN_input.mean().item():.4f}, std={SDE_NN_input.std().item():.4f}, min={SDE_NN_input.min().item():.4f}, max={SDE_NN_input.max().item():.4f}"
+                    f"[DEBUG] Hybrid_SDE apply_SDE_fun: SDE_NN_input_shape={SDE_NN_input.shape}, SDE_NN_output_latents_shape={SDE_NN_output_latents.shape}"
                 )
-                print(
-                    f"  physics: mean={physics_feats.mean().item():.4f}, std={physics_feats.std().item():.4f}, min={physics_feats.min().item():.4f}, max={physics_feats.max().item():.4f}"
-                )
-                print(
-                    f"  dt_u: mean={scaled_output.mean().item():.4f}, std={scaled_output.std().item():.4f}, min={scaled_output.min().item():.4f}, max={scaled_output.max().item():.4f}"
-                )
-            except Exception:
-                pass
+                print(f"Scaled output: {scaled_output}")
+                try:
+                    print(
+                        f"  inputs: mean={SDE_NN_input.mean().item():.4f}, std={SDE_NN_input.std().item():.4f}, min={SDE_NN_input.min().item():.4f}, max={SDE_NN_input.max().item():.4f}"
+                    )
+                    print(
+                        f"  physics: mean={physics_feats.mean().item():.4f}, std={physics_feats.std().item():.4f}, min={physics_feats.min().item():.4f}, max={physics_feats.max().item():.4f}"
+                    )
+                    print(
+                        f"  dt_u: mean={scaled_output.mean().item():.4f}, std={scaled_output.std().item():.4f}, min={scaled_output.min().item():.4f}, max={scaled_output.max().item():.4f}"
+                    )
+                except Exception:
+                    pass
 
         # Optionally zero specific control heads (debug/ablation support)
         if hasattr(self, "disabled_control_indices") and self.disabled_control_indices:
             try:
                 scaled_output[:, self.disabled_control_indices] = 0.0
-                if self.debug and t.item() % 10 == 0:
-                    print(
-                        f"[DEBUG] apply_SDE_fun: zeroed controls at indices {self.disabled_control_indices}"
-                    )
+                if self.debug:
+                    t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+                    if (t_idx.remainder(10) == 0).item():
+                        print(
+                            f"[DEBUG] apply_SDE_fun: zeroed controls at indices {self.disabled_control_indices}"
+                        )
             except Exception as e:
                 if self.debug:
                     print(
@@ -948,9 +1080,10 @@ class Hybrid_SDE(LightningModule):
         for i in range(self.SDEnet_out_dims):
             i_ext_SDE_dict[f"i_ext_SDE_{i+1}"] = y_clamped[:, i].unsqueeze(1)
 
-        if (
-            t.item() >= time_to_treatment
-        ):  # this will always be the case when working with mimic data as time to treatment is 0
+        # Use tensor-safe comparison for time gating (no .item())
+        t_tensor = t if torch.is_tensor(t) else torch.tensor(t, device=self.device)
+        if (t_tensor >= time_to_treatment).all():
+            # this will always be the case when working with mimic data as time to treatment is 0
             dt_i_ext_SDE = self.apply_SDE_fun(t, y_clamped)
             dt_i_ext_SDE_dict = {}
             for i in range(self.SDEnet_out_dims):
@@ -958,7 +1091,7 @@ class Hybrid_SDE(LightningModule):
                     1
                 )
         else:
-            raise ValueError("Time to treatment should always be less than t.item()")
+            raise ValueError("Time to treatment should always be <= current time t")
 
         # Neural embedding derivatives (zeros - they evolve stochastically)
         dt_neural_embedding = torch.zeros([batch_size, self.encoder_SDENN_dims]).to(
@@ -1001,37 +1134,41 @@ class Hybrid_SDE(LightningModule):
             dt_tau,
         ) = zenker_derivatives(expert_slice, device=self.device, expert_start_index=0)
 
-        if self.debug and t.item() % 10 == 0:
-            try:
-                pa_vals = expert_slice[:, 0]
-                pv_vals = expert_slice[:, 1]
-                ca_vals = expert_slice[:, 9]
-                cv_vals = expert_slice[:, 10]
-                print(
-                    f"[DEBUG] f(): t={t.item():.0f} | p_a mean={pa_vals.mean().item():.2f}, p_v mean={pv_vals.mean().item():.2f}, c_a mean={ca_vals.mean().item():.2f}, c_v mean={cv_vals.mean().item():.2f}"
-                )
-                print(
-                    f"  dpa_dt mean={dpa_dt.mean().item():.4f}, dpv_dt(before ctl) mean={dpv_dt.mean().item():.4f}"
-                )
-            except Exception:
-                pass
+        if self.debug:
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            if (t_idx.remainder(10) == 0).item():
+                try:
+                    pa_vals = expert_slice[:, 0]
+                    pv_vals = expert_slice[:, 1]
+                    ca_vals = expert_slice[:, 9]
+                    cv_vals = expert_slice[:, 10]
+                    print(
+                        f"[DEBUG] f(): t_idx={int(t_idx):.0f} | p_a mean={pa_vals.mean().item():.2f}, p_v mean={pv_vals.mean().item():.2f}, c_a mean={ca_vals.mean().item():.2f}, c_v mean={cv_vals.mean().item():.2f}"
+                    )
+                    print(
+                        f"  dpa_dt mean={dpa_dt.mean().item():.4f}, dpv_dt(before ctl) mean={dpv_dt.mean().item():.4f}"
+                    )
+                except Exception:
+                    pass
 
-        # apply model-specific transformations on Zenker model output (use control DERIVATIVES)
-        dpv_dt = dpv_dt + i_ext_SDE_dict["i_ext_SDE_1"]
-        dsv_dt = i_ext_SDE_dict["i_ext_SDE_2"]
-        dt_ca = dt_ca + i_ext_SDE_dict["i_ext_SDE_3"]
-        dt_r_tpr_mod = dt_r_tpr_mod + i_ext_SDE_dict["i_ext_SDE_4"]
+        # apply model-specific transformations on Zenker model output using control DERIVATIVES
+        dpv_dt = dpv_dt + dt_i_ext_SDE_dict["dt_i_ext_SDE_1"]
+        dsv_dt = dt_i_ext_SDE_dict["dt_i_ext_SDE_2"]
+        dt_ca = dt_ca + dt_i_ext_SDE_dict["dt_i_ext_SDE_3"]
+        dt_r_tpr_mod = dt_r_tpr_mod + dt_i_ext_SDE_dict["dt_i_ext_SDE_4"]
 
-        if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] Time: {t}")
-            print(f"  controls (first sample): {y_clamped[0, :self.SDEnet_out_dims]}")
-            print(f"  control derivs (first sample): {dt_i_ext[0]}")
-            try:
-                print(
-                    f"  dpv_dt(after ctl) mean={dpv_dt.mean().item():.4f}, dt_ca mean={dt_ca.mean().item():.6f}, dt_r_tpr_mod mean={dt_r_tpr_mod.mean().item():.6f}"
-                )
-            except Exception:
-                pass
+        if self.debug:
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            if (t_idx.remainder(10) == 0).item():
+                print(f"[DEBUG] Time idx: {int(t_idx)}")
+                print(f"  controls (first sample): {y_clamped[0, :self.SDEnet_out_dims]}")
+                print(f"  control derivs (first sample): {dt_i_ext[0]}")
+                try:
+                    print(
+                        f"  dpv_dt(after ctl) mean={dpv_dt.mean().item():.4f}, dt_ca mean={dt_ca.mean().item():.6f}, dt_r_tpr_mod mean={dt_r_tpr_mod.mean().item():.6f}"
+                    )
+                except Exception:
+                    pass
 
         dt_expert = torch.cat(
             [
@@ -1053,16 +1190,21 @@ class Hybrid_SDE(LightningModule):
             dim=-1,
         )
 
-        # Combine all
+        # Combine all with NaN guards
+        dt_i_ext = torch.nan_to_num(dt_i_ext, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-10.0, 10.0)
+        dt_expert = torch.nan_to_num(dt_expert, nan=0.0, posinf=0.0, neginf=0.0)
+        dt_neural_embedding = torch.nan_to_num(dt_neural_embedding, nan=0.0, posinf=0.0, neginf=0.0)
         final_f_out = torch.cat([dt_i_ext, dt_expert, dt_neural_embedding], dim=-1)
 
-        if self.debug and t.item() % 10 == 0:
-            expected_dims = (
-                self.SDEnet_out_dims + self.expert_latent_dims + self.encoder_SDENN_dims
-            )
-            print(
-                f"[DEBUG] f: final_f_out shape = {final_f_out.shape} (expected [batch, {expected_dims}])"
-            )
+        if self.debug:
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            if (t_idx.remainder(10) == 0).item():
+                expected_dims = (
+                    self.SDEnet_out_dims + self.expert_latent_dims + self.encoder_SDENN_dims
+                )
+                print(
+                    f"[DEBUG] f: final_f_out shape = {final_f_out.shape} (expected [batch, {expected_dims}])"
+                )
 
         return final_f_out
 
@@ -1112,17 +1254,21 @@ class Hybrid_SDE(LightningModule):
             ],
             dim=1,
         )
-        if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] Hybrid_SDE f_aug: t={t.item()}, f_out_shape={f_out.shape}")
+        if self.debug:
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            if (t_idx.remainder(10) == 0).item():
+                print(f"[DEBUG] Hybrid_SDE f_aug: t_idx={int(t_idx)}, f_out_shape={f_out.shape}")
 
         return f_out
 
     # 4. Fixed h method:
     def h(self, t, y):  # Prior drift.
-        if self.debug and t.item() % 10 == 0:
-            print(
-                f"[DEBUG] Hybrid_SDE h (prior drift): t={t.item()}, y_shape={y.shape}"
-            )
+        if self.debug:
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            if (t_idx.remainder(10) == 0).item():
+                print(
+                    f"[DEBUG] Hybrid_SDE h (prior drift): t_idx={int(t_idx)}, y_shape={y.shape}"
+                )
 
         # y here should be just i_ext_2 (single dimension)
         self.mu = torch.tensor([0.0], device=y.device)
@@ -1148,8 +1294,10 @@ class Hybrid_SDE(LightningModule):
 
     # 5. Fixed g method:
     def g(self, t, y):
-        if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] Hybrid_SDE g (diffusion): t={t.item()}, y_shape={y.shape}")
+        if self.debug:
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            if (t_idx.remainder(10) == 0).item():
+                print(f"[DEBUG] Hybrid_SDE g (diffusion): t_idx={int(t_idx)}, y_shape={y.shape}")
 
         batch_size = y.shape[0]
 
@@ -1170,8 +1318,7 @@ class Hybrid_SDE(LightningModule):
     # 6. Fixed g_aug method:
     def g_aug(self, t, y):
         """Diffusion for augmented dynamics (no valid_time masking)."""
-        if self.debug and t.item() % 10 == 0:
-            print(f"[DEBUG] g_aug: t={t.item()}, y_shape={y.shape}")
+        # concise only
 
         batch_size = y.shape[0]
 
@@ -1206,10 +1353,7 @@ class Hybrid_SDE(LightningModule):
             dim=1,
         )
 
-        if self.debug and t.item() % 10 == 0:
-            print(
-                f"[DEBUG] g_aug: g_out_shape={g_out.shape} (should be [batch, {self.SDEnet_out_dims + self.expert_latent_dims + self.encoder_SDENN_dims + 3}])"
-            )
+        # concise only
 
         return g_out
 
@@ -1329,6 +1473,21 @@ class Hybrid_SDE(LightningModule):
             print(
                 f"current_med_values shape: {self.current_med_values.shape}. (batch, time, n_meds)"
             )
+        # Initialize time grid helpers for debug/indexing (avoid host syncs)
+        try:
+            self._t0 = ts[0].to(self.device)
+            self._time_len = int(ts.shape[0])
+            if ts.shape[0] > 1:
+                self._dt_grid = (ts[1] - ts[0]).to(self.device).clamp_min(1e-6)
+            else:
+                self._dt_grid = torch.tensor(float(self.integration_step_size), device=self.device)
+        except Exception:
+            # Fallback defaults
+            self._t0 = torch.tensor(0.0, device=self.device)
+            self._time_len = 1
+            self._dt_grid = torch.tensor(float(self.integration_step_size), device=self.device)
+
+        # Note: removed runtime precompute; med_context now loaded offline via dataloader
 
         # Prepare standard augmented state components
         Tx_expanded = (
@@ -1462,7 +1621,9 @@ class Hybrid_SDE(LightningModule):
             :,
             self.SDEnet_out_dims : self.expert_latent_dims + self.SDEnet_out_dims,
         ]
-        logqp_path = aug_ys[:, :, -1, -4]  # Note: -4 now because valid_time is at -1
+        # Layout: [i_ext (4), expert (14), neural (encoder dims), logqp, Tx, time_to_tx]
+        # Select logqp (third from last)
+        logqp_path = aug_ys[:, :, -1, -3]
 
         if self.debug:
             print(f"Latent out: {latent_out.shape}. Expect [23 x 7 x 17 x 14]")
@@ -1594,6 +1755,39 @@ class Hybrid_SDE(LightningModule):
                 f"Mask shape: {mask.shape if mask is not None else None} (expected [B, T, C])"
             )
 
+            # Additional diagnostics: per-channel masked MSE/MAE on predicted mean
+            pred_mean = predicted_traj.mean(dim=1)  # [B,T,C]
+            if mask is not None:
+                mask_f = mask.to(dtype=pred_mean.dtype, device=pred_mean.device)
+                denom = torch.clamp(mask_f.sum(dim=(0, 1)), min=1.0)  # [C]
+                se = ((pred_mean - true_traj) ** 2) * mask_f  # [B,T,C]
+                ae = (pred_mean - true_traj).abs() * mask_f
+                mse_ch = se.sum(dim=(0, 1)) / denom
+                mae_ch = ae.sum(dim=(0, 1)) / denom
+                print(f"[DEBUG] MSE per channel: {mse_ch.detach().cpu().tolist()}")
+                print(f"[DEBUG] MAE per channel: {mae_ch.detach().cpu().tolist()}")
+                # Saturation stats (0 and high clip ~220 if present)
+                zeros_frac = ((pred_mean == 0.0) * mask_f.bool()).sum(dim=(0, 1)) / torch.clamp(mask_f.sum(dim=(0, 1)), min=1.0)
+                high_frac = ((pred_mean >= 210.0) * mask_f.bool()).sum(dim=(0, 1)) / torch.clamp(mask_f.sum(dim=(0, 1)), min=1.0)
+                print(f"[DEBUG] Saturation frac@0 per channel: {zeros_frac.detach().cpu().tolist()}")
+                print(f"[DEBUG] Saturation frac@>=210 per channel: {high_frac.detach().cpu().tolist()}")
+                # Mask coverage
+                cov = mask_f.mean(dim=(0, 1))
+                print(f"[DEBUG] Mask coverage per channel: {cov.detach().cpu().tolist()}")
+                # Per-channel NLL (mean over B,T,S)
+                mask_expanded_dbg = mask_f.unsqueeze(1).expand(-1, predicted_traj.shape[1], -1, -1)
+                logpy_masked = logpy * mask_expanded_dbg
+                denom_ch = torch.clamp(mask_f.sum(dim=(0, 1)), min=1.0)
+                nll_ch = -logpy_masked.sum(dim=(0, 2, 3)) / denom_ch  # [S]
+                nll_ch_mean = nll_ch.mean(dim=0) if nll_ch.dim() > 0 else nll_ch
+                print(f"[DEBUG] NLL per channel (avg over samples): {nll_ch_mean.detach().cpu().tolist() if nll_ch_mean.numel()>1 else float(nll_ch_mean.detach().cpu())}")
+                # Small diff snippet first 5 timesteps
+                Tsnip = min(pred_mean.shape[1], 5)
+                diff_snip = (pred_mean[:1, :Tsnip, :] - true_traj[:1, :Tsnip, :]).detach().cpu()
+                print(f"[DEBUG] y_pred - y_true (first sample, first {Tsnip} steps):\n{diff_snip}")
+            else:
+                print("[DEBUG] No mask provided; MSE/MAE coverage skipped.")
+
         # FIXED: Correct normalization
         if mask is not None:
             # Ensure mask dtype/device compatibility
@@ -1625,6 +1819,22 @@ class Hybrid_SDE(LightningModule):
         loss = -logpy.mean() + self.KL_weighting_SDE * current_kl_weight * logqp.mean()
 
         return loss, -logpy.mean(), logqp.mean()
+
+    def on_after_backward(self) -> None:
+        # Gradient norm diagnostics
+        if not self.debug:
+            return
+        total_norm_sq = 0.0
+        count = 0
+        with torch.no_grad():
+            for p in self.parameters():
+                if p.grad is not None:
+                    g = p.grad.detach()
+                    total_norm_sq += float(g.norm(2).item() ** 2)
+                    count += 1
+        if count > 0:
+            total_norm = total_norm_sq ** 0.5
+            print(f"[DEBUG] Grad global L2 norm: {total_norm:.6f} over {count} tensors")
 
     def compute_counterfactual_loss(self, true_fact, true_cf, pred_fact, pred_cf):
         if self.debug:
@@ -1761,6 +1971,7 @@ class Hybrid_SDE(LightningModule):
                 med_trajectory_values,
                 med_trajectory_mask,
                 med_trajectory_time,
+                med_context,
             ) = batch
         else:
             raise NotImplementedError(
@@ -1822,6 +2033,9 @@ class Hybrid_SDE(LightningModule):
 
         valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
 
+        # Attach precomputed med_context for fast per-step indexing
+        self.current_med_context = med_context if med_context is not None else None
+
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
             ts=ts,
@@ -1857,6 +2071,18 @@ class Hybrid_SDE(LightningModule):
         )
 
         total_loss = loss + self.ic_consistency_weight * ic_consistency_loss
+
+        # Optional control TV/L2 smoothness loss over mean path: mean ||u_t - u_{t-1}||^2
+        if getattr(self, "use_control_tv_loss", False):
+            try:
+                u = i_ext_path
+                if u is not None and u.shape[1] > 1:
+                    u_mean = u.mean(1)  # [B,T,D]
+                    du = u_mean[:, 1:, :] - u_mean[:, :-1, :]
+                    tv_loss = (du**2).mean()
+                    total_loss = total_loss + self.control_tv_weight * tv_loss
+            except Exception:
+                pass
 
         return {
             "loss": loss,
@@ -1913,17 +2139,9 @@ class Hybrid_SDE(LightningModule):
 
         total_loss = total_loss + self.control_energy_weight * control_energy
 
-        # Optional training plots
-        if self.plot_outputs_train and (
-            self.global_step % max(int(self.plot_every), 1) == 0
-        ):
+        # Optional training plots (controls only, every step when enabled)
+        if self.plot_outputs_train:
             try:
-                self.plot_nature_style_with_uncertainty(
-                    result["decoded_traj"],
-                    result["Y"],
-                    result["combined_mask"],
-                    batch_idx,
-                )
                 self.plot_nature_with_controls(
                     result["decoded_traj"],
                     result["Y"],
@@ -1934,22 +2152,9 @@ class Hybrid_SDE(LightningModule):
                 )
             except Exception as e:
                 if self.debug:
-                    print(f"[WARN] Training plot failed: {e}")
+                    print(f"[WARN] Training control plot failed: {e}")
 
-        # Save control CSVs every plot_every steps regardless of plotting success
-        if self.global_step % max(int(self.plot_every), 1) == 0:
-            try:
-                self._save_control_time_series(result["i_ext_path"], batch_idx)
-            except Exception as e:
-                if self.debug:
-                    print(f"[WARN] Control CSV save failed: {e}")
-        # Also save for the first train batch of each step to guarantee at least one CSV
-        if batch_idx == 0:
-            try:
-                self._save_control_time_series(result["i_ext_path"], batch_idx)
-            except Exception as e:
-                if self.debug:
-                    print(f"[WARN] Control CSV save (first-batch) failed: {e}")
+        # Disabled CSV exporting for speed as requested
 
         # Log metrics
         self.log(
@@ -2418,7 +2623,7 @@ class Hybrid_SDE(LightningModule):
         batch_idx,
         z1_for_sde=None,
     ):
-        """Plot BP + controls with Zenker baseline and detailed control analysis"""
+        """Plot BP + controls with detailed control analysis (Zenker baseline removed)."""
 
         colors = self._setup_plot_style()  # Use same style
         os.makedirs(os.path.join(self.train_dir, "control_plots"), exist_ok=True)
@@ -2469,30 +2674,30 @@ class Hybrid_SDE(LightningModule):
             r_tpr_mod, f_hr_max, f_hr_min, r_tpr_max, r_tpr_min = patient_z1[4:9]
             ca, cv, k_width, p_aset, tau = patient_z1[9:14]
 
-            # Run Zenker baseline
-            zenker_model = ZenkerODE(
-                p_a_init=float(p_a_init),
-                p_v_init=float(p_v_init),
-                s_reflex_init=float(s_reflex_init),
-                sv_init=float(sv_init),
-                r_tpr_mod=float(r_tpr_mod),
-                f_hr_max=float(f_hr_max),
-                f_hr_min=float(f_hr_min),
-                r_tpr_max=float(r_tpr_max),
-                r_tpr_min=float(r_tpr_min),
-                ca=float(ca),
-                cv=float(cv),
-                k_width=float(k_width),
-                p_aset=float(p_aset),
-                tau=float(tau),
-                use_physiological_clamping=True,
-            )
+            # # Run Zenker baseline
+            # zenker_model = ZenkerODE(
+            #     p_a_init=float(p_a_init),
+            #     p_v_init=float(p_v_init),
+            #     s_reflex_init=float(s_reflex_init),
+            #     sv_init=float(sv_init),
+            #     r_tpr_mod=float(r_tpr_mod),
+            #     f_hr_max=float(f_hr_max),
+            #     f_hr_min=float(f_hr_min),
+            #     r_tpr_max=float(r_tpr_max),
+            #     r_tpr_min=float(r_tpr_min),
+            #     ca=float(ca),
+            #     cv=float(cv),
+            #     k_width=float(k_width),
+            #     p_aset=float(p_aset),
+            #     tau=float(tau),
+            #     use_physiological_clamping=True,
+            # )
 
-            t_zenker, solution_zenker = zenker_model.integrate(
-                t_span=time_seconds[-1], dt=self.integration_step_size
-            )
-            zenker_pa = np.interp(time_seconds, t_zenker, solution_zenker[:, 0])
-            zenker_pv = np.interp(time_seconds, t_zenker, solution_zenker[:, 1])
+            # t_zenker, solution_zenker = zenker_model.integrate(
+            #     t_span=time_seconds[-1], dt=self.integration_step_size
+            # )
+            # zenker_pa = np.interp(time_seconds, t_zenker, solution_zenker[:, 0])
+            # zenker_pv = np.interp(time_seconds, t_zenker, solution_zenker[:, 1])
 
             # Calculate derivatives
             sde_derivatives = np.zeros_like(control_mean_patient)
@@ -2536,15 +2741,7 @@ class Hybrid_SDE(LightningModule):
                 linewidth=1.5,
                 label="Arterial BP (predicted)",
             )
-            ax1.plot(
-                time_seconds,
-                zenker_pa,
-                color=colors["arterial_baseline"],
-                linestyle=":",
-                linewidth=2.0,
-                alpha=0.7,
-                label="Arterial BP (Zenker baseline)",
-            )
+            # (Zenker arterial baseline removed)
             ax1.fill_between(
                 time_seconds,
                 arterial_pred - arterial_std,
@@ -2576,15 +2773,7 @@ class Hybrid_SDE(LightningModule):
                 linewidth=1.5,
                 label="Venous BP (predicted)",
             )
-            ax1.plot(
-                time_seconds,
-                zenker_pv,
-                color=colors["venous_baseline"],
-                linestyle=":",
-                linewidth=2.0,
-                alpha=0.7,
-                label="Venous BP (Zenker baseline)",
-            )
+            # (Zenker venous baseline removed)
             ax1.fill_between(
                 time_seconds,
                 venous_pred - venous_std,

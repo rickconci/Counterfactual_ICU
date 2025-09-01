@@ -87,6 +87,10 @@ class SimpleGATLayer(nn.Module):
         self.out_proj = nn.Linear(out_dim, out_dim, bias=True)
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(out_dim)
+        # Residual projection to match dimensions when in_dim != out_dim
+        self.residual_proj = (
+            nn.Identity() if in_dim == out_dim else nn.Linear(in_dim, out_dim, bias=False)
+        )
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         B, N, _ = x.shape
@@ -114,7 +118,8 @@ class SimpleGATLayer(nn.Module):
         out = self.out_proj(out)
 
         # Residual + norm
-        out = self.layer_norm(x + out)
+        residual = self.residual_proj(x)
+        out = self.layer_norm(residual + out)
         return out
 
 

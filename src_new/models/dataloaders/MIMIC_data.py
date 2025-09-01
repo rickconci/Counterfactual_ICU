@@ -1,4 +1,5 @@
 import os
+import platform
 import pickle
 
 import lightning as L
@@ -214,9 +215,23 @@ class MIMICDataset(Dataset):
         med_traj_path = os.path.join(self.m_tensor_dir, f"med_tensor_{traj_key}.pt")
         if not os.path.exists(med_traj_path):
             raise FileNotFoundError(f"Med trajectory tensor not found: {med_traj_path}")
-        med_traj_values, med_traj_mask, med_traj_time_sec, med_traj_time_hr, _ = (
-            torch.load(med_traj_path)
-        )
+        loaded = torch.load(med_traj_path)
+        # Backward/forward compatible unpacking (optionally includes med_context)
+        if len(loaded) == 6:
+            (
+                med_traj_values,
+                med_traj_mask,
+                med_traj_time_sec,
+                med_traj_time_hr,
+                _n_intervals,
+                med_context,
+            ) = loaded
+        else:
+            med_traj_values, med_traj_mask, med_traj_time_sec, med_traj_time_hr, _ = loaded
+            # Create a placeholder med_context (zeros) if not present
+            med_context = torch.zeros(
+                med_traj_values.shape[0], med_traj_values.shape[1] * 2
+            )
 
         # Legacy meds context removed
 
@@ -244,6 +259,8 @@ class MIMICDataset(Dataset):
             "med_values": med_traj_values,  # [T_fwd, M]
             "med_mask": med_traj_mask,  # [T_fwd, M]
             "med_time": med_traj_time_sec,  # [T_fwd]
+            # Precomputed med context per time [T_fwd, 2*M]
+            "med_context": med_context,
         }
 
 
@@ -273,6 +290,25 @@ class MIMICDataModule(L.LightningDataModule):
         self.context_max_len: int | None = None
         self.forward_max_len: int | None = None
         self.expert_latent_dim = expert_latent_dim
+
+    def _resolve_num_workers(self) -> int:
+        """Choose efficient default workers: 6-8 on non-macOS, 1 on macOS."""
+        if platform.system() == "Darwin":
+            return 1
+        cpu_count = os.cpu_count() or 8
+        # Aim for 6-8 to avoid dataloader contention and CPU throttling
+        return min(8, max(6, cpu_count // 2))
+
+    def _loader_common_kwargs(self) -> dict:
+        eff_workers = self._resolve_num_workers()
+        # Pin memory if using CUDA; persistent workers when >0 workers
+        use_pin = torch.cuda.is_available() and platform.system() != "Darwin"
+        return {
+            "num_workers": eff_workers,
+            "pin_memory": use_pin,
+            "persistent_workers": eff_workers > 0,
+            "prefetch_factor": 4 if eff_workers > 0 else None,
+        }
 
     def setup(self, stage=None):
         if stage == "fit" or stage is None:
@@ -359,28 +395,31 @@ class MIMICDataModule(L.LightningDataModule):
                             self.static_input_dim = baseline_meta["feature_dim"]
 
     def train_dataloader(self):
+        kwargs = self._loader_common_kwargs()
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=self.num_workers,
             collate_fn=self.collate_fn,
+            **{k: v for k, v in kwargs.items() if v is not None},
         )
 
     def val_dataloader(self):
+        kwargs = self._loader_common_kwargs()
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            num_workers=self.num_workers,
             collate_fn=self.collate_fn,
+            **{k: v for k, v in kwargs.items() if v is not None},
         )
 
     def test_dataloader(self):
+        kwargs = self._loader_common_kwargs()
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
-            num_workers=self.num_workers,
             collate_fn=self.collate_fn,
+            **{k: v for k, v in kwargs.items() if v is not None},
         )
 
     def collate_fn(self, batch):
@@ -390,7 +429,15 @@ class MIMICDataModule(L.LightningDataModule):
         )
 
         # Group pad keys by sequence family (simplified API)
-        pad_forward_keys = ["Y", "Y_mask", "t_Y", "med_values", "med_mask", "med_time"]
+        pad_forward_keys = [
+            "Y",
+            "Y_mask",
+            "t_Y",
+            "med_values",
+            "med_mask",
+            "med_time",
+            "med_context",
+        ]
         # Context keys derived from raindrop context
         pad_context_keys = []  # no legacy X/X_mask/t_X
 
@@ -520,4 +567,5 @@ class MIMICDataModule(L.LightningDataModule):
             collated["med_values"],  # [B, T_fwd, M]
             collated["med_mask"],  # [B, T_fwd, M]
             collated["med_time"],  # [B, T_fwd]
+            collated["med_context"],  # [B, T_fwd, 2*M]
         )

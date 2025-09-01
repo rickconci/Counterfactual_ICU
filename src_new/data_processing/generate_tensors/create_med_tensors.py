@@ -254,11 +254,38 @@ def save_trajectory_tensor(
     time_seconds_tensor = torch.from_numpy(time_seconds).float()
     time_hours_tensor = torch.from_numpy(time_hours).float()
 
+    # Compute med context per time step: for each med, [last_rate, recency]
+    # last_idx_plus1 via cumulative max of valid indices (1-based to keep 0 as sentinel)
+    time_idx = np.arange(n_intervals, dtype=np.int64)
+    valid = (mask_array > 0).astype(np.int64)
+    valid_idxs = np.where(valid > 0, time_idx[None, :].T + 1, 0)  # [T, M]
+    last_idx_plus1 = np.maximum.accumulate(valid_idxs, axis=0)
+    has_valid = last_idx_plus1 > 0
+    last_idx = np.clip(last_idx_plus1 - 1, 0, n_intervals - 1)
+    # Gather last rates per time,med
+    rows = last_idx
+    cols = np.tile(np.arange(values_array.shape[1])[None, :], (n_intervals, 1))
+    last_rates = values_array[rows, cols]
+    # Compute recency in seconds relative to last valid time
+    t_grid = (time_idx[:, None] * interval_seconds).astype(np.float32)
+    last_times = (last_idx.astype(np.float32) * float(interval_seconds))
+    time_since = t_grid - last_times
+    recency = np.clip(time_since / 1200.0 - 1.0 / 1200.0, a_min=0.0, a_max=None)
+    # Defaults where no valid data yet
+    last_rates = np.where(has_valid, last_rates, 0.0).astype(np.float32)
+    recency = np.where(has_valid, recency, 1.0).astype(np.float32)
+    # Interleave per-med [rate, recency]
+    med_context = np.stack([last_rates, recency], axis=-1)  # [T, M, 2]
+    med_context = med_context.reshape(n_intervals, -1)  # [T, 2*M]
+
     # Create filename
     filename = f"med_tensor_{traj_key}.pt"
     filepath = output_dir / filename
 
     # Save tensor
+    med_context_tensor = torch.from_numpy(med_context).float()
+
+    # Backward compatible: append med_context as 6th item
     torch.save(
         (
             values_tensor,
@@ -266,6 +293,7 @@ def save_trajectory_tensor(
             time_seconds_tensor,
             time_hours_tensor,
             n_intervals,
+            med_context_tensor,
         ),
         filepath,
     )
