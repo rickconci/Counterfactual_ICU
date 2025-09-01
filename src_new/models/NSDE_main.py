@@ -220,6 +220,7 @@ def main(args):
         adjoint=args.adjoint,
         plot_every=args.plot_every,
         dataset=args.dataset_type,
+        KL_weighting_SDE=args.KL_weighting_SDE,
         debug=args.debug,  # <<< Pass debug flag >>>
     )
     os.makedirs(model.train_dir, exist_ok=True)
@@ -556,6 +557,13 @@ if __name__ == "__main__":
         default=False,
         help="Whether encoder runs with inputs backwards in time)",
     )
+    parser.add_argument(
+        "--KL_weighting_SDE",
+        type=float,
+        default=0.0001,
+        help="Defines the weighting to the KL loss for the SDE",
+    )
+    parser.add_argument("--adjoint", type=bool, default=False, const=True, nargs="?")
 
     args = parser.parse_args()
     main(args)

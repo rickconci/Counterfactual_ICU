@@ -20,21 +20,21 @@ mkdir -p ../../results/model_checkpoints
 
 # Training command
 echo "Starting training with nohup..."
-nohup python ../models/NSDE_main.py \
+nohup python ../models/NODE_main.py \
     --dataset_type mimic \
-    --use_encoder none \
-    --num_samples 3 \
+    --use_encoder raindrop \
+    --num_samples 1 \
     --batch_size 16 \
     --seed 14 \
     --max_epochs 50 \
     --data_root '../../data/mimic_3_data/processed_data' \
+    --log_wandb True \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 2 \
-    --prior_tx_sigma 0.1 \
+    --HPC_work True \
     --output_scale 1 \
     --run_eval \
-    --log_wandb True \
     --learning_rate 0.001 \
     --early_stopping_patience 10 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &

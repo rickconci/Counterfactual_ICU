@@ -67,6 +67,7 @@ class NSDE(LightningModule):
         adjoint,
         plot_every,
         dataset,
+        KL_weighting_SDE,
         debug=False,  # <<< Add debug flag >>>
     ):
         super().__init__()
@@ -98,6 +99,8 @@ class NSDE(LightningModule):
         self.start_dec_at_treatment = start_dec_at_treatment
 
         self.noise_scale = prior_tx_sigma
+
+        self.KL_weighting_SDE = KL_weighting_SDE
 
         temporal_embedding_dim = 0  # To store the output dim of the temporal encoder
 
@@ -162,7 +165,7 @@ class NSDE(LightningModule):
             )
             # Head 2: Predicts the separate embedding for the neural SDE component
             self.neural_embedding_head = nn.Linear(
-                fusion_hidden_dim, encoder_ODENN_dims
+                fusion_hidden_dim, encoder_SDENN_dims
             )
         else:
             self.static_encoder = None
@@ -218,6 +221,7 @@ class NSDE(LightningModule):
         self.normalised_data = normalised_data
         self.dataset = dataset
 
+        self.sdeint_fn = torchsde.sdeint_adjoint if adjoint else torchsde.sdeint
         self.integration_step_size = integration_step_size
         self.integration_method = integration_method
         self.rtol = rtol
@@ -253,6 +257,9 @@ class NSDE(LightningModule):
             "p_aset": (50.0, 90.0),
             "tau": (15, 25),
         }
+
+        self.noise_type = "diagonal"  # required
+        self.sde_type = "ito"
 
         # In __init__, add these parameters (you'll need to pass them as arguments):
         self.first_two_normalization_mu = torch.tensor(
@@ -484,7 +491,7 @@ class NSDE(LightningModule):
         expert_latents = y[:, : self.expert_latent_dims]  # [batch, 14]
         neural_embedding = y[
             :,
-            self.expert_latent_dims : self.expert_latent_dims + self.encoder_ODENN_dims,
+            self.expert_latent_dims : self.expert_latent_dims + self.encoder_SDENN_dims,
         ]
 
         # Normalize expert latents (which include current pressures)
