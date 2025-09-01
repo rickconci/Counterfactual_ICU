@@ -36,6 +36,7 @@ class NODE(LightningModule):
         encoder_w_time,
         encoder_reverse_time,
         n_medications,
+        encoder_context_len,
         # New static fusion params
         static_input_dim,
         static_hidden_dim,
@@ -108,13 +109,16 @@ class NODE(LightningModule):
             # TODO not quite sure if this is still right
             d_ob = max(int(encoder_hidden_dim / encoder_input_dim), 2)
             temporal_embedding_dim = encoder_input_dim * d_ob + 16  # d_model + d_pe
+            max_len_ctx = (
+                120 if encoder_context_len is None else int(encoder_context_len)
+            )
             self.temporal_encoder = Raindrop_v2(
                 d_inp=encoder_input_dim,
                 d_model=encoder_hidden_dim,
                 output_dim=temporal_embedding_dim,  # Not used since we commented out final layer
                 nhead=4,
                 nhid=128,
-                max_len=120,
+                max_len=max_len_ctx,
                 global_structure=torch.ones(
                     encoder_input_dim, encoder_input_dim
                 ),  # pass a complete adj matrix
@@ -541,6 +545,8 @@ class NODE(LightningModule):
             med_context = med_context.repeat_interleave(samples_per_batch, dim=0)
         else:
             med_context = self.get_medication_context(t, batch_size)
+
+        med_context = (med_context - 0.5) * 4.0
 
         # Network input uses all available information
         nn_input = torch.cat([normalized_expert_latents, neural_embedding], dim=-1)
@@ -1270,7 +1276,7 @@ class NODE(LightningModule):
                 logger=True,
             )
 
-        if batch_idx < 3:
+        if batch_idx < 10:
             self.plot_nature_style_with_uncertainty(
                 decoded_traj, Y, combined_mask, batch_idx
             )
