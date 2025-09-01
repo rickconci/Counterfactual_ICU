@@ -157,6 +157,7 @@ def main(args):
         num_workers = 0
         if args.HPC_work:
             num_workers = 4
+            breakpoint()
         data_module = MIMICDataModule(
             data_root=args.data_root,
             icu_stays_path=args.icu_stays_path,

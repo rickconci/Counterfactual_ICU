@@ -993,30 +993,6 @@ class NODE(LightningModule):
                 zero_reg = 0.0 * total_loss
             total_loss = total_loss + zero_reg
 
-        # Optional training plots
-        if (
-            self.plot_outputs_train
-            and (self.global_step % max(int(self.plot_every), 1) == 0)
-        ):
-            try:
-                self.plot_nature_style_with_uncertainty(
-                    result["decoded_traj"],
-                    result["Y"],
-                    result["combined_mask"],
-                    batch_idx,
-                )
-                self.plot_nature_with_controls(
-                    result["decoded_traj"],
-                    result["Y"],
-                    result["combined_mask"],
-                    result["i_ext_path"],
-                    batch_idx,
-                    result["z1_for_ode"],
-                )
-            except Exception as e:
-                if self.debug:
-                    print(f"[WARN] Training plot failed: {e}")
-
         # Save control CSVs every plot_every steps regardless of plotting success
         if self.global_step % max(int(self.plot_every), 1) == 0:
             try:
@@ -1200,15 +1176,6 @@ class NODE(LightningModule):
             self.plot_nature_style_with_uncertainty(
                 decoded_traj, Y, combined_mask, batch_idx
             )
-            self.plot_nature_with_controls(
-                decoded_traj,
-                Y,
-                combined_mask,
-                result["i_ext_path"],
-                batch_idx,
-                result["z1_for_ode"],
-            )
-
         return_dict = {
             "test_loss": loss,
             "test_nll": nll,
