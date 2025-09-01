@@ -441,7 +441,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--integration_adaptive",
         type=bool,
-        default=True,
+        default=False,
         help="Use adaptive SDE integration?",
     )
 

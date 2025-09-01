@@ -325,13 +325,28 @@ class NSDE(LightningModule):
             )
             print(f"  Contains NaN: {torch.isnan(sigmoid_values).any()}")
             print(f"  Sample values: {sigmoid_values[0, 0, :5]}")
+            try:
+                p10 = torch.quantile(sigmoid_values, 0.10).item()
+                p50 = torch.quantile(sigmoid_values, 0.50).item()
+                p90 = torch.quantile(sigmoid_values, 0.90).item()
+                print(f"  Quantiles p10/p50/p90: {p10:.3f}/{p50:.3f}/{p90:.3f}")
+                pa_raw = sigmoid_values[..., 0]
+                pv_raw = sigmoid_values[..., 1]
+                print(
+                    f"  Raw p_a sigmoid min/max: {pa_raw.min().item():.3f}/{pa_raw.max().item():.3f}"
+                )
+                print(
+                    f"  Raw p_v sigmoid min/max: {pv_raw.min().item():.3f}/{pv_raw.max().item():.3f}"
+                )
+            except Exception:
+                pass
 
         # Check that sigmoid values are actually in [0,1] range
         if sigmoid_values.min().item() < 0 or sigmoid_values.max().item() > 1:
             print("[WARNING] Sigmoid values outside [0,1] range!")
 
         transformed = self.physio_min_vals + sigmoid_values * (
-            self.physio_max_vals - self.physio_min_vals
+                self.physio_max_vals - self.physio_min_vals
         )
         transformed = torch.clamp(
             transformed, min=self.physio_min_vals, max=self.physio_max_vals
@@ -341,7 +356,18 @@ class NSDE(LightningModule):
             print("[DEBUG] Physiological transform output stats:")
             print(f"  Min/Max: {transformed.min().item()}/{transformed.max().item()}")
             print(f"  Contains NaN: {torch.isnan(transformed).any()}")
-            print(f"  Sample transformed: {transformed[0, 0, :5]}")
+            try:
+                pa = transformed[..., 0]
+                pv = transformed[..., 1]
+                print(
+                    f"  p_a (mmHg) range: {pa.min().item():.2f} - {pa.max().item():.2f}"
+                )
+                print(
+                    f"  p_v (mmHg) range: {pv.min().item():.2f} - {pv.max().item():.2f}"
+                )
+                print(f"  Sample transformed (first 5 dims): {transformed[0, 0, :5]}")
+            except Exception:
+                print(f"  Sample transformed: {transformed[0, 0, :5]}")
 
         return transformed
 
@@ -373,6 +399,7 @@ class NSDE(LightningModule):
                             f"[DEBUG] Hybrid_SDE forward_enc (non-variational): Encoder output z1_shape (before repeat): {z1.shape}"
                         )
                     # The following line seems incorrect as sigmoid_scale is not a method of this class. Assuming it's a typo from original code.
+                    # z1 = torch.cat([self.sigmoid_scale(z1[:,:self.expert_latent_dims], self.use_2_5std_encoder_minmax), z1[:, self.expert_latent_dims:] ], dim =-1)
                     z1 = z1.unsqueeze(1).repeat(1, self.num_samples, 1)
                     logqp0 = 0
                     z1_logvar = None
@@ -396,64 +423,55 @@ class NSDE(LightningModule):
         return z1, z1_logvar, logqp0
 
     def get_medication_context(self, t, expanded_batch_size):
-        # TODO check this again
-        """Fully vectorized medication context handling intermittent availability"""
-        batch_size, time_steps, n_meds = self.current_med_values.shape
+        """Medication context at time t, using precomputed per-time tensors when available."""
+        batch_size, _, n_meds = self.current_med_values.shape
 
-        # Create valid mask: time ≤ t AND medication is actually present
-        time_valid = self.current_med_time <= t.item()  # (batch, time)
+        # Fast path: precomputed per-time context
+        if hasattr(self, "med_context_by_time") and hasattr(self, "_dt_grid"):
+            t_tensor = (
+                t
+                if torch.is_tensor(t)
+                else torch.tensor(t, dtype=self._t0.dtype, device=self._t0.device)
+            )
+            idx = torch.round((t_tensor - self._t0) / self._dt_grid).to(torch.long)
+            idx = torch.clamp(idx, 0, self._time_len - 1)
+            ctx_bt = self.med_context_by_time[:, idx, :]  # [B, 2*M]
+            samples_per_batch = expanded_batch_size // batch_size
+            return ctx_bt.repeat_interleave(samples_per_batch, dim=0)
+
+        # Fallback: on-the-fly computation (slower)
+        time_steps = self.current_med_values.shape[1]
+        t_tensor = (
+            t
+            if torch.is_tensor(t)
+            else torch.tensor(
+                t, dtype=self.current_med_time.dtype, device=self.current_med_time.device
+            )
+        )
+        time_valid = self.current_med_time <= t_tensor  # (batch, time)
         med_present = self.current_med_mask > 0  # (batch, time, meds)
         valid_mask = time_valid.unsqueeze(-1) & med_present  # (batch, time, meds)
 
-        # Create time indices for argmax trick
-        time_indices = torch.arange(time_steps, device=self.device).float()  # (time,)
-        time_indices = time_indices.unsqueeze(0).unsqueeze(-1)  # (1, time, 1)
-        time_indices = time_indices.expand(
+        time_indices = torch.arange(time_steps, device=self.device).float()
+        time_indices = time_indices.view(1, time_steps, 1).expand(
             batch_size, -1, n_meds
-        )  # (batch, time, meds)
-
-        # Where invalid, set to large negative number so argmax ignores them
+        )
         masked_indices = torch.where(
             valid_mask, time_indices, torch.full_like(time_indices, -1e6)
-        )  # (batch, time, meds)
-
-        # Find last valid time index for each (batch, med) pair
-        last_valid_indices = masked_indices.argmax(dim=1)  # (batch, meds)
-
-        # Check if any valid data exists (max index > -1e6 means we found valid data)
-        has_valid_data = masked_indices.max(dim=1)[0] > -1e5  # (batch, meds)
-
-        # Gather the values using advanced indexing
-        batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(
-            1
-        )  # (batch, 1)
-        med_idx = torch.arange(n_meds, device=self.device).unsqueeze(0)  # (1, meds)
-
-        # Get last rates and times
-        last_rates = self.current_med_values[
-            batch_idx, last_valid_indices, med_idx
-        ]  # (batch, meds)
-        last_times = self.current_med_time[
-            batch_idx, last_valid_indices
-        ]  # (batch, meds)
-
-        # Calculate recency weights
-        time_since = t.item() - last_times
-        recency_weights = torch.clamp(time_since / 1200 - 1 / 1200, min=0)
-
-        # Set defaults where no valid data exists
-        last_rates = torch.where(
-            has_valid_data, last_rates, torch.zeros_like(last_rates)
         )
+        last_valid_indices = masked_indices.argmax(dim=1)
+        has_valid_data = masked_indices.max(dim=1)[0] > -1e5
+        batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(1)
+        med_idx = torch.arange(n_meds, device=self.device).unsqueeze(0)
+        last_rates = self.current_med_values[batch_idx, last_valid_indices, med_idx]
+        last_times = self.current_med_time[batch_idx, last_valid_indices]
+        time_since = t_tensor - last_times
+        recency_weights = torch.clamp(time_since / 1200 - 1 / 1200, min=0)
+        last_rates = torch.where(has_valid_data, last_rates, torch.zeros_like(last_rates))
         recency_weights = torch.where(
             has_valid_data, recency_weights, torch.ones_like(recency_weights)
         )
-
-        # Interleave rates and weights: [rate1, weight1, rate2, weight2, ...]
-        result = torch.stack([last_rates, recency_weights], dim=-1)  # (batch, meds, 2)
-        result = result.flatten(start_dim=1)  # (batch, meds*2)
-
-        # Expand for multiple samples per batch element
+        result = torch.stack([last_rates, recency_weights], dim=-1).flatten(start_dim=1)
         samples_per_batch = expanded_batch_size // batch_size
         return result.repeat_interleave(samples_per_batch, dim=0)
 
