@@ -26,10 +26,9 @@ nohup python ../models/NODE_main.py \
     --num_samples 1 \
     --batch_size 16 \
     --seed 14 \
-    --max_epochs 50 \
+    --max_epochs 1 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
-    --adjoint True \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 0.1 \

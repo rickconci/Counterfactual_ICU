@@ -868,6 +868,7 @@ class NSDE(LightningModule):
                 med_trajectory_values,
                 med_trajectory_mask,
                 med_trajectory_time,
+                med_context,
             ) = batch
         else:
             raise NotImplementedError(
@@ -929,6 +930,9 @@ class NSDE(LightningModule):
 
         valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
 
+        # Attach precomputed med_context for fast per-step indexing
+        self.current_med_context = med_context if med_context is not None else None
+
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
             ts=ts,
@@ -964,6 +968,18 @@ class NSDE(LightningModule):
         )
 
         total_loss = loss + self.ic_consistency_weight * ic_consistency_loss
+
+        # Optional control TV/L2 smoothness loss over mean path: mean ||u_t - u_{t-1}||^2
+        if getattr(self, "use_control_tv_loss", False):
+            try:
+                u = i_ext_path
+                if u is not None and u.shape[1] > 1:
+                    u_mean = u.mean(1)  # [B,T,D]
+                    du = u_mean[:, 1:, :] - u_mean[:, :-1, :]
+                    tv_loss = (du ** 2).mean()
+                    total_loss = total_loss + self.control_tv_weight * tv_loss
+            except Exception:
+                pass
 
         return {
             "loss": loss,
@@ -1006,45 +1022,6 @@ class NSDE(LightningModule):
             if zero_reg is None:
                 zero_reg = 0.0 * total_loss
             total_loss = total_loss + zero_reg
-
-        # Optional training plots
-        if (
-            self.plot_outputs_train
-            and (self.global_step % max(int(self.plot_every), 1) == 0)
-        ):
-            try:
-                self.plot_nature_style_with_uncertainty(
-                    result["decoded_traj"],
-                    result["Y"],
-                    result["combined_mask"],
-                    batch_idx,
-                )
-                self.plot_nature_with_controls(
-                    result["decoded_traj"],
-                    result["Y"],
-                    result["combined_mask"],
-                    result["i_ext_path"],
-                    batch_idx,
-                    result["z1_for_sde"],
-                )
-            except Exception as e:
-                if self.debug:
-                    print(f"[WARN] Training plot failed: {e}")
-
-        # Save control CSVs every plot_every steps regardless of plotting success
-        if self.global_step % max(int(self.plot_every), 1) == 0:
-            try:
-                self._save_control_time_series(result["i_ext_path"], batch_idx)
-            except Exception as e:
-                if self.debug:
-                    print(f"[WARN] Control CSV save failed: {e}")
-        # Also save for the first train batch of each step to guarantee at least one CSV
-        if batch_idx == 0:
-            try:
-                self._save_control_time_series(result["i_ext_path"], batch_idx)
-            except Exception as e:
-                if self.debug:
-                    print(f"[WARN] Control CSV save (first-batch) failed: {e}")
 
         # Log metrics
         self.log(
@@ -1213,14 +1190,6 @@ class NSDE(LightningModule):
         if batch_idx < 3:
             self.plot_nature_style_with_uncertainty(
                 decoded_traj, Y, combined_mask, batch_idx
-            )
-            self.plot_nature_with_controls(
-                decoded_traj,
-                Y,
-                combined_mask,
-                result["i_ext_path"],
-                batch_idx,
-                result["z1_for_sde"],
             )
 
         return_dict = {

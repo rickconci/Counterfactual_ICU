@@ -839,7 +839,7 @@ class NODE(LightningModule):
 
     def common_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_ODE validation_step: batch_idx={batch_idx}")
+            print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
         if self.dataset == "mimic":
             (
                 rd_src,
@@ -854,6 +854,7 @@ class NODE(LightningModule):
                 med_trajectory_values,
                 med_trajectory_mask,
                 med_trajectory_time,
+                med_context,
             ) = batch
         else:
             raise NotImplementedError(
@@ -896,7 +897,7 @@ class NODE(LightningModule):
                 .unsqueeze(1)
                 .repeat(1, self.num_samples, 1)
             )
-            z1_for_ode = self._prepare_ode_initial_state(
+            z1_for_sde = self._prepare_sde_initial_state(
                 predicted_ode_latents, neural_embedding, init_states, ic_mask
             )
 
@@ -909,14 +910,17 @@ class NODE(LightningModule):
             initial_condition = self._prepare_no_encoder_initial_state(
                 init_states, ic_mask
             )
-            z1_for_ode = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
+            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
             logqp0 = 0
             ic_consistency_loss = 0
 
         valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
 
+        # Attach precomputed med_context for fast per-step indexing
+        self.current_med_context = med_context if med_context is not None else None
+
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
-            init_latents=z1_for_ode,
+            init_latents=z1_for_sde,
             ts=ts,
             Tx=torch.ones(batch_size, device=self.device),
             time_to_tx=torch.zeros(batch_size, device=self.device),
@@ -951,6 +955,18 @@ class NODE(LightningModule):
 
         total_loss = loss + self.ic_consistency_weight * ic_consistency_loss
 
+        # Optional control TV/L2 smoothness loss over mean path: mean ||u_t - u_{t-1}||^2
+        if getattr(self, "use_control_tv_loss", False):
+            try:
+                u = i_ext_path
+                if u is not None and u.shape[1] > 1:
+                    u_mean = u.mean(1)  # [B,T,D]
+                    du = u_mean[:, 1:, :] - u_mean[:, :-1, :]
+                    tv_loss = (du**2).mean()
+                    total_loss = total_loss + self.control_tv_weight * tv_loss
+            except Exception:
+                pass
+
         return {
             "loss": loss,
             "nll": nll,
@@ -961,7 +977,7 @@ class NODE(LightningModule):
             "Y": Y,
             "combined_mask": combined_mask,
             "i_ext_path": i_ext_path,
-            "z1_for_ode": z1_for_ode,
+            "z1_for_sde": z1_for_sde,
         }
 
     def training_step(self, batch, batch_idx):
@@ -993,13 +1009,6 @@ class NODE(LightningModule):
                 zero_reg = 0.0 * total_loss
             total_loss = total_loss + zero_reg
 
-        # Save control CSVs every plot_every steps regardless of plotting success
-        if self.global_step % max(int(self.plot_every), 1) == 0:
-            try:
-                self._save_control_time_series(result["i_ext_path"], batch_idx)
-            except Exception as e:
-                if self.debug:
-                    print(f"[WARN] Control CSV save failed: {e}")
         # Also save for the first train batch of each step to guarantee at least one CSV
         if batch_idx == 0:
             try:
