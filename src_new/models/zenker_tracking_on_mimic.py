@@ -15,19 +15,41 @@ def _ensure_src_on_path() -> None:
 
 _ensure_src_on_path()
 
-from models.ZenkerModel import ZenkerODE  # noqa: E402
-from models.zenker_tracking_demo import make_pa_pv_trajectory_tracker  # noqa: E402
 from models.dataloaders.MIMIC_data import MIMICDataModule  # noqa: E402
+from models.zenker_tracking_demo import make_pa_pv_trajectory_tracker  # noqa: E402
+from models.ZenkerModel import ZenkerODE  # noqa: E402
 
 
 def build_argparser():
     p = argparse.ArgumentParser(description="Zenker trajectory tracking on MIMIC data")
-    p.add_argument("--data_root", type=str, required=True, help="Path to processed data root (BIOMM/processed_data)")
-    p.add_argument("--icu_stays_path", type=str, required=True, help="Path to ICUSTAYS.csv")
+    p.add_argument(
+        "--data_root",
+        type=str,
+        required=True,
+        help="Path to processed data root (BIOMM/processed_data)",
+    )
+    p.add_argument(
+        "--icu_stays_path", type=str, required=True, help="Path to ICUSTAYS.csv"
+    )
     p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--max_samples", type=int, default=32, help="Limit total dataset for faster testing")
-    p.add_argument("--num_plots", type=int, default=10, help="Number of trajectories to process and plot")
-    p.add_argument("--out_dir", type=str, default="zenker_tracking_outputs", help="Directory to save plots")
+    p.add_argument(
+        "--max_samples",
+        type=int,
+        default=32,
+        help="Limit total dataset for faster testing",
+    )
+    p.add_argument(
+        "--num_plots",
+        type=int,
+        default=10,
+        help="Number of trajectories to process and plot",
+    )
+    p.add_argument(
+        "--out_dir",
+        type=str,
+        default="zenker_tracking_outputs",
+        help="Directory to save plots",
+    )
     p.add_argument("--device", type=str, default="cpu")
     # Controller gains for tracker
     p.add_argument("--kv", type=float, default=0.12)
@@ -39,6 +61,7 @@ def build_argparser():
 
 def make_unified_plot(t, pa_ref, pv_ref, sol_aug, control_series, out_path):
     import matplotlib.pyplot as plt
+
     try:
         plt.switch_backend("Agg")
     except Exception:
@@ -64,7 +87,12 @@ def make_unified_plot(t, pa_ref, pv_ref, sol_aug, control_series, out_path):
     labels = ["u1: +dpv_dt", "u2: dsv_dt", "u3: dca/dt", "u4: d(r_tpr_mod)/dt"]
     # Derivatives
     dt_arr = np.maximum(np.diff(t), 1e-9)
-    dU = np.vstack([np.zeros((1, control_series.shape[1])), np.diff(control_series, axis=0) / dt_arr[:, None]])
+    dU = np.vstack(
+        [
+            np.zeros((1, control_series.shape[1])),
+            np.diff(control_series, axis=0) / dt_arr[:, None],
+        ]
+    )
     # Integrated controls
     for i in range(control_series.shape[1]):
         axes[2].plot(t, control_series[:, i], linewidth=1.6, label=labels[i])
@@ -183,5 +211,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

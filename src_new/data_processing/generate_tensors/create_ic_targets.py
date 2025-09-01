@@ -2,12 +2,16 @@ import os
 import pickle
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+
+
+# Module-level globals for fork-based shared memory
+_WF_DF: Optional[pd.DataFrame] = None
 
 
 def load_waveforms_data(parquet_path: str, interval_seconds: int = 10) -> pd.DataFrame:
@@ -336,6 +340,7 @@ def create_physiological_tensors(
     med_tensors_metadata_path: str,
     output_dir: str = "./physio_tensors_output",
     interval_seconds: int = 10,
+    n_workers: int = 1,
 ) -> Dict:
     """
     Main function to create IC values and prediction targets from waveforms data.
@@ -389,33 +394,61 @@ def create_physiological_tensors(
         f"Using consistent time grid: {n_intervals} intervals of {interval_seconds} seconds each"
     )
 
-    # Align waveforms with trajectories
+    # Report cohort overlap prior to processing
     print("\n=== Aligning Data ===")
-    aligned_trajectories = align_waveforms_with_trajectories(waveforms_df, med_metadata)
+    med_hadm_ids = {ti["hadm_id"] for ti in med_metadata["trajectories"].values()}
+    waveform_hadm_ids = set(waveforms_df["hadm_id"].unique())
+    common_hadm_ids = med_hadm_ids.intersection(waveform_hadm_ids)
+    print(f"Med trajectories: {len(med_hadm_ids)} patients")
+    print(f"Waveform data: {len(waveform_hadm_ids)} patients")
+    print(f"Common patients: {len(common_hadm_ids)} patients")
 
-    # Process each trajectory
-    print(f"\n=== Processing {len(aligned_trajectories)} Trajectories ===")
+    # Prepare fork-shared globals
+    global _WF_DF
+    _WF_DF = waveforms_df
 
-    ic_metadata = {}
-    pred_metadata = {}
+    # Worker utility to process a single trajectory end-to-end
+    def _process_single_trajectory(args: Tuple[str, Dict, int, int, str, str]) -> Tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]], bool]:
+        traj_key, traj_info, n_int, int_seconds, ic_dir_str, pred_dir_str = args
+        # Filter waveform data for this trajectory using shared DataFrame
+        hadm_id = traj_info["hadm_id"]
+        if hadm_id not in common_hadm_ids:  # quick skip
+            return traj_key, None, None, True
 
-    skipped_trajectories = 0
+        patient_waveforms = _WF_DF[_WF_DF["hadm_id"] == hadm_id].copy()
+        if len(patient_waveforms) == 0:
+            return traj_key, None, None, True
 
-    for traj_key, traj_info in tqdm(
-        aligned_trajectories.items(), desc="Creating tensors"
-    ):
-        ic_values, ic_mask = create_ic_tensor(traj_key, traj_info)
+        t0_time = pd.to_datetime(traj_info["t0_time"])
+        trajectory_end_time = pd.to_datetime(traj_info["trajectory_end_time"])
+        trajectory_waveforms = patient_waveforms[
+            (patient_waveforms["absolute_timestamp"] >= t0_time)
+            & (patient_waveforms["absolute_timestamp"] < trajectory_end_time)
+        ].copy()
+
+        if len(trajectory_waveforms) == 0:
+            return traj_key, None, None, True
+
+        # Build a local traj_info with waveform_data
+        local_traj_info = {**traj_info, "waveform_data": trajectory_waveforms}
+
+        ic_values, ic_mask = create_ic_tensor(traj_key, local_traj_info)
         if not (ic_mask[0].item() or ic_mask[1].item()):
-            skipped_trajectories += 1
-            # still save zeros for completeness, or skip saving entirely.
-            # Here we skip saving and continue to next trajectory.
-            continue
-        ic_filepath = save_ic_tensor(traj_key, ic_values, ic_mask, ic_dir)
+            # skip saving if neither ABP nor CVP present at t0
+            return traj_key, None, None, True
 
-        ic_metadata[traj_key] = {
-            "hadm_id": traj_info["hadm_id"],
-            "action_cluster_id": traj_info["action_cluster_id"],
-            "t0_time": traj_info["t0_time"],
+        ic_filepath = save_ic_tensor(traj_key, ic_values, ic_mask, Path(ic_dir_str))
+        pred_values, pred_mask = create_prediction_targets_tensor(
+            traj_key, local_traj_info, n_int, int_seconds
+        )
+        pred_filepath = save_prediction_targets_tensor(
+            traj_key, pred_values, pred_mask, n_int, int_seconds, Path(pred_dir_str)
+        )
+
+        ic_meta = {
+            "hadm_id": local_traj_info["hadm_id"],
+            "action_cluster_id": local_traj_info["action_cluster_id"],
+            "t0_time": local_traj_info["t0_time"],
             "file_path": ic_filepath,
             "has_abp_mean": bool(ic_mask[0].item()),
             "has_cvp": bool(ic_mask[1].item()),
@@ -423,30 +456,54 @@ def create_physiological_tensors(
             "cvp_value": float(ic_values[1].item()) if ic_mask[1] else None,
         }
 
-        # Create prediction targets tensor
-        pred_values, pred_mask = create_prediction_targets_tensor(
-            traj_key, traj_info, n_intervals, interval_seconds
-        )
-
-        # No imputation - any NaN values will have caused an error above
-
-        pred_filepath = save_prediction_targets_tensor(
-            traj_key, pred_values, pred_mask, n_intervals, interval_seconds, pred_dir
-        )
-
-        pred_metadata[traj_key] = {
-            "hadm_id": traj_info["hadm_id"],
-            "action_cluster_id": traj_info["action_cluster_id"],
-            "t0_time": traj_info["t0_time"],
-            "trajectory_end_time": traj_info["trajectory_end_time"],
-            "duration_minutes": traj_info["duration_minutes"],
+        pred_meta = {
+            "hadm_id": local_traj_info["hadm_id"],
+            "action_cluster_id": local_traj_info["action_cluster_id"],
+            "t0_time": local_traj_info["t0_time"],
+            "trajectory_end_time": local_traj_info["trajectory_end_time"],
+            "duration_minutes": local_traj_info["duration_minutes"],
             "file_path": pred_filepath,
-            "n_intervals": n_intervals,
-            "interval_seconds": interval_seconds,
+            "n_intervals": n_int,
+            "interval_seconds": int_seconds,
             "total_abp_mean_measurements": int(torch.sum(pred_mask[:, 0] > 0).item()),
             "total_cvp_measurements": int(torch.sum(pred_mask[:, 1] > 0).item()),
             "timestamps_aligned": True,
         }
+
+        return traj_key, ic_meta, pred_meta, False
+
+    # Process trajectories (parallel if requested)
+    ic_metadata: Dict[str, Any] = {}
+    pred_metadata: Dict[str, Any] = {}
+    skipped_trajectories = 0
+
+    tasks = [
+        (tk, ti, n_intervals, interval_seconds, str(ic_dir), str(pred_dir))
+        for tk, ti in med_metadata["trajectories"].items()
+    ]
+
+    if n_workers and n_workers > 1:
+        print(f"\n=== Processing {len(tasks)} Trajectories with {n_workers} workers ===")
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futures = [ex.submit(_process_single_trajectory, t) for t in tasks]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Creating tensors"):
+                traj_key, ic_meta, pred_meta, skipped = fut.result()
+                if skipped or ic_meta is None or pred_meta is None:
+                    skipped_trajectories += 1
+                    continue
+                ic_metadata[traj_key] = ic_meta
+                pred_metadata[traj_key] = pred_meta
+    else:
+        print(f"\n=== Processing {len(tasks)} Trajectories (single process) ===")
+        for t in tqdm(tasks, desc="Creating tensors"):
+            traj_key, ic_meta, pred_meta, skipped = _process_single_trajectory(t)
+            if skipped or ic_meta is None or pred_meta is None:
+                skipped_trajectories += 1
+                continue
+            ic_metadata[traj_key] = ic_meta
+            pred_metadata[traj_key] = pred_meta
 
     # Save metadata
     physio_metadata = {
@@ -474,7 +531,7 @@ def create_physiological_tensors(
     print("\n=== Summary ===")
     print(f"Created {len(ic_metadata)} IC tensors")
     print(f"Created {len(pred_metadata)} prediction target tensors")
-    print(f"Total trajectories aligned: {len(aligned_trajectories)}")
+    print(f"Total trajectories aligned: {len(ic_metadata) + skipped_trajectories}")
     print(f"Trajectories with exact t0 match: {len(ic_metadata)}")
     print(f"Trajectories skipped (no exact t0): {skipped_trajectories}")
     print(f"Success rate: {len(ic_metadata) / len(aligned_trajectories) * 100:.1f}%")

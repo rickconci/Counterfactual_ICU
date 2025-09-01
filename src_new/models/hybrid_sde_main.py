@@ -183,7 +183,9 @@ def main(args):
         print("[DEBUG] main_beta.py: Initializing Hybrid_VAE_SDE model.")
     # Determine final train_dir
     train_dir_final = (
-        args.train_dir if getattr(args, "train_dir", None) else os.path.join(saving_dir, unique_dir_name)
+        args.train_dir
+        if getattr(args, "train_dir", None)
+        else os.path.join(saving_dir, unique_dir_name)
     )
     model = Hybrid_SDE(
         use_encoder=args.use_encoder,
@@ -253,12 +255,16 @@ def main(args):
     # Optionally disable specific control heads for ablation
     if args.disable_controls:
         try:
-            disabled = [int(x) for x in args.disable_controls.split(",") if x.strip() != ""]
+            disabled = [
+                int(x) for x in args.disable_controls.split(",") if x.strip() != ""
+            ]
             model.disabled_control_indices = disabled
             if DEBUG:
                 print(f"[DEBUG] main: Disabled control indices = {disabled}")
         except Exception as e:
-            print(f"[WARN] Failed to parse --disable_controls='{args.disable_controls}': {e}")
+            print(
+                f"[WARN] Failed to parse --disable_controls='{args.disable_controls}': {e}"
+            )
     os.makedirs(model.train_dir, exist_ok=True)
     if DEBUG:
         print("[DEBUG] main_beta.py: Hybrid_VAE_SDE model initialized.")

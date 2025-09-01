@@ -1,7 +1,5 @@
 import os
 import sys
-import math
-import random
 from typing import Dict, Tuple
 
 import numpy as np
@@ -10,18 +8,22 @@ import torch
 
 def add_project_to_syspath() -> None:
     # Add .../Counterfactual_ICU/src_new to sys.path
-    src_new_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    src_new_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if src_new_root not in sys.path:
         sys.path.insert(0, src_new_root)
+
 
 add_project_to_syspath()
 
 # Imports that depend on sys.path including the project root
 from utils.train_utils import zenker_derivatives  # noqa: E402
+
 from models.ZenkerModel import ZenkerODE  # noqa: E402
 
 
-def sample_parameters(batch_size: int, rng: np.random.Generator) -> Dict[str, np.ndarray]:
+def sample_parameters(
+    batch_size: int, rng: np.random.Generator
+) -> Dict[str, np.ndarray]:
     """Sample physiologically plausible states and parameters for testing.
 
     Returns arrays shaped [batch_size].
@@ -45,7 +47,9 @@ def sample_parameters(batch_size: int, rng: np.random.Generator) -> Dict[str, np
     mask = r_tpr_max <= r_tpr_min
     r_tpr_max[mask] = r_tpr_min[mask] + 0.5
 
-    r_tpr_mod = rng.uniform(-0.1, 0.1, size=batch_size)  # small modulation so total stays > 0
+    r_tpr_mod = rng.uniform(
+        -0.1, 0.1, size=batch_size
+    )  # small modulation so total stays > 0
 
     ca = rng.uniform(2.0, 6.0, size=batch_size)
     cv = rng.uniform(60.0, 150.0, size=batch_size)
@@ -72,7 +76,9 @@ def sample_parameters(batch_size: int, rng: np.random.Generator) -> Dict[str, np
     }
 
 
-def build_torch_state_matrix(params: Dict[str, np.ndarray], device: torch.device) -> torch.Tensor:
+def build_torch_state_matrix(
+    params: Dict[str, np.ndarray], device: torch.device
+) -> torch.Tensor:
     """Pack state + parameters into the torch layout expected by zenker_derivatives.
 
     Order: [p_a, p_v, s_reflex, sv, r_tpr_mod, f_hr_max, f_hr_min, r_tpr_max, r_tpr_min, ca, cv, k_width, p_aset, tau]
@@ -100,7 +106,9 @@ def build_torch_state_matrix(params: Dict[str, np.ndarray], device: torch.device
     return y_torch
 
 
-def compare_derivatives(batch_size: int = 32, seed: int = 123, atol: float = 1e-5, rtol: float = 1e-5) -> Tuple[bool, Dict[str, float]]:
+def compare_derivatives(
+    batch_size: int = 32, seed: int = 123, atol: float = 1e-5, rtol: float = 1e-5
+) -> Tuple[bool, Dict[str, float]]:
     """Compare numpy (ZenkerODE) derivatives and torch (zenker_derivatives) across random samples.
 
     Returns a tuple (all_close, max_abs_diffs)
@@ -151,12 +159,14 @@ def compare_derivatives(batch_size: int = 32, seed: int = 123, atol: float = 1e-
         )
 
         # State vector for derivative evaluation
-        y_np = np.array([
-            params["p_a"][i],
-            params["p_v"][i],
-            params["s_reflex"][i],
-            params["sv"][i],
-        ])
+        y_np = np.array(
+            [
+                params["p_a"][i],
+                params["p_v"][i],
+                params["s_reflex"][i],
+                params["sv"][i],
+            ]
+        )
 
         d_np = model.derivatives(y_np, t=0.0)
         dpa_dt_n[i] = d_np[0]
@@ -188,7 +198,9 @@ def main() -> int:
     atol = float(os.environ.get("ZC_ATOL", "1e-5"))
     rtol = float(os.environ.get("ZC_RTL", "1e-5"))
 
-    ok, diffs = compare_derivatives(batch_size=batch_size, seed=seed, atol=atol, rtol=rtol)
+    ok, diffs = compare_derivatives(
+        batch_size=batch_size, seed=seed, atol=atol, rtol=rtol
+    )
 
     status = "PASS" if ok else "FAIL"
     print(f"Zenker derivatives consistency: {status}")
@@ -205,5 +217,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

@@ -7,12 +7,12 @@ import plotly.graph_objects as go
 import torch
 import torchsde
 import wandb
+from graph_control_net import GraphControlNet
 from lightning import LightningModule
 from raindrop import Raindrop_v2
 from torch import distributions, nn
 from torch.special import erf
 from ZenkerModel import ZenkerODE
-from graph_control_net import GraphControlNet
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
 from train_utils import zenker_derivatives
@@ -666,7 +666,9 @@ class Hybrid_SDE(LightningModule):
             ] / self.divisors.to(self.device)
 
         # Always get raw expert variables (physical units) for physics features
-        expert_raw = y[:, self.SDEnet_out_dims : self.SDEnet_out_dims + self.expert_latent_dims]
+        expert_raw = y[
+            :, self.SDEnet_out_dims : self.SDEnet_out_dims + self.expert_latent_dims
+        ]
         pa = expert_raw[:, 0:1]
         pv = expert_raw[:, 1:2]
         s = expert_raw[:, 2:3]
@@ -688,11 +690,15 @@ class Hybrid_SDE(LightningModule):
         dP = pa - pv
         F = -dP / torch.clamp(r_tpr, min=1e-9) + sv * fhr
         dpa_base = F / torch.clamp(ca, min=1e-9)
-        dpv_base = (dP / (torch.clamp(cv, min=1e-9) * torch.clamp(r_tpr, min=1e-9))) - (sv * fhr / torch.clamp(cv, min=1e-9))
+        dpv_base = (dP / (torch.clamp(cv, min=1e-9) * torch.clamp(r_tpr, min=1e-9))) - (
+            sv * fhr / torch.clamp(cv, min=1e-9)
+        )
         sigma = 1.0 / (1.0 + torch.exp(-k_width * (pa - p_aset)))
         s_dot = (1.0 / torch.clamp(tau, min=1e-9)) * (1.0 - sigma - s)
 
-        physics_feats = torch.cat([dP, r_tpr, fhr, F, dpa_base, dpv_base, sigma, s_dot], dim=-1)
+        physics_feats = torch.cat(
+            [dP, r_tpr, fhr, F, dpa_base, dpv_base, sigma, s_dot], dim=-1
+        )
         # Normalize physics features if we normalize SDEnn inputs (zero-mean, unit-std across batch)
         if self.normalise_for_SDENN:
             pf_mean = physics_feats.mean(dim=0, keepdim=True)
@@ -754,11 +760,16 @@ class Hybrid_SDE(LightningModule):
             med_context = (med_context - mc_mean) / mc_std
 
         # If GAT controller is selected, build node-wise features and branch here
-        if self.controller_type == "gat" and getattr(self, "gat_controller", None) is not None:
+        if (
+            self.controller_type == "gat"
+            and getattr(self, "gat_controller", None) is not None
+        ):
             # Per-node scalar values for the 14 expert variables
             node_value = expert_raw.unsqueeze(-1)  # [B, 14, 1]
             # Broadcast physics features to all nodes
-            phys_b = physics_feats.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)  # [B,14,8]
+            phys_b = physics_feats.unsqueeze(1).repeat(
+                1, expert_raw.shape[1], 1
+            )  # [B,14,8]
             parts = [node_value, phys_b]
             # Optional time features
             if self.include_time:
@@ -766,7 +777,10 @@ class Hybrid_SDE(LightningModule):
                 time_b = time_feats.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)
                 parts.append(time_b)
             # Optional medication embedding shared across nodes
-            if getattr(self, "med_proj", None) is not None and med_context.shape[1] == self.n_medications * 2:
+            if (
+                getattr(self, "med_proj", None) is not None
+                and med_context.shape[1] == self.n_medications * 2
+            ):
                 med_embed = torch.tanh(self.med_proj(med_context))  # [B,8]
                 med_b = med_embed.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)
                 parts.append(med_b)
@@ -777,7 +791,9 @@ class Hybrid_SDE(LightningModule):
                 scaled_output = torch.zeros_like(u_raw)
             else:
                 # Apply per-head scales and global weighting
-                scaled_output = (u_raw * self.control_scales.to(u_raw.device)) * self.SDE_control_weighting
+                scaled_output = (
+                    u_raw * self.control_scales.to(u_raw.device)
+                ) * self.SDE_control_weighting
 
             if self.debug and t.item() % 10 == 0:
                 print(
@@ -813,7 +829,8 @@ class Hybrid_SDE(LightningModule):
         else:
             # Apply per-head scales and global weighting
             scaled_output = (
-                SDE_NN_output_latents * self.control_scales.to(SDE_NN_output_latents.device)
+                SDE_NN_output_latents
+                * self.control_scales.to(SDE_NN_output_latents.device)
             ) * self.SDE_control_weighting
 
         if torch.isnan(SDE_NN_output_latents).any():
@@ -853,7 +870,9 @@ class Hybrid_SDE(LightningModule):
                     )
             except Exception as e:
                 if self.debug:
-                    print(f"[WARN] Failed to zero controls {self.disabled_control_indices}: {e}")
+                    print(
+                        f"[WARN] Failed to zero controls {self.disabled_control_indices}: {e}"
+                    )
 
         return scaled_output
 
@@ -1049,7 +1068,6 @@ class Hybrid_SDE(LightningModule):
 
     # 3. Fixed f_aug method:
     def f_aug(self, t, y):
-
         i_ext = y[:, : self.SDEnet_out_dims]
         dt_all_dims = y[
             :,
@@ -1887,7 +1905,7 @@ class Hybrid_SDE(LightningModule):
             i_ext_path = result.get("i_ext_path", None)
             if i_ext_path is not None:
                 control_mean = i_ext_path.mean(1)  # [B, T, D]
-                control_energy = (control_mean ** 2).mean()
+                control_energy = (control_mean**2).mean()
             else:
                 control_energy = torch.tensor(0.0, device=total_loss.device)
         except Exception:
@@ -1896,9 +1914,8 @@ class Hybrid_SDE(LightningModule):
         total_loss = total_loss + self.control_energy_weight * control_energy
 
         # Optional training plots
-        if (
-            self.plot_outputs_train
-            and (self.global_step % max(int(self.plot_every), 1) == 0)
+        if self.plot_outputs_train and (
+            self.global_step % max(int(self.plot_every), 1) == 0
         ):
             try:
                 self.plot_nature_style_with_uncertainty(
@@ -2265,6 +2282,7 @@ class Hybrid_SDE(LightningModule):
         import os
 
         import matplotlib.pyplot as plt
+
         try:
             plt.switch_backend("Agg")
         except Exception:
@@ -2306,19 +2324,68 @@ class Hybrid_SDE(LightningModule):
             ax.set_xlim(0, 1200)
 
             # Use consistent colors and styling
-            ax.plot(time_seconds, arterial_true, color=colors["arterial_true"], linestyle="-", linewidth=2.0, label="Arterial pressure (true)", zorder=3)
-            ax.plot(time_seconds, arterial_pred, color=colors["arterial_pred"], linestyle="--", linewidth=1.5, label="Arterial pressure (predicted)", alpha=0.9, zorder=2)
-            ax.fill_between(time_seconds, arterial_pred - arterial_std, arterial_pred + arterial_std, color=colors["arterial_pred"], alpha=0.2, zorder=1)
+            ax.plot(
+                time_seconds,
+                arterial_true,
+                color=colors["arterial_true"],
+                linestyle="-",
+                linewidth=2.0,
+                label="Arterial pressure (true)",
+                zorder=3,
+            )
+            ax.plot(
+                time_seconds,
+                arterial_pred,
+                color=colors["arterial_pred"],
+                linestyle="--",
+                linewidth=1.5,
+                label="Arterial pressure (predicted)",
+                alpha=0.9,
+                zorder=2,
+            )
+            ax.fill_between(
+                time_seconds,
+                arterial_pred - arterial_std,
+                arterial_pred + arterial_std,
+                color=colors["arterial_pred"],
+                alpha=0.2,
+                zorder=1,
+            )
 
-            ax.plot(time_seconds, venous_true, color=colors["venous_true"], linestyle="-", linewidth=2.0, label="Venous pressure (true)", zorder=3)
-            ax.plot(time_seconds, venous_pred, color=colors["venous_pred"], linestyle="--", linewidth=1.5, label="Venous pressure (predicted)", alpha=0.9, zorder=2)
-            ax.fill_between(time_seconds, venous_pred - venous_std, venous_pred + venous_std, color=colors["venous_pred"], alpha=0.2, zorder=1)
+            ax.plot(
+                time_seconds,
+                venous_true,
+                color=colors["venous_true"],
+                linestyle="-",
+                linewidth=2.0,
+                label="Venous pressure (true)",
+                zorder=3,
+            )
+            ax.plot(
+                time_seconds,
+                venous_pred,
+                color=colors["venous_pred"],
+                linestyle="--",
+                linewidth=1.5,
+                label="Venous pressure (predicted)",
+                alpha=0.9,
+                zorder=2,
+            )
+            ax.fill_between(
+                time_seconds,
+                venous_pred - venous_std,
+                venous_pred + venous_std,
+                color=colors["venous_pred"],
+                alpha=0.2,
+                zorder=1,
+            )
 
             ax.set_xlabel("Time (seconds)", fontweight="bold")
             ax.set_ylabel("Pressure (mmHg)", fontweight="bold")
             epoch_tag = f"epoch{int(getattr(self, 'current_epoch', 0)):03d}_step{int(getattr(self, 'global_step', 0)):06d}"
             ax.set_title(
-                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})", fontweight="bold"
+                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})",
+                fontweight="bold",
             )
             ax.legend(
                 loc="upper right", fancybox=False, facecolor="white", framealpha=1.0
@@ -2358,6 +2425,7 @@ class Hybrid_SDE(LightningModule):
 
         try:
             import matplotlib.pyplot as plt
+
             plt.switch_backend("Agg")
         except Exception:
             pass
@@ -2369,7 +2437,9 @@ class Hybrid_SDE(LightningModule):
         # Approximate drift (derivative of control state) using finite differences over 10-second grid
         control_drift = control_mean.clone()
         if control_drift.shape[1] > 1:
-            control_drift[:, 1:, :] = (control_mean[:, 1:, :] - control_mean[:, :-1, :]) / 10.0
+            control_drift[:, 1:, :] = (
+                control_mean[:, 1:, :] - control_mean[:, :-1, :]
+            ) / 10.0
             control_drift[:, 0, :] = control_drift[:, 1, :]
         else:
             control_drift[:] = 0.0
@@ -2380,7 +2450,11 @@ class Hybrid_SDE(LightningModule):
 
             pred_mean_patient = pred_mean[patient_idx].detach().cpu().numpy()
             pred_std_patient = pred_std[patient_idx].detach().cpu().numpy()
-            true_patient = targets[patient_idx].detach().cpu().numpy() if hasattr(targets[patient_idx], "requires_grad") else targets[patient_idx].cpu().numpy()
+            true_patient = (
+                targets[patient_idx].detach().cpu().numpy()
+                if hasattr(targets[patient_idx], "requires_grad")
+                else targets[patient_idx].cpu().numpy()
+            )
             control_mean_patient = control_mean[patient_idx].detach().cpu().numpy()
             control_std_patient = control_std[patient_idx].detach().cpu().numpy()
 
@@ -2431,7 +2505,9 @@ class Hybrid_SDE(LightningModule):
                 control_mean_patient.shape[1] if control_mean_patient.ndim == 2 else 1
             )
             nrows = 1 + 2 * num_controls
-            fig, axes = plt.subplots(nrows, 1, figsize=(8, 2.0 * nrows + 3), sharex=True)
+            fig, axes = plt.subplots(
+                nrows, 1, figsize=(8, 2.0 * nrows + 3), sharex=True
+            )
             if nrows == 1:
                 axes = [axes]
             ax1 = axes[0]
@@ -2533,7 +2609,13 @@ class Hybrid_SDE(LightningModule):
             for control_idx in range(num_controls):
                 axc = axes[1 + 2 * control_idx]
                 # Integrated control state and its finite-difference derivative
-                deriv_values = control_drift[patient_idx, :, control_idx].detach().cpu().numpy().copy()
+                deriv_values = (
+                    control_drift[patient_idx, :, control_idx]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .copy()
+                )
                 deriv_values[~bp_available_mask] = np.nan
                 control_values = control_mean_patient[:, control_idx].copy()
                 control_std_values = control_std_patient[:, control_idx].copy()
@@ -2600,7 +2682,8 @@ class Hybrid_SDE(LightningModule):
 
             epoch_tag = f"epoch{int(getattr(self, 'current_epoch', 0)):03d}_step{int(getattr(self, 'global_step', 0)):06d}"
             plt.suptitle(
-                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})", fontweight="bold"
+                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})",
+                fontweight="bold",
             )
             plt.tight_layout()
 
@@ -2685,18 +2768,24 @@ class Hybrid_SDE(LightningModule):
                 # Build columns: time, mean_d0..mean_d{D-1}, std_d0..std_d{D-1}
                 data = [time_seconds]
                 for d in range(num_dims):
-                    data.append(control_mean[patient_idx, :, d:d+1])
+                    data.append(control_mean[patient_idx, :, d : d + 1])
                 for d in range(num_dims):
-                    data.append(control_std[patient_idx, :, d:d+1])
+                    data.append(control_std[patient_idx, :, d : d + 1])
                 mat = np.concatenate(data, axis=1)
 
-                header = ["time_sec"] + [f"mean_d{d}" for d in range(num_dims)] + [f"std_d{d}" for d in range(num_dims)]
+                header = (
+                    ["time_sec"]
+                    + [f"mean_d{d}" for d in range(num_dims)]
+                    + [f"std_d{d}" for d in range(num_dims)]
+                )
                 out_path = os.path.join(
                     self.train_dir,
                     "control_csvs",
                     f"batch_{batch_idx}_patient_{patient_idx}_controls.csv",
                 )
-                np.savetxt(out_path, mat, delimiter=",", header=",".join(header), comments="")
+                np.savetxt(
+                    out_path, mat, delimiter=",", header=",".join(header), comments=""
+                )
                 print(f"[PLOT] Saved control CSV (stats over samples): {out_path}")
         except Exception as e:
             if self.debug:

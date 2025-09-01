@@ -327,7 +327,9 @@ class ZenkerODE:
 
         return fn
 
-    def simulate_with_controls(self, t_span=1200.0, dt=0.1, controls=None, t_grid=None, clamp_states=True):
+    def simulate_with_controls(
+        self, t_span=1200.0, dt=0.1, controls=None, t_grid=None, clamp_states=True
+    ):
         """Simulate ODE with time-varying controls affecting venous, SV, ca, r_tpr_mod.
 
         Controls dictionary keys:
@@ -356,7 +358,11 @@ class ZenkerODE:
                     narg = values_or_fn.__code__.co_argcount
                 except Exception:
                     narg = 1
-                return values_or_fn if narg >= 2 else (lambda tt, y: float(values_or_fn(tt)))
+                return (
+                    values_or_fn
+                    if narg >= 2
+                    else (lambda tt, y: float(values_or_fn(tt)))
+                )
             if isinstance(values_or_fn, (int, float)):
                 val = float(values_or_fn)
                 return lambda tt, y: val
@@ -371,14 +377,17 @@ class ZenkerODE:
         u4 = _as_state_feedback(controls.get("u4_drtpr", 0.0), t)
 
         # Initial augmented state: include dynamic ca and r_tpr_mod
-        y0_aug = np.array([
-            self.p_a_init,
-            self.p_v_init,
-            self.s_reflex_init,
-            self.sv_init,
-            self.ca,
-            self.r_tpr_mod,
-        ], dtype=float)
+        y0_aug = np.array(
+            [
+                self.p_a_init,
+                self.p_v_init,
+                self.s_reflex_init,
+                self.sv_init,
+                self.ca,
+                self.r_tpr_mod,
+            ],
+            dtype=float,
+        )
 
         phys_min = self.physio_min
         phys_max = self.physio_max
@@ -395,7 +404,9 @@ class ZenkerODE:
 
             # Derived parameters
             f_hr = s * (self.f_hr_max - self.f_hr_min) + self.f_hr_min
-            r_tpr = s * (self.r_tpr_max - self.r_tpr_min) + self.r_tpr_min + r_tpr_mod_dyn
+            r_tpr = (
+                s * (self.r_tpr_max - self.r_tpr_min) + self.r_tpr_min + r_tpr_mod_dyn
+            )
 
             # Hemodynamics
             outflow = (p_a - p_v) / r_tpr
@@ -415,7 +426,9 @@ class ZenkerODE:
             dca_dt = u3(tt, y_aug)
             drtpr_dt = u4(tt, y_aug)
 
-            return np.array([dpa_dt, dpv_dt, ds_dt, dsv_dt, dca_dt, drtpr_dt], dtype=float)
+            return np.array(
+                [dpa_dt, dpv_dt, ds_dt, dsv_dt, dca_dt, drtpr_dt], dtype=float
+            )
 
         sol_aug = odeint(f_aug, y0_aug, t)
 
@@ -430,17 +443,21 @@ class ZenkerODE:
             ca_i = sol_aug[i, 4]
             rmod_i = sol_aug[i, 5]
             y_aug = np.array([pa_i, pv_i, s_i, sv_i, ca_i, rmod_i], dtype=float)
-            ctrl_vals.append([
-                u1(tt, y_aug),
-                u2(tt, y_aug),
-                u3(tt, y_aug),
-                u4(tt, y_aug),
-            ])
+            ctrl_vals.append(
+                [
+                    u1(tt, y_aug),
+                    u2(tt, y_aug),
+                    u3(tt, y_aug),
+                    u4(tt, y_aug),
+                ]
+            )
         control_series = np.asarray(ctrl_vals, dtype=float)
 
         return t, sol_aug, control_series
 
-    def plot_control_impact(self, t, sol_aug, control_series, save_path=None, figsize=(8, 8)):
+    def plot_control_impact(
+        self, t, sol_aug, control_series, save_path=None, figsize=(8, 8)
+    ):
         """Plot pressures and control profiles with approximate derivatives."""
         try:
             plt.switch_backend("Agg")
@@ -452,10 +469,12 @@ class ZenkerODE:
 
         # Finite differences of controls
         dt_arr = np.maximum(np.diff(t), 1e-6)
-        du = np.vstack([
-            np.zeros((1, control_series.shape[1])),
-            np.diff(control_series, axis=0) / dt_arr[:, None],
-        ])
+        du = np.vstack(
+            [
+                np.zeros((1, control_series.shape[1])),
+                np.diff(control_series, axis=0) / dt_arr[:, None],
+            ]
+        )
 
         num_controls = control_series.shape[1]
         nrows = 1 + num_controls
@@ -476,7 +495,14 @@ class ZenkerODE:
         for i in range(num_controls):
             axi = axes[i + 1]
             axi.plot(t, control_series[:, i], linewidth=1.8, label=labels[i])
-            axi.plot(t, du[:, i], linestyle=":", linewidth=1.2, alpha=0.8, label=f"d({labels[i]})/dt")
+            axi.plot(
+                t,
+                du[:, i],
+                linestyle=":",
+                linewidth=1.2,
+                alpha=0.8,
+                label=f"d({labels[i]})/dt",
+            )
             axi.set_ylabel(labels[i])
             axi.grid(True, alpha=0.3)
             axi.axhline(y=0.0, color="black", linestyle=":", alpha=0.4)
