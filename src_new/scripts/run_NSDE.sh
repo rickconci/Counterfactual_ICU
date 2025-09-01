@@ -31,7 +31,7 @@ nohup python ../models/NSDE_main.py \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 2 \
-    --prior_tx_sigma 0.1 \
+    --prior_tx_sigma 0.2 \
     --output_scale 1 \
     --run_eval \
     --log_wandb True \

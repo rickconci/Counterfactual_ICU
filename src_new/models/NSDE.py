@@ -8,6 +8,7 @@ from lightning import LightningModule
 from raindrop import Raindrop_v2
 from torch import distributions, nn
 import torchsde
+import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
 from utils_beta import (
@@ -1319,6 +1320,7 @@ class NSDE(LightningModule):
         import os
 
         import matplotlib.pyplot as plt
+        import numpy as np
 
         try:
             plt.switch_backend("Agg")
