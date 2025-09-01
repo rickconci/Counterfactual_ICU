@@ -69,7 +69,12 @@ def make_pa_pv_trajectory_tracker(
     pa_star = _np.array([pa_star_fn(ti) for ti in t_grid])
     pv_star = _np.array([pv_star_fn(ti) for ti in t_grid])
 
-    if deriv_smooth and deriv_smooth > 0 and deriv_smooth % 2 == 1 and deriv_smooth >= 3:
+    if (
+        deriv_smooth
+        and deriv_smooth > 0
+        and deriv_smooth % 2 == 1
+        and deriv_smooth >= 3
+    ):
         pa_dot = _savgol(pa_star, deriv_smooth, 2, deriv=1, delta=_np.mean(dt))
         pa_ddot = _savgol(pa_star, deriv_smooth, 2, deriv=2, delta=_np.mean(dt))
         pv_dot = _savgol(pv_star, deriv_smooth, 2, deriv=1, delta=_np.mean(dt))
@@ -85,7 +90,7 @@ def make_pa_pv_trajectory_tracker(
     pv_dot_of_t = lambda t: float(_np.interp(t, t_grid, pv_dot))
 
     if ka2 is None:
-        ka2 = 2.0 * (ka1 ** 0.5)
+        ka2 = 2.0 * (ka1**0.5)
 
     w = _np.asarray(w, dtype=float).clip(min=eps)
     W = _np.diag(w)
@@ -123,13 +128,13 @@ def make_pa_pv_trajectory_tracker(
         rdot0 = rspan * sdot
         fhrd = fspan * sdot
         dPdot0 = A - ((pa - pv) / (cv * r) - sv * fhr / cv)
-        Fp0 = -(dPdot0 * r - (pa - pv) * rdot0) / (r ** 2) + sv * fhrd
+        Fp0 = -(dPdot0 * r - (pa - pv) * rdot0) / (r**2) + sv * fhrd
         a_x = Fp0 / ca_safe
 
         b1 = 1.0 / (ca_safe * r)
         b2 = fhr / ca_safe
         b3 = -A / ca_safe
-        b4 = (pa - pv) / (ca_safe * (r ** 2))
+        b4 = (pa - pv) / (ca_safe * (r**2))
 
         r_need = v1 - a_x - b1 * u1
 
@@ -149,6 +154,7 @@ def make_pa_pv_trajectory_tracker(
 
 def main():
     import matplotlib
+
     matplotlib.use("Agg")
 
     zen = ZenkerODE()
@@ -183,6 +189,7 @@ def main():
 
     # Unified figure: desired vs actual p_a/p_v + controls, shared x-axis
     import matplotlib.pyplot as plt
+
     try:
         plt.switch_backend("Agg")
     except Exception:
@@ -236,5 +243,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

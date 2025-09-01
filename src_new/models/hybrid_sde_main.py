@@ -17,6 +17,23 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
 
 
+def str2bool(v):
+    """Parse flexible boolean values from CLI.
+
+    Accepts: true/false, yes/no, y/n, 1/0 (case-insensitive). If provided without a value,
+    it evaluates to True when used with nargs='?'.
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    if s in ("yes", "true", "t", "y", "1"):
+        return True
+    if s in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected (true/false)")
+
 def set_seed(seed):
     seed_everything(seed, workers=True)
     random.seed(seed)
@@ -183,7 +200,9 @@ def main(args):
         print("[DEBUG] main_beta.py: Initializing Hybrid_VAE_SDE model.")
     # Determine final train_dir
     train_dir_final = (
-        args.train_dir if getattr(args, "train_dir", None) else os.path.join(saving_dir, unique_dir_name)
+        args.train_dir
+        if getattr(args, "train_dir", None)
+        else os.path.join(saving_dir, unique_dir_name)
     )
     model = Hybrid_SDE(
         use_encoder=args.use_encoder,
@@ -213,11 +232,16 @@ def main(args):
         # SDE params
         num_samples=args.num_samples,
         normalise_for_SDENN=args.normalise_for_SDENN,
-        self_reverting_prior_control=False,
+        self_reverting_prior_control=args.self_reverting_prior_control,
         prior_tx_sigma=args.prior_tx_sigma,
         prior_tx_mu=args.prior_tx_mu,
         theta=args.theta,
         SDE_control_weighting=args.SDE_control_weighting,
+        use_control_lowpass=args.use_control_lowpass,
+        control_lowpass_tau=args.control_lowpass_tau,
+        use_control_tv_loss=args.use_control_tv_loss,
+        control_tv_weight=args.control_tv_weight,
+        override_control_scales=args.override_control_scales,
         # SDE model params
         SDE_input_state=args.SDE_input_state,
         include_time=args.include_time,
@@ -253,12 +277,16 @@ def main(args):
     # Optionally disable specific control heads for ablation
     if args.disable_controls:
         try:
-            disabled = [int(x) for x in args.disable_controls.split(",") if x.strip() != ""]
+            disabled = [
+                int(x) for x in args.disable_controls.split(",") if x.strip() != ""
+            ]
             model.disabled_control_indices = disabled
             if DEBUG:
                 print(f"[DEBUG] main: Disabled control indices = {disabled}")
         except Exception as e:
-            print(f"[WARN] Failed to parse --disable_controls='{args.disable_controls}': {e}")
+            print(
+                f"[WARN] Failed to parse --disable_controls='{args.disable_controls}': {e}"
+            )
     os.makedirs(model.train_dir, exist_ok=True)
     if DEBUG:
         print("[DEBUG] main_beta.py: Hybrid_VAE_SDE model initialized.")
@@ -338,7 +366,7 @@ if __name__ == "__main__":
     )
     # Logging specific args
     parser.add_argument(
-        "--HPC_work", type=bool, default=False, help="Where to save if HPC"
+        "--HPC_work", type=str2bool, nargs="?", const=True, default=False, help="Where to save if HPC"
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for initialization"
@@ -351,16 +379,20 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--log_wandb",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=False,
         help="Whether to log to Weights & Biases",
     )
     parser.add_argument(
-        "--early_stopping", type=bool, default=False, help="Enable early stopping"
+        "--early_stopping", type=str2bool, nargs="?", const=True, default=False, help="Enable early stopping"
     )
     parser.add_argument(
         "--model_checkpoint",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=False,
         help="Enable model checkpointing",
     )
@@ -402,7 +434,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--normalise",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=False,
         help="Whether to normalise the data. Recommended ONLY if using an Encoder",
     )
@@ -414,19 +448,25 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--non_confounded_effect",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=False,
         help="Whether to add non-confounded unsee effect on the treatment (increases the noise of the prediction)",
     )
     parser.add_argument(
         "--fixed_tx",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=True,
         help="Whether all patients receive the same treatment ",
     )
     parser.add_argument(
         "--include_all_inputs",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=True,
         help="Whether to create data with all variables in the X as input",
     )
@@ -461,13 +501,17 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_batch_norm",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=False,
         help="Whether to include batch norm within the SDE NN network )",
     )
     parser.add_argument(
         "--include_time",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=True,
         help="Whether to include encoded time in the SDE NN inputs)",
     )
@@ -475,7 +519,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--integration_step_size",
         type=float,
-        default=0.1,
+        default= 10.0,
         help="Parameter dt for SDE integration",
     )
     parser.add_argument(
@@ -489,8 +533,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--integration_adaptive",
-        type=bool,
-        default=True,
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
         help="Use adaptive SDE integration?",
     )
 
@@ -502,14 +548,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--self_reverting_prior_control",
-        type=bool,
-        default=False,
+        action="store_true",
         help="Whether the control has a self reverting prior to it with a functional prior",
     )
     parser.add_argument(
         "--KL_weighting_SDE",
         type=float,
-        default=0.001,
+        default=0.0001,
         help="Defines the weighting to the KL loss for the SDE",
     )
 
@@ -542,7 +587,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--theta",
         type=float,
-        default=0.001,
+        default=0.0001,
         help="Theta defines how the impact of the mean reverting process correction on the SDE",
     )
     parser.add_argument(
@@ -550,6 +595,35 @@ if __name__ == "__main__":
         type=float,
         default=1,
         help="how much to scale the output of the SDE NN",
+    )
+    # Smoothness/inductive bias flags
+    parser.add_argument(
+        "--use_control_lowpass",
+        action="store_true",
+        help="Use low-pass control dynamics du/dt=(u_hat-u)/tau",
+    )
+    parser.add_argument(
+        "--control_lowpass_tau",
+        type=float,
+        default=30.0,
+        help="Time constant tau (seconds) for control low-pass",
+    )
+    parser.add_argument(
+        "--use_control_tv_loss",
+        action="store_true",
+        help="Add TV/L2 smoothness penalty on control path",
+    )
+    parser.add_argument(
+        "--control_tv_weight",
+        type=float,
+        default=1e-3,
+        help="Weight for control TV/L2 smoothness penalty",
+    )
+    parser.add_argument(
+        "--override_control_scales",
+        type=str,
+        default="",
+        help="Comma-separated per-head control scales to override defaults (e.g., '0.1,0.02,0.01,0.01')",
     )
 
     parser.add_argument(
@@ -611,7 +685,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--final_activation",
         type=str,
-        default="none",
+        default="tanh",
         choices=["relu", "none", "tanh"],
         help="Which nonlinearity to add as a final layer to the NN!",
     )
@@ -627,7 +701,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_scale",
         type=float,
-        default=0.1,
+        default=3,
         help="Standard Deviation when computing GaussianNegLL between Y_true and Y_hat",
     )
     parser.add_argument(
@@ -650,7 +724,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=0.001,
+        default=0.0005,
         help="Learning rate for the optimizer",
     )
     parser.add_argument("--batch_size", type=int, default=2, help="Training batch size")

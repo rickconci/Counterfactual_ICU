@@ -6,7 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def build_default_adjacency(num_nodes: int = 14, device: Optional[torch.device] = None) -> torch.Tensor:
+def build_default_adjacency(
+    num_nodes: int = 14, device: Optional[torch.device] = None
+) -> torch.Tensor:
     """Construct a sparse physiology graph adjacency mask A in {0,1}^{N x N}.
 
     Node order matches expert state order used across the project:
@@ -69,7 +71,9 @@ class SimpleGATLayer(nn.Module):
     Output: node_features [B, N, Fout]
     """
 
-    def __init__(self, in_dim: int, out_dim: int, num_heads: int = 4, dropout: float = 0.0):
+    def __init__(
+        self, in_dim: int, out_dim: int, num_heads: int = 4, dropout: float = 0.0
+    ):
         super().__init__()
         assert out_dim % num_heads == 0, "out_dim must be divisible by num_heads"
         self.in_dim = in_dim
@@ -83,6 +87,10 @@ class SimpleGATLayer(nn.Module):
         self.out_proj = nn.Linear(out_dim, out_dim, bias=True)
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(out_dim)
+        # Residual projection to match dimensions when in_dim != out_dim
+        self.residual_proj = (
+            nn.Identity() if in_dim == out_dim else nn.Linear(in_dim, out_dim, bias=False)
+        )
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         B, N, _ = x.shape
@@ -95,11 +103,13 @@ class SimpleGATLayer(nn.Module):
         k = k.permute(0, 2, 1, 3)  # [B, H, N, D]
         v = v.permute(0, 2, 1, 3)  # [B, H, N, D]
 
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B, H, N, N]
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(
+            self.head_dim
+        )  # [B, H, N, N]
 
         # Apply adjacency mask: set -inf where no edge
         mask = (adj > 0).unsqueeze(0).unsqueeze(0)  # [1,1,N,N]
-        attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
+        attn_logits = attn_logits.masked_fill(~mask, float("-inf"))
         attn = F.softmax(attn_logits, dim=-1)
         attn = self.dropout(attn)
 
@@ -108,7 +118,8 @@ class SimpleGATLayer(nn.Module):
         out = self.out_proj(out)
 
         # Residual + norm
-        out = self.layer_norm(x + out)
+        residual = self.residual_proj(x)
+        out = self.layer_norm(residual + out)
         return out
 
 
@@ -141,15 +152,25 @@ class GraphControlNet(nn.Module):
         layers = []
         in_dim = node_feature_dim
         for _ in range(num_layers):
-            layers.append(SimpleGATLayer(in_dim, hidden_dim, num_heads=num_heads, dropout=dropout))
+            layers.append(
+                SimpleGATLayer(in_dim, hidden_dim, num_heads=num_heads, dropout=dropout)
+            )
             in_dim = hidden_dim
         self.gnn = nn.ModuleList(layers)
 
         # Readout MLPs for each control from designated nodes
-        self.readout_u1 = nn.Sequential(nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Linear(64, 1))
-        self.readout_u2 = nn.Sequential(nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Linear(64, 1))
-        self.readout_u3 = nn.Sequential(nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Linear(64, 1))
-        self.readout_u4 = nn.Sequential(nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Linear(64, 1))
+        self.readout_u1 = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Linear(64, 1)
+        )
+        self.readout_u2 = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Linear(64, 1)
+        )
+        self.readout_u3 = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Linear(64, 1)
+        )
+        self.readout_u4 = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Linear(64, 1)
+        )
 
         # Default adjacency
         A = build_default_adjacency(self.num_nodes, device)
@@ -160,7 +181,9 @@ class GraphControlNet(nn.Module):
         # u1: +dpv_dt from p_v, u2: dsv_dt from sv, u3: dca/dt from ca, u4: d(r_tpr_mod)/dt from r_tpr_mod
         return 1, 3, 9, 4
 
-    def forward(self, node_features: torch.Tensor, adjacency: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, node_features: torch.Tensor, adjacency: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         # node_features: [B, N, F]
         B, N, _ = node_features.shape
         assert N == self.num_nodes, f"Expected {self.num_nodes} nodes, got {N}"
@@ -185,5 +208,3 @@ class GraphControlNet(nn.Module):
         u = torch.cat([u1, u2, u3, u4], dim=-1)
         u = torch.tanh(u)  # keep bounded; scales applied by caller
         return u
-
-

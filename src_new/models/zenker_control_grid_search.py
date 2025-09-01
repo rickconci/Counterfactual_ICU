@@ -46,9 +46,13 @@ def make_profiles(t: np.ndarray, amplitude: float) -> Dict[str, np.ndarray]:
     return profiles
 
 
-def simulate_and_score(model: ZenkerODE, t: np.ndarray, control_key: str, profile: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+def simulate_and_score(
+    model: ZenkerODE, t: np.ndarray, control_key: str, profile: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
     controls = {control_key: profile}
-    t_out, sol_aug, control_series = model.simulate_with_controls(t_grid=t, controls=controls)
+    t_out, sol_aug, control_series = model.simulate_with_controls(
+        t_grid=t, controls=controls
+    )
 
     # sol_aug columns: [p_a, p_v, s_reflex, sv, ca, r_tpr_mod]
     p_a = sol_aug[:, 0]
@@ -69,7 +73,9 @@ def simulate_and_score(model: ZenkerODE, t: np.ndarray, control_key: str, profil
 
 def run_grid_search(out_dir: str) -> None:
     import csv
+
     import matplotlib
+
     matplotlib.use("Agg")
 
     os.makedirs(out_dir, exist_ok=True)
@@ -86,10 +92,10 @@ def run_grid_search(out_dir: str) -> None:
 
     # Control keys and sensible base scales (per-second) for 20 min horizon
     control_specs = [
-        ("u1_dpv", 0.10),   # mmHg/s
+        ("u1_dpv", 0.10),  # mmHg/s
         ("u2_dsv", 0.002),  # ml/s
-        ("u3_dca", 0.0005), # compliance units/s
-        ("u4_drtpr", 0.0005), # resistance-mod units/s
+        ("u3_dca", 0.0005),  # compliance units/s
+        ("u4_drtpr", 0.0005),  # resistance-mod units/s
     ]
 
     multipliers = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]
@@ -104,23 +110,25 @@ def run_grid_search(out_dir: str) -> None:
         csv_path = os.path.join(ctrl_dir, f"summary_{control_key}.csv")
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "control",
-                "multiplier",
-                "amplitude",
-                "profile",
-                "pa_mean",
-                "pv_mean",
-                "pa_mean_delta",
-                "pv_mean_delta",
-                "pa_end",
-                "pv_end",
-                "pa_min",
-                "pa_max",
-                "pv_min",
-                "pv_max",
-                "plot_path",
-            ])
+            writer.writerow(
+                [
+                    "control",
+                    "multiplier",
+                    "amplitude",
+                    "profile",
+                    "pa_mean",
+                    "pv_mean",
+                    "pa_mean_delta",
+                    "pv_mean_delta",
+                    "pa_end",
+                    "pv_end",
+                    "pa_min",
+                    "pa_max",
+                    "pv_min",
+                    "pv_max",
+                    "plot_path",
+                ]
+            )
 
             for mult in multipliers:
                 amplitude = mult * base_scale
@@ -136,33 +144,41 @@ def run_grid_search(out_dir: str) -> None:
                     )
 
                     # Save plot
-                    plot_name = f"{control_key}_{pname}_mult{mult:+.2f}.png".replace("+", "p").replace("-", "m").replace(".", "p")
+                    plot_name = (
+                        f"{control_key}_{pname}_mult{mult:+.2f}.png".replace("+", "p")
+                        .replace("-", "m")
+                        .replace(".", "p")
+                    )
                     plot_path = os.path.join(ctrl_dir, plot_name)
                     try:
-                        model_i.plot_control_impact(t_out, sol_aug, control_series, save_path=plot_path)
+                        model_i.plot_control_impact(
+                            t_out, sol_aug, control_series, save_path=plot_path
+                        )
                     except Exception as e:
                         plot_path = f"ERROR: {e}"
 
                     pa_delta = metrics["pa_mean"] - base_pa_mean
                     pv_delta = metrics["pv_mean"] - base_pv_mean
 
-                    writer.writerow([
-                        control_key,
-                        f"{mult:.2f}",
-                        f"{amplitude:.6f}",
-                        pname,
-                        f"{metrics['pa_mean']:.4f}",
-                        f"{metrics['pv_mean']:.4f}",
-                        f"{pa_delta:.4f}",
-                        f"{pv_delta:.4f}",
-                        f"{metrics['pa_end']:.4f}",
-                        f"{metrics['pv_end']:.4f}",
-                        f"{metrics['pa_min']:.4f}",
-                        f"{metrics['pa_max']:.4f}",
-                        f"{metrics['pv_min']:.4f}",
-                        f"{metrics['pv_max']:.4f}",
-                        plot_path,
-                    ])
+                    writer.writerow(
+                        [
+                            control_key,
+                            f"{mult:.2f}",
+                            f"{amplitude:.6f}",
+                            pname,
+                            f"{metrics['pa_mean']:.4f}",
+                            f"{metrics['pv_mean']:.4f}",
+                            f"{pa_delta:.4f}",
+                            f"{pv_delta:.4f}",
+                            f"{metrics['pa_end']:.4f}",
+                            f"{metrics['pv_end']:.4f}",
+                            f"{metrics['pa_min']:.4f}",
+                            f"{metrics['pa_max']:.4f}",
+                            f"{metrics['pv_min']:.4f}",
+                            f"{metrics['pv_max']:.4f}",
+                            plot_path,
+                        ]
+                    )
 
                     summary_rows.append(
                         {
@@ -180,6 +196,7 @@ def run_grid_search(out_dir: str) -> None:
     # Combined summary CSV
     comb_csv = os.path.join(out_dir, "summary_all_controls.csv")
     import csv as _csv
+
     with open(comb_csv, "w", newline="") as f:
         if summary_rows:
             fieldnames = list(summary_rows[0].keys())
@@ -225,5 +242,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

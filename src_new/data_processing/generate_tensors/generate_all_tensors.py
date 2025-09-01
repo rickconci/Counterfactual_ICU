@@ -42,6 +42,7 @@ def generate_all_tensors(
     context_interval_minutes: int = 10,
     hosp_input_dir: str | None = None,
     force_reload: bool = False,
+    physio_workers: int = 6,
     context_workers: int = 6,
 ) -> Dict[str, Any]:
     """Generate medication tensors, physiological IC/target tensors, and context tensors.
@@ -123,6 +124,7 @@ def generate_all_tensors(
             med_tensors_metadata_path=str(med_metadata_path),
             output_dir=str(physio_out_dir),
             interval_seconds=interval_seconds,
+            n_workers=physio_workers,
         )
 
     context_metadata_path = context_out_dir / "context_tensors_metadata.pkl"
@@ -276,6 +278,12 @@ def _parse_args() -> argparse.Namespace:
         help="Number of worker processes for context generation (default: 1).",
     )
     parser.add_argument(
+        "--physio-workers",
+        type=int,
+        default=6,
+        help="Number of worker processes for physio/IC generation (default: 6).",
+    )
+    parser.add_argument(
         "--mimic-III-input-dir",
         type=str,
         default=None,
@@ -314,6 +322,7 @@ def main() -> None:
         context_interval_minutes=args.context_interval_minutes,
         hosp_input_dir=args.mimic_III_input_dir,
         force_reload=args.force_reload,
+        physio_workers=args.physio_workers,
         context_workers=args.context_workers,
     )
 
