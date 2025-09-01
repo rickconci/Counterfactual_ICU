@@ -188,6 +188,7 @@ def main(args):
         expert_latent_dims=14,  # Fixed by the ODE model #todo check that
         encoder_SDENN_dims=0 if args.use_encoder == "none" else args.encoder_SDENN_dims,
         n_medications=22,
+        encoder_context_len=data_module.context_max_len,
         encoder_num_layers=args.encoder_num_layers,
         encoder_w_time=args.encoder_w_time,
         encoder_reverse_time=args.encoder_reverse_time,

@@ -36,6 +36,7 @@ class NSDE(LightningModule):
         encoder_w_time,
         encoder_reverse_time,
         n_medications,
+        encoder_context_len,
         # New static fusion params
         static_input_dim,
         static_hidden_dim,
@@ -110,13 +111,16 @@ class NSDE(LightningModule):
             # TODO not quite sure if this is still right
             d_ob = max(int(encoder_hidden_dim / encoder_input_dim), 2)
             temporal_embedding_dim = encoder_input_dim * d_ob + 16  # d_model + d_pe
+            max_len_ctx = (
+                120 if encoder_context_len is None else int(encoder_context_len)
+            )
             self.temporal_encoder = Raindrop_v2(
                 d_inp=encoder_input_dim,
                 d_model=encoder_hidden_dim,
                 output_dim=temporal_embedding_dim,  # Not used since we commented out final layer
                 nhead=4,
                 nhid=128,
-                max_len=120,
+                max_len=max_len_ctx,
                 global_structure=torch.ones(
                     encoder_input_dim, encoder_input_dim
                 ),  # pass a complete adj matrix
@@ -508,6 +512,8 @@ class NSDE(LightningModule):
                 batch_size, 1
             )
             nn_input = torch.cat([nn_input, time_encoding], dim=-1)
+
+        med_context = (med_context - 0.5) * 4.0
 
         nn_input = torch.cat([nn_input, med_context], dim=-1)
 
@@ -1307,37 +1313,49 @@ class NSDE(LightningModule):
         return colors
 
     def plot_nature_style_with_uncertainty(
-        self, predictions_full, targets, combined_mask, batch_idx
+            self, predictions_full, targets, combined_mask, batch_idx
     ):
         """Nature-style plots with uncertainty bands around predictions"""
         import os
 
         import matplotlib.pyplot as plt
 
+        try:
+            plt.switch_backend("Agg")
+        except Exception:
+            pass
+
         colors = self._setup_plot_style()
         os.makedirs(os.path.join(self.train_dir, "nature_plots"), exist_ok=True)
 
-        if predictions_full.dim() == 4:
-            pred_mean = predictions_full.squeeze(1)  # Remove fake samples dim
-            pred_std = torch.zeros_like(
-                pred_mean
-            )  # No uncertainty for deterministic NODE
-        else:
-            pred_mean = predictions_full
-            pred_std = torch.zeros_like(pred_mean)
+        pred_mean = predictions_full.mean(1).detach()
+        pred_std = predictions_full.std(1).detach()
+        targets = targets.detach() if targets.requires_grad else targets
 
         for patient_idx in range(min(3, predictions_full.shape[0])):
             patient_mask = combined_mask[patient_idx]
-            valid_both = patient_mask.sum(dim=1) == 2
-            valid_indices = torch.where(valid_both)[0].cpu().numpy()
+            time_seconds = (torch.arange(patient_mask.shape[0]).cpu().numpy()) * 10
+            pred_mean_patient = pred_mean[patient_idx].detach().cpu().numpy()
+            pred_std_patient = pred_std[patient_idx].detach().cpu().numpy()
+            true_patient = targets[patient_idx].detach().cpu().numpy()
 
-            if len(valid_indices) < 5:
-                continue
+            arterial_mask = patient_mask[:, 0].cpu().numpy().astype(bool)
+            venous_mask = patient_mask[:, 1].cpu().numpy().astype(bool)
 
-            time_seconds = valid_indices * 10
-            pred_mean_patient = pred_mean[patient_idx, valid_indices].cpu().numpy()
-            pred_std_patient = pred_std[patient_idx, valid_indices].cpu().numpy()
-            true_patient = targets[patient_idx, valid_indices].cpu().numpy()
+            # Mask out invalid points per channel (plot with gaps where missing)
+            arterial_true = true_patient[:, 0].copy()
+            arterial_pred = pred_mean_patient[:, 0].copy()
+            arterial_std = pred_std_patient[:, 0].copy()
+            arterial_true[~arterial_mask] = np.nan
+            arterial_pred[~arterial_mask] = np.nan
+            arterial_std[~arterial_mask] = np.nan
+
+            venous_true = true_patient[:, 1].copy()
+            venous_pred = pred_mean_patient[:, 1].copy()
+            venous_std = pred_std_patient[:, 1].copy()
+            venous_true[~venous_mask] = np.nan
+            venous_pred[~venous_mask] = np.nan
+            venous_std[~venous_mask] = np.nan
 
             fig, ax = plt.subplots(figsize=(7, 5))
             ax.set_xlim(0, 1200)
@@ -1345,7 +1363,7 @@ class NSDE(LightningModule):
             # Use consistent colors and styling
             ax.plot(
                 time_seconds,
-                true_patient[:, 0],
+                arterial_true,
                 color=colors["arterial_true"],
                 linestyle="-",
                 linewidth=2.0,
@@ -1354,7 +1372,7 @@ class NSDE(LightningModule):
             )
             ax.plot(
                 time_seconds,
-                pred_mean_patient[:, 0],
+                arterial_pred,
                 color=colors["arterial_pred"],
                 linestyle="--",
                 linewidth=1.5,
@@ -1364,8 +1382,8 @@ class NSDE(LightningModule):
             )
             ax.fill_between(
                 time_seconds,
-                pred_mean_patient[:, 0] - pred_std_patient[:, 0],
-                pred_mean_patient[:, 0] + pred_std_patient[:, 0],
+                arterial_pred - arterial_std,
+                arterial_pred + arterial_std,
                 color=colors["arterial_pred"],
                 alpha=0.2,
                 zorder=1,
@@ -1373,7 +1391,7 @@ class NSDE(LightningModule):
 
             ax.plot(
                 time_seconds,
-                true_patient[:, 1],
+                venous_true,
                 color=colors["venous_true"],
                 linestyle="-",
                 linewidth=2.0,
@@ -1382,7 +1400,7 @@ class NSDE(LightningModule):
             )
             ax.plot(
                 time_seconds,
-                pred_mean_patient[:, 1],
+                venous_pred,
                 color=colors["venous_pred"],
                 linestyle="--",
                 linewidth=1.5,
@@ -1392,8 +1410,8 @@ class NSDE(LightningModule):
             )
             ax.fill_between(
                 time_seconds,
-                pred_mean_patient[:, 1] - pred_std_patient[:, 1],
-                pred_mean_patient[:, 1] + pred_std_patient[:, 1],
+                venous_pred - venous_std,
+                venous_pred + venous_std,
                 color=colors["venous_pred"],
                 alpha=0.2,
                 zorder=1,
@@ -1401,8 +1419,10 @@ class NSDE(LightningModule):
 
             ax.set_xlabel("Time (seconds)", fontweight="bold")
             ax.set_ylabel("Pressure (mmHg)", fontweight="bold")
+            epoch_tag = f"epoch{int(getattr(self, 'current_epoch', 0)):03d}_step{int(getattr(self, 'global_step', 0)):06d}"
             ax.set_title(
-                f"Patient {patient_idx} (Batch {batch_idx})", fontweight="bold"
+                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})",
+                fontweight="bold",
             )
             ax.legend(
                 loc="upper right", fancybox=False, facecolor="white", framealpha=1.0
@@ -1418,12 +1438,10 @@ class NSDE(LightningModule):
                     }
                 )
             else:
-                plt.savefig(
-                    os.path.join(
-                        self.train_dir,
-                        f"nature_plots/patient_{batch_idx}_{patient_idx}_uncertainty.png",
-                    ),
-                    dpi=300,
-                    bbox_inches="tight",
+                out_path = os.path.join(
+                    self.train_dir,
+                    f"nature_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}_uncertainty.png",
                 )
+                plt.savefig(out_path, dpi=300, bbox_inches="tight")
+                print(f"[PLOT] Saved: {out_path}")
             plt.close()

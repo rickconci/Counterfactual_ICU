@@ -24,7 +24,7 @@ nohup python ../models/NODE_main.py \
     --dataset_type mimic \
     --use_encoder raindrop \
     --num_samples 1 \
-    --batch_size 16 \
+    --batch_size 32 \
     --seed 14 \
     --max_epochs 50 \
     --data_root '../../data/mimic_3_data/processed_data' \
