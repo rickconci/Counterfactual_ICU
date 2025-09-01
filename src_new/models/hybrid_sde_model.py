@@ -101,6 +101,8 @@ class Hybrid_SDE(LightningModule):
         force_no_controls=False,
         # Plotting
         plot_outputs_train=True,
+        # plotting behavior (overlays auto-enabled for num_samples>1)
+        plot_control_samples=False,
         # regularization
         control_energy_weight: float = 1e-4,
         # controller selection
@@ -358,6 +360,7 @@ class Hybrid_SDE(LightningModule):
         self.force_no_controls = force_no_controls
         # Plotting flags
         self.plot_outputs_train = plot_outputs_train
+        self.plot_control_samples = plot_control_samples
         # Regularization weight for control energy λ·E[||u||^2]
         self.control_energy_weight = float(control_energy_weight)
         # Controller config
@@ -948,18 +951,7 @@ class Hybrid_SDE(LightningModule):
         scaled_output = torch.nan_to_num(scaled_output, nan=0.0, posinf=0.0, neginf=0.0)
         scaled_output = torch.clamp(scaled_output, -5.0, 5.0)
 
-        # Optional: apply low-pass to controls before returning (du/dt=(u_hat - u)/tau)
-        if getattr(self, "use_control_lowpass", False):
-            # y contains current control states at indices [:, :SDEnet_out_dims]
-            u_current = y[:, : self.SDEnet_out_dims]
-            tau = max(self.control_lowpass_tau, 1e-3)
-            du_lowpass = (scaled_output - u_current) / tau
-            # raw derivative interpretation: use scaled_output directly as du
-            du_raw = scaled_output
-            alpha = float(self.control_lowpass_blend)
-            alpha = 0.0 if alpha < 0.0 else (1.0 if alpha > 1.0 else alpha)
-            du = alpha * du_lowpass + (1.0 - alpha) * du_raw
-            scaled_output = du
+    
 
         if torch.isnan(SDE_NN_output_latents).any():
             print("SDE_NN_output contains NaN!")
@@ -1778,8 +1770,9 @@ class Hybrid_SDE(LightningModule):
                 mask_expanded_dbg = mask_f.unsqueeze(1).expand(-1, predicted_traj.shape[1], -1, -1)
                 logpy_masked = logpy * mask_expanded_dbg
                 denom_ch = torch.clamp(mask_f.sum(dim=(0, 1)), min=1.0)
-                nll_ch = -logpy_masked.sum(dim=(0, 2, 3)) / denom_ch  # [S]
-                nll_ch_mean = nll_ch.mean(dim=0) if nll_ch.dim() > 0 else nll_ch
+                # Sum over batch, samples, and time to get per-channel NLL
+                nll_ch = -logpy_masked.sum(dim=(0, 1, 2)) / denom_ch  # [C]
+                nll_ch_mean = nll_ch
                 print(f"[DEBUG] NLL per channel (avg over samples): {nll_ch_mean.detach().cpu().tolist() if nll_ch_mean.numel()>1 else float(nll_ch_mean.detach().cpu())}")
                 # Small diff snippet first 5 timesteps
                 Tsnip = min(pred_mean.shape[1], 5)
@@ -2747,8 +2740,24 @@ class Hybrid_SDE(LightningModule):
                 arterial_pred - arterial_std,
                 arterial_pred + arterial_std,
                 color=colors["arterial_pred"],
-                alpha=0.2,
+                alpha=0.3,
+                zorder=1,
             )
+            # Overlay a few per-sample predicted arterial traces when S>1
+            if predictions_full.shape[1] > 1:
+                samples_np = predictions_full[patient_idx].detach().cpu().numpy()  # [S,T,C]
+                max_overlays = min(samples_np.shape[0], 6)
+                for s_idx in range(max_overlays):
+                    sample_line = samples_np[s_idx, :, 0].copy()
+                    sample_line[~arterial_mask] = np.nan
+                    ax1.plot(
+                        time_seconds,
+                        sample_line,
+                        color=colors["arterial_pred"],
+                        linewidth=0.8,
+                        linestyle="-",
+                        alpha=0.35,
+                    )
 
             venous_true = true_patient[:, 1].copy()
             venous_pred = pred_mean_patient[:, 1].copy()
@@ -2779,8 +2788,24 @@ class Hybrid_SDE(LightningModule):
                 venous_pred - venous_std,
                 venous_pred + venous_std,
                 color=colors["venous_pred"],
-                alpha=0.2,
+                alpha=0.3,
+                zorder=1,
             )
+            # Overlay a few per-sample predicted venous traces when S>1
+            if predictions_full.shape[1] > 1:
+                samples_np = predictions_full[patient_idx].detach().cpu().numpy()  # [S,T,C]
+                max_overlays = min(samples_np.shape[0], 6)
+                for s_idx in range(max_overlays):
+                    sample_line = samples_np[s_idx, :, 1].copy()
+                    sample_line[~venous_mask] = np.nan
+                    ax1.plot(
+                        time_seconds,
+                        sample_line,
+                        color=colors["venous_pred"],
+                        linewidth=0.8,
+                        linestyle="-",
+                        alpha=0.35,
+                    )
 
             ax1.set_xlim(0, 1200)
             ax1.set_ylabel("Pressure (mmHg)", fontweight="bold")
@@ -2826,8 +2851,21 @@ class Hybrid_SDE(LightningModule):
                     control_values - control_std_values,
                     control_values + control_std_values,
                     color=color,
-                    alpha=0.2,
+                    alpha=0.35,
                 )
+                # Overlay per-sample control traces if multiple samples
+                if i_ext_path.shape[1] > 1:
+                    sample_controls = (
+                        i_ext_path[patient_idx, :, :, control_idx].detach().cpu().numpy()
+                    )  # [S, T]
+                    for s_idx in range(min(sample_controls.shape[0], 6)):
+                        axc.plot(
+                            time_seconds,
+                            sample_controls[s_idx],
+                            color=color,
+                            linewidth=0.8,
+                            alpha=0.35,
+                        )
                 axc.plot(
                     time_seconds,
                     deriv_values,
@@ -2842,15 +2880,52 @@ class Hybrid_SDE(LightningModule):
                 axc.axhline(y=0, color="black", linestyle=":", alpha=0.4)
                 # Separate derivative subplot directly under the control state
                 axd = axes[1 + 2 * control_idx + 1]
+                # Compute per-sample finite-difference derivatives for uncertainty and overlays
+                samples_for_ctrl = (
+                    i_ext_path[patient_idx, :, :, control_idx]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )  # [S, T]
+                if samples_for_ctrl.shape[1] > 1:
+                    sample_derivs = np.diff(samples_for_ctrl, axis=1) / 10.0  # [S, T-1]
+                    # pad first timestep by copying the first diff to align lengths
+                    first_col = sample_derivs[:, :1]
+                    sample_derivs = np.concatenate([first_col, sample_derivs], axis=1)  # [S, T]
+                else:
+                    sample_derivs = np.zeros_like(samples_for_ctrl)
+                deriv_mean_line = sample_derivs.mean(axis=0)
+                deriv_std_line = sample_derivs.std(axis=0, ddof=0)
+
+                # Mean derivative line
                 axd.plot(
                     time_seconds,
-                    deriv_values,
+                    deriv_mean_line,
                     color=color,
-                    linewidth=1.0,
+                    linewidth=1.2,
                     linestyle="-",
                     alpha=0.9,
-                    label=f"d(Control {control_idx + 1})/dt",
+                    label=f"d(Control {control_idx + 1})/dt (mean)",
                 )
+                # Std band
+                axd.fill_between(
+                    time_seconds,
+                    deriv_mean_line - deriv_std_line,
+                    deriv_mean_line + deriv_std_line,
+                    color=color,
+                    alpha=0.25,
+                )
+                # Overlay a few sample derivative traces for visibility
+                max_overlays = min(sample_derivs.shape[0], 6)
+                for s_idx in range(max_overlays):
+                    axd.plot(
+                        time_seconds,
+                        sample_derivs[s_idx],
+                        color=color,
+                        linewidth=0.7,
+                        linestyle="-",
+                        alpha=0.3,
+                    )
                 axd.set_ylabel(f"dCtrl {control_idx + 1}/dt")
                 axd.grid(True, alpha=0.2)
                 axd.axhline(y=0, color="black", linestyle=":", alpha=0.4)

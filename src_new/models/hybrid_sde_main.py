@@ -543,19 +543,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prior_tx_sigma",
         type=float,
-        default=0.000001,
+        default=0.00001,
         help="prior_tx_sigma defines our assumed prior noise of the stochastic control ",
     )
     parser.add_argument(
         "--self_reverting_prior_control",
-        type=bool,
-        default=False,
+        action="store_true",
         help="Whether the control has a self reverting prior to it with a functional prior",
     )
     parser.add_argument(
         "--KL_weighting_SDE",
         type=float,
-        default=0.001,
+        default=0.0001,
         help="Defines the weighting to the KL loss for the SDE",
     )
 
@@ -588,7 +587,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--theta",
         type=float,
-        default=0.001,
+        default=0.0001,
         help="Theta defines how the impact of the mean reverting process correction on the SDE",
     )
     parser.add_argument(
