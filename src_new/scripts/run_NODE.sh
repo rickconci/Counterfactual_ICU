@@ -20,26 +20,25 @@ mkdir -p ../../results/model_checkpoints
 
 # Training command
 echo "Starting training with nohup..."
-python ../models/NODE_main.py \
+nohup python ../models/NODE_main.py \
     --dataset_type mimic \
     --use_encoder none \
     --num_samples 1 \
-    --batch_size 32 \
+    --batch_size 16 \
     --seed 14 \
-    --max_epochs 1 \
+    --max_epochs 50 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --adjoint True \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 0.1 \
-    --HPC_work False \
+    --HPC_work True \
     --prior_tx_sigma 0.1 \
     --output_scale 1 \
     --run_eval \
     --learning_rate 0.001 \
     --early_stopping_patience 10 \
-    --max_samples 10 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
 # Get the process ID
