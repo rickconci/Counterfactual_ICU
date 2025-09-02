@@ -319,6 +319,24 @@ class NODE(LightningModule):
             ),
         )
 
+    def _initialize_ode_network(self):
+        """Initialize ODEnet to output reasonable derivative magnitudes"""
+        with torch.no_grad():
+            # Find the final layer
+            final_layer = None
+            for module in self.ODEnet.modules():
+                if isinstance(module, nn.Linear):
+                    final_layer = module  # Last linear layer found
+
+            if final_layer is not None:
+                # Initialize to output derivatives in range [-0.1, 0.1] before scaling
+                final_layer.weight.data.uniform_(-0.1, 0.1)
+                final_layer.bias.data.uniform_(-0.05, 0.05)
+                print(f"[DEBUG] Initialized final layer with range [-0.1, 0.1]")
+
+    # Call this in __init__ after creating ODEnet:
+    self._initialize_ode_network()
+
     def transform_sigmoid_to_physiological_ranges(self, sigmoid_values):
         # TODO check this again in encoder setting
         """Simplified version using pre-computed ranges"""

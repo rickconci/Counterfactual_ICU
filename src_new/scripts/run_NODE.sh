@@ -36,7 +36,7 @@ nohup python ../models/NODE_main.py \
     --output_scale 3 \
     --debug \
     --run_eval \
-    --learning_rate 0.0005 \
+    --learning_rate 0.01 \
     --early_stopping_patience 10 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
