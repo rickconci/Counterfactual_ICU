@@ -2,6 +2,8 @@ import argparse
 import os
 import random
 import tempfile
+import sys
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -34,6 +36,7 @@ def str2bool(v):
         return False
     raise argparse.ArgumentTypeError("Boolean value expected (true/false)")
 
+
 def set_seed(seed):
     seed_everything(seed, workers=True)
     random.seed(seed)
@@ -52,6 +55,22 @@ def main(args):
     DEBUG = args.debug
     if DEBUG:
         print(f"[DEBUG] main_beta.py: Starting main function with args: {args}")
+
+    # Redirect stdout/stderr to file if requested
+    if getattr(args, "redirect_output", False):
+        try:
+            base_dir = args.train_dir if args.train_dir else os.path.join(os.getcwd(), "../../results")
+            os.makedirs(base_dir, exist_ok=True)
+            log_path = args.log_file if getattr(args, "log_file", "") else os.path.join(
+                base_dir, f"train_{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+            )
+            log_fh = open(log_path, "a", buffering=1)
+            sys.stdout = log_fh
+            sys.stderr = log_fh
+            print(f"[LOG] Redirected stdout/stderr to: {log_path}")
+        except Exception as e:
+            # If redirection fails, continue without crashing
+            print(f"[WARN] Failed to redirect output to file: {e}")
 
     print("CUDA GPUs present?", torch.cuda.is_available())
     if args.HPC_work:
@@ -198,12 +217,20 @@ def main(args):
 
     if DEBUG:
         print("[DEBUG] main_beta.py: Initializing Hybrid_VAE_SDE model.")
-    # Determine final train_dir
-    train_dir_final = (
-        args.train_dir
-        if getattr(args, "train_dir", None)
-        else os.path.join(saving_dir, unique_dir_name)
-    )
+    # Determine final train_dir; if not provided, compose from variable params
+    if getattr(args, "train_dir", None):
+        train_dir_final = args.train_dir
+    else:
+        # Compose name from key variable params with safe formatting
+        enc_tag = f"enc-{args.use_encoder}"
+        sdew_tag = f"sdew-{args.SDE_control_weighting}"
+        lr_tag = f"lr-{args.learning_rate}"
+        sigma_tag = f"sigma-{args.prior_tx_sigma}"
+        ns_tag = f"ns-{args.num_samples}"
+        seed_tag = f"seed-{args.seed}"
+        auto_name = "_".join([enc_tag, sdew_tag, lr_tag, sigma_tag, ns_tag, seed_tag])
+        train_dir_final = os.path.join(saving_dir, "experiments", auto_name)
+    os.makedirs(train_dir_final, exist_ok=True)
     model = Hybrid_SDE(
         use_encoder=args.use_encoder,
         start_dec_at_treatment=args.start_dec_at_treatment,
@@ -242,6 +269,7 @@ def main(args):
         use_control_tv_loss=args.use_control_tv_loss,
         control_tv_weight=args.control_tv_weight,
         override_control_scales=args.override_control_scales,
+        control_energy_weight=args.control_energy_weight,
         # SDE model params
         SDE_input_state=args.SDE_input_state,
         include_time=args.include_time,
@@ -325,7 +353,7 @@ def main(args):
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
         logger=wandb_logger,
-        log_every_n_steps=6,
+        log_every_n_steps=args.log_every_n_steps,
         callbacks=callbacks,
         gradient_clip_val=1,  # Start with 1.0, adjust if needed
         gradient_clip_algorithm="norm",
@@ -366,7 +394,12 @@ if __name__ == "__main__":
     )
     # Logging specific args
     parser.add_argument(
-        "--HPC_work", type=str2bool, nargs="?", const=True, default=False, help="Where to save if HPC"
+        "--HPC_work",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Where to save if HPC",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for initialization"
@@ -374,7 +407,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--project_name",
         type=str,
-        default="sdehybrid_partial_hard",
+        default="sdehybrid_rc",
         help="Wandb project name",
     )
     parser.add_argument(
@@ -386,14 +419,19 @@ if __name__ == "__main__":
         help="Whether to log to Weights & Biases",
     )
     parser.add_argument(
-        "--early_stopping", type=str2bool, nargs="?", const=True, default=False, help="Enable early stopping"
+        "--early_stopping",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Enable early stopping",
     )
     parser.add_argument(
         "--model_checkpoint",
         type=str2bool,
         nargs="?",
         const=True,
-        default=False,
+        default=True,
         help="Enable model checkpointing",
     )
     parser.add_argument(
@@ -423,13 +461,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--static_hidden_dim",
         type=int,
-        default=16,
+        default=32,
         help="Hidden dimension for the static encoder MLP.",
     )
     parser.add_argument(
         "--fusion_hidden_dim",
         type=int,
-        default=32,
+        default=64,
         help="Hidden dimension for the fusion MLP.",
     )
     parser.add_argument(
@@ -494,7 +532,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--SDEnet_hidden_dim", type=int, default=300, help="Hidden dim for SDE NN  "
+        "--SDEnet_hidden_dim", type=int, default=256, help="Hidden dim for SDE NN  "
     )
     parser.add_argument(
         "--SDEnet_depth", type=int, default=6, help="Num layeres for SDE NN  "
@@ -519,7 +557,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--integration_step_size",
         type=float,
-        default= 10.0,
+        default=2.0,
         help="Parameter dt for SDE integration",
     )
     parser.add_argument(
@@ -625,6 +663,12 @@ if __name__ == "__main__":
         default="",
         help="Comma-separated per-head control scales to override defaults (e.g., '0.1,0.02,0.01,0.01')",
     )
+    parser.add_argument(
+        "--control_energy_weight",
+        type=float,
+        default=1e-4,
+        help="Weight for control energy regularizer added to total loss",
+    )
 
     parser.add_argument(
         "--force_no_controls",
@@ -701,7 +745,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_scale",
         type=float,
-        default=3,
+        default=2,
         help="Standard Deviation when computing GaussianNegLL between Y_true and Y_hat",
     )
     parser.add_argument(
@@ -727,9 +771,11 @@ if __name__ == "__main__":
         default=0.0005,
         help="Learning rate for the optimizer",
     )
-    parser.add_argument("--batch_size", type=int, default=2, help="Training batch size")
+    parser.add_argument("--batch_size", 
+        type=int, default=32,
+        help="Training batch size")
     parser.add_argument(
-        "--max_epochs", type=int, default=100, help="Maximum number of epochs to train"
+        "--max_epochs", type=int, default=50, help="Maximum number of epochs to train"
     )
     parser.add_argument(
         "--accelerator",
@@ -739,15 +785,45 @@ if __name__ == "__main__":
         help="Which accelerator to use",
     )
     parser.add_argument(
+        "--precision",
+        type=str,
+        default="16-mixed",
+        choices=["32-true", "16-mixed", "bf16-mixed", "64-true"],
+        help="Lightning precision (use 16-mixed or bf16-mixed for speed)",
+    )
+    parser.add_argument(
+        "--log_every_n_steps",
+        type=int,
+        default=1,
+        help="Lightning logging frequency in steps",
+    )
+    parser.add_argument(
+        "--redirect_output",
+        action="store_true",
+        help="Redirect stdout/stderr to a log file instead of terminal",
+    )
+    parser.add_argument(
+        "--log_file",
+        type=str,
+        default="",
+        help="Optional explicit path to log file (default: train_<timestamp>.log under --train_dir if set)",
+    )
+    
+    parser.add_argument(
         "--max_samples",
         type=str,
-        default=2,
+        default=None,
         help="Max dataset length (None for production)",
     )
     parser.add_argument(
         "--run_eval", action="store_true", help="Run evaluation after training"
     )
-    parser.add_argument("--early_stopping_patience", type=int, default=20)
+    parser.add_argument(
+        "--early_stopping_patience", 
+        type=int, 
+        default=10,
+        help="Early stopping patience"
+    )
     parser.add_argument(
         "--test_zenker",
         type=bool,
