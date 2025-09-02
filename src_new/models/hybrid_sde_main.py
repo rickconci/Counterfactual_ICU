@@ -355,7 +355,7 @@ def main(args):
         logger=wandb_logger,
         log_every_n_steps=args.log_every_n_steps,
         callbacks=callbacks,
-        gradient_clip_val=1,  # Start with 1.0, adjust if needed
+        gradient_clip_val=2.0,  # Increased to 2.0 for extra stability
         gradient_clip_algorithm="norm",
         overfit_batches=args.overfit_batches,
         num_sanity_val_steps=0 if args.disable_sanity_check else 2,
@@ -532,7 +532,9 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--SDEnet_hidden_dim", type=int, default=256, help="Hidden dim for SDE NN  "
+        "--SDEnet_hidden_dim", 
+        type=int, default=512, 
+        help="Hidden dim for SDE NN  "
     )
     parser.add_argument(
         "--SDEnet_depth", type=int, default=6, help="Num layeres for SDE NN  "
@@ -774,8 +776,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", 
         type=int, default=32,
         help="Training batch size")
+    
     parser.add_argument(
-        "--max_epochs", type=int, default=50, help="Maximum number of epochs to train"
+        "--max_epochs", type=int, default=15, help="Maximum number of epochs to train"
     )
     parser.add_argument(
         "--accelerator",

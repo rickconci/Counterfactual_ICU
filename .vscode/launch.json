@@ -1,14 +1,57 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: Python File",
-            "type": "debugpy",
+            "name": "Debug Hybrid SDE",
+            "type": "python",
             "request": "launch",
-            "program": "${file}"
+            "program": "${workspaceFolder}/src_new/models/hybrid_sde_main.py",
+            "python": "/n/holylfs06/LABS/mzitnik_lab/Lab/rconci/micromamba/envs/cf_icu2/bin/python",
+            "args": [
+                "--dataset_type",
+                "mimic",
+                "--log_every_n_steps",
+                "4",
+                "--use_encoder",
+                "none",
+                "--SDE_control_weighting",
+                "1",
+                "--learning_rate",
+                "5e-5",
+                "--prior_tx_sigma",
+                "0.00001",
+                "--num_samples",
+                "3",
+                "--seed",
+                "42",
+                "--batch_size",
+                "32",
+                "--plot_outputs_train",
+                "--plot_every",
+                "10",
+                "--log_wandb",
+                "True",
+                "--output_scale",
+                "2",
+                "--integration_step_size",
+                "2",
+                "--integration_adaptive",
+                "False",
+                "--control_energy_weight",
+                "0.000001",
+                "--SDEnet_hidden_dim",
+                "512",
+                "--controller_type",
+                "mlp",
+                "--devices",
+                "1",
+                "--debug"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            }
         }
     ]
 }
