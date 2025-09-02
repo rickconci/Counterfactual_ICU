@@ -189,7 +189,7 @@ class NODE(LightningModule):
         net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         if self.use_encoder != "none":
-            self.ic_consistency_weight = 10
+            self.ic_consistency_weight = 0.1
             # each medication has rate and last administration info
             net_input_dims = net_input_dims + n_medications * 2
         else:

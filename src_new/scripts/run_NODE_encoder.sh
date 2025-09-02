@@ -35,7 +35,7 @@ nohup python ../models/NODE_main.py \
     --HPC_work True \
     --output_scale 3 \
     --run_eval \
-    --learning_rate 0.001 \
+    --learning_rate 0.0005 \
     --early_stopping_patience 10 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 

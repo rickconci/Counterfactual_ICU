@@ -35,7 +35,7 @@ nohup python ../models/NSDE_main.py \
     --output_scale 3 \
     --run_eval \
     --log_wandb True \
-    --learning_rate 0.0005 \
+    --learning_rate 0.001 \
     --early_stopping_patience 10 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
