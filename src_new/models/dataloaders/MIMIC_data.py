@@ -224,12 +224,12 @@ class MIMICDataset(Dataset):
                 med_traj_time_sec,
                 med_traj_time_hr,
                 _n_intervals,
-                med_context,
+                med_tensors,
             ) = loaded
         else:
             med_traj_values, med_traj_mask, med_traj_time_sec, med_traj_time_hr, _ = loaded
             # Create a placeholder med_context (zeros) if not present
-            med_context = torch.zeros(
+            med_tensors = torch.zeros(
                 med_traj_values.shape[0], med_traj_values.shape[1] * 2
             )
 
@@ -260,7 +260,7 @@ class MIMICDataset(Dataset):
             "med_mask": med_traj_mask,  # [T_fwd, M]
             "med_time": med_traj_time_sec,  # [T_fwd]
             # Precomputed med context per time [T_fwd, 2*M]
-            "med_tensors": med_context,
+            "med_tensors": med_tensors,
         }
 
 

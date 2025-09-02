@@ -13,6 +13,7 @@ DEBUG = False
 
 from dataloaders.MIMIC_data import MIMICDataModule
 from hybrid_sde_model import Hybrid_SDE
+from synthetic_data import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
 from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
@@ -240,7 +241,8 @@ def main(args):
         encoder_hidden_dim=args.encoder_hidden_dim,
         expert_latent_dims=14,  # Fixed by the ODE model
         encoder_SDENN_dims=0 if args.use_encoder == "none" else args.encoder_SDENN_dims,
-        n_medications=22,
+        n_medications=21,
+        med_embed_dim=args.med_embed_dim,
         encoder_context_len=data_module.context_max_len,
         use_2_5std_encoder_minmax=args.use_2_5std_encoder_minmax,
         encoder_num_layers=args.encoder_num_layers,
@@ -742,7 +744,16 @@ if __name__ == "__main__":
         help="Whether to normalise data when handing it to the SDE NN or just scale it )",
     )
     parser.add_argument(
-        "--SDEnet_out_dims", type=int, default=4, help="Num output dims for SDE NN  "
+        "--SDEnet_out_dims", 
+        type=int, 
+        default=4, 
+        help="Num output dims for SDE NN  "
+    )
+    parser.add_argument(
+        "--med_embed_dim", 
+        type=int, 
+        default=64, 
+        help="Num output dims for med embedding"
     )
     parser.add_argument(
         "--output_scale",

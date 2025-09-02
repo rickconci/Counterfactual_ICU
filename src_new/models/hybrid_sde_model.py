@@ -14,9 +14,14 @@ from torch import distributions, nn
 from torch.special import erf
 from ZenkerModel import ZenkerODE
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
-from train_utils import zenker_derivatives
-from utils_beta import (
+# Add the project root and utils directory to Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+utils_path = os.path.join(project_root, "src_new", "utils")
+sys.path.insert(0, project_root)
+sys.path.insert(0, utils_path)
+
+from src_new.utils.train_utils import zenker_derivatives
+from src_new.utils.utils_beta import (
     CV_params,
     CV_params_divisors,
     LinearScheduler,
@@ -99,6 +104,76 @@ def activate_auto_debug_mode(model_instance, location: str, tensor_name: str, te
             print(f"Could not log parameter stats: {e}")
         
         print("="*80 + "\n")
+        
+        # Set breakpoint for debugging
+        import pdb; pdb.set_trace()
+
+
+def check_for_nan_inf(tensor, name: str, location: str, model_instance=None, raise_error: bool = True):
+    """
+    Comprehensive NaN/Inf detection with detailed logging.
+    
+    Args:
+        tensor: Tensor to check
+        name: Name of the tensor for logging
+        location: Location where the check is performed
+        model_instance: Model instance for context
+        raise_error: Whether to raise an error on NaN/Inf detection
+    """
+    if tensor is None:
+        return False
+        
+    has_nan = torch.isnan(tensor).any()
+    has_inf = torch.isinf(tensor).any()
+    
+    if has_nan or has_inf:
+        print(f"\n🚨 NaN/Inf detected in {name} at {location}")
+        print(f"  Shape: {tensor.shape}")
+        print(f"  Dtype: {tensor.dtype}")
+        print(f"  Device: {tensor.device}")
+        print(f"  NaN count: {torch.isnan(tensor).sum().item()}")
+        print(f"  Inf count: {torch.isinf(tensor).sum().item()}")
+        
+        if has_nan:
+            nan_indices = torch.isnan(tensor).nonzero()
+            print(f"  NaN indices (first 10): {nan_indices[:10]}")
+            
+        if has_inf:
+            inf_indices = torch.isinf(tensor).nonzero()
+            print(f"  Inf indices (first 10): {inf_indices[:10]}")
+            
+        if model_instance is not None:
+            activate_auto_debug_mode(model_instance, location, name, tensor)
+            
+        if raise_error:
+            raise RuntimeError(f"NaN/Inf detected in {name} at {location}")
+            
+    return has_nan or has_inf
+
+
+def fail_on_nan_inf(param, name: str, location: str, model_instance=None):
+    """
+    Fail fast on NaN/Inf values with comprehensive debugging.
+    
+    Args:
+        param: Parameter tensor to check
+        name: Name of the parameter
+        location: Location where check occurs
+        model_instance: Model instance for context
+    """
+    if param is None:
+        return
+        
+    has_nan = torch.isnan(param).any()
+    has_inf = torch.isinf(param).any()
+    
+    if has_nan or has_inf:
+        print(f"[ERROR] NaN/Inf weights in {name}! FAILING FAST - NO SANITIZATION!")
+        
+        if model_instance is not None:
+            activate_auto_debug_mode(model_instance, location, name, param)
+            
+        raise RuntimeError(f"NaN/Inf detected in {name} at {location}. Failing fast for debugging.")
 
 
 class Hybrid_SDE(LightningModule):
@@ -118,6 +193,7 @@ class Hybrid_SDE(LightningModule):
         encoder_reverse_time,
         use_2_5std_encoder_minmax,
         n_medications,
+        med_embed_dim,
         encoder_context_len,
         # New static fusion params
         static_input_dim,
@@ -352,14 +428,20 @@ class Hybrid_SDE(LightningModule):
         )
         net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
+        # Medication embedding config (project variable med context dims -> fixed size)
+        self.n_medications = int(n_medications)
+        self.med_embed_dim = med_embed_dim
+        # Use LazyLinear to infer input dim on first forward while keeping params registered
+        self.med_proj = nn.LazyLinear(self.med_embed_dim)
+
         if self.use_encoder != "none":
             self.ic_consistency_weight = 0.1
-            # each medication has rate and last administration info
-            net_input_dims = net_input_dims + n_medications * 2
+            # add fixed med embedding dims
+            net_input_dims = net_input_dims + self.med_embed_dim
         else:
             self.ic_consistency_weight = 0
-            # each medication has rate and last administration info
-            net_input_dims = self.expert_latent_dims + n_medications * 2
+            # expert latents + fixed med embedding dims
+            net_input_dims = self.expert_latent_dims + self.med_embed_dim
             net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         # Append physics-derived feature count (ΔP, r_tpr, f_hr, F, dpa_base, dpv_base, sigma, s_dot)
@@ -580,10 +662,9 @@ class Hybrid_SDE(LightningModule):
 
         # Optional GAT controller (AB test)
         node_feat_dim = 1 + self.physics_feat_dims + (2 if self.include_time else 0)
-        self.n_medications = int(n_medications)
         if self.n_medications > 0:
-            self.med_proj = nn.Linear(self.n_medications * 2, 8)
-            node_feat_dim += 8
+            # med embedding appended per node
+            node_feat_dim += self.med_embed_dim
         else:
             self.med_proj = None
 
@@ -708,104 +789,6 @@ class Hybrid_SDE(LightningModule):
             )
         return z1, z1_logvar, logqp0
 
-    def get_medication_context(self, t, expanded_batch_size):
-        """Medication context at time t, using precomputed per-time tensors when available."""
-        batch_size, _, n_meds = self.current_med_values.shape
-
-        # Fast path: precomputed per-time context
-        if hasattr(self, "med_context_by_time") and hasattr(self, "_dt_grid"):
-            t_tensor = (
-                t
-                if torch.is_tensor(t)
-                else torch.tensor(t, dtype=self._t0.dtype, device=self._t0.device)
-            )
-            idx = torch.round((t_tensor - self._t0) / self._dt_grid).to(torch.long)
-            idx = torch.clamp(idx, 0, self._time_len - 1)
-            ctx_bt = self.med_context_by_time[:, idx, :]  # [B, 2*M]
-            samples_per_batch = expanded_batch_size // batch_size
-            return ctx_bt.repeat_interleave(samples_per_batch, dim=0)
-
-        # Fallback: on-the-fly computation (slower)
-        time_steps = self.current_med_values.shape[1]
-        t_tensor = (
-            t
-            if torch.is_tensor(t)
-            else torch.tensor(
-                t,
-                dtype=self.current_med_time.dtype,
-                device=self.current_med_time.device,
-            )
-        )
-        time_valid = self.current_med_time <= t_tensor  # (batch, time)
-        med_present = self.current_med_mask > 0  # (batch, time, meds)
-        valid_mask = time_valid.unsqueeze(-1) & med_present  # (batch, time, meds)
-
-        time_indices = torch.arange(time_steps, device=self.device).float()
-        time_indices = time_indices.view(1, time_steps, 1).expand(
-            batch_size, -1, n_meds
-        )
-        masked_indices = torch.where(
-            valid_mask, time_indices, torch.full_like(time_indices, -1e6)
-        )
-        last_valid_indices = masked_indices.argmax(dim=1)
-        has_valid_data = masked_indices.max(dim=1)[0] > -1e5
-        batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(1)
-        med_idx = torch.arange(n_meds, device=self.device).unsqueeze(0)
-        last_rates = self.current_med_values[batch_idx, last_valid_indices, med_idx]
-        last_times = self.current_med_time[batch_idx, last_valid_indices]
-        time_since = t_tensor - last_times
-        recency_weights = torch.clamp(time_since / 1200 - 1 / 1200, min=0)
-        last_rates = torch.where(
-            has_valid_data, last_rates, torch.zeros_like(last_rates)
-        )
-        recency_weights = torch.where(
-            has_valid_data, recency_weights, torch.ones_like(recency_weights)
-        )
-        result = torch.stack([last_rates, recency_weights], dim=-1).flatten(start_dim=1)
-        samples_per_batch = expanded_batch_size // batch_size
-        return result.repeat_interleave(samples_per_batch, dim=0)
-
-    def _precompute_med_context(self, ts: torch.Tensor) -> None:
-        """Precompute medication context [rate, recency] for each time step.
-
-        Creates `self.med_context_by_time` with shape [B, T, 2*M] and stores
-        time grid params `_t0`, `_dt_grid`, `_time_len` for fast indexing.
-        """
-        B, T, M = self.current_med_values.shape
-        device = self.current_med_values.device
-        dtype = self.current_med_values.dtype
-
-        ts_dev = ts.to(device=device, dtype=dtype)
-        self._t0 = ts_dev[0]
-        self._time_len = int(ts_dev.shape[0])
-        self._dt_grid = (
-            (ts_dev[1] - ts_dev[0]).clamp_min(1e-6)
-            if T > 1
-            else torch.tensor(1.0, device=device, dtype=dtype)
-        )
-
-        valid = self.current_med_mask > 0  # [B,T,M]
-        idxs = torch.arange(T, device=device).view(1, T, 1).expand(B, T, M)
-        valid_idxs = torch.where(valid, idxs + 1, torch.zeros_like(idxs))  # +1 sentinel
-        last_idx_plus1 = torch.cummax(valid_idxs, dim=1).values  # [B,T,M]
-        has_valid = last_idx_plus1 > 0
-        last_idx = torch.clamp(last_idx_plus1 - 1, min=0).to(torch.long)
-
-        last_rates = torch.gather(
-            self.current_med_values, dim=1, index=last_idx
-        )  # [B,T,M]
-        time_bt = self.current_med_time.unsqueeze(-1).expand(B, T, M)
-        last_times = torch.gather(time_bt, dim=1, index=last_idx)  # [B,T,M]
-
-        t_grid = ts_dev.view(1, T, 1).expand(B, T, M)
-        time_since = t_grid - last_times
-        recency = torch.clamp(time_since / 1200.0 - 1.0 / 1200.0, min=0.0)
-
-        last_rates = torch.where(has_valid, last_rates, torch.zeros_like(last_rates))
-        recency = torch.where(has_valid, recency, torch.ones_like(recency))
-
-        ctx = torch.stack([last_rates, recency], dim=-1)  # [B,T,M,2]
-        self.med_context_by_time = ctx.view(B, T, 2 * M).contiguous()
 
     def apply_SDE_fun(self, t, y):
         """
@@ -831,6 +814,10 @@ class Hybrid_SDE(LightningModule):
         """
 
         batch_size = y.shape[0]
+        
+        # Check for NaN/Inf in input
+        check_for_nan_inf(y, "SDE_input_y", "apply_SDE_fun", self, raise_error=True)
+        check_for_nan_inf(t, "SDE_input_t", "apply_SDE_fun", self, raise_error=True)
 
         if self.debug:
             t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
@@ -959,41 +946,35 @@ class Hybrid_SDE(LightningModule):
                 )
 
         # Medication context (used by either controller)
-        if (
-            hasattr(self, "current_med_context")
-            and self.current_med_context is not None
-        ):
-            # Index precomputed med context by time step
-            if not hasattr(self, "_t0"):
-                self._t0 = torch.tensor(0.0, device=self.device)
-            if not hasattr(self, "_dt_grid"):
-                self._dt_grid = torch.tensor(
-                    float(self.integration_step_size), device=self.device
-                )
-            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
-                torch.long
-            )
-            t_idx = torch.clamp(t_idx, 0, self.current_med_context.shape[1] - 1)
-            med_context = self.current_med_context[:, t_idx, :]
-            # expand over samples if needed
-            samples_per_batch = batch_size // med_context.shape[0]
-            med_context = med_context.repeat_interleave(samples_per_batch, dim=0)
-        else:
-            med_context = self.get_medication_context(
-                t, batch_size
-            )  # (batch, 2*n_meds)
-        if torch.isnan(med_context).any() or torch.isinf(med_context).any():
-            activate_auto_debug_mode(self, "apply_SDE_fun", "med_context", med_context)
-            raise RuntimeError("Non-finite values in med_context. Auto-debug mode activated.")
-        if self.normalise_for_SDENN and med_context.numel() > 0:
-            mc_mean = med_context.mean(dim=0, keepdim=True)
-            mc_std = med_context.std(dim=0, keepdim=True).clamp_min(1e-6)
-            med_context = (med_context - mc_mean) / mc_std
 
+        # Index precomputed med context by time step
+        if not hasattr(self, "_t0"):
+            self._t0 = torch.tensor(0.0, device=self.device)
+        if not hasattr(self, "_dt_grid"):
+            self._dt_grid = torch.tensor(
+                float(self.integration_step_size), device=self.device
+            )
+        t_idx = torch.floor_divide((t.to(self._t0) - self._t0), 10).to(
+            torch.long
+        )
+        t_idx = torch.clamp(t_idx, 0, self.current_med_tensors.shape[1] - 1)
+
+    
+        med_tensor = self.current_med_tensors[:, t_idx, :]
+        # expand over samples if needed
+        samples_per_batch = batch_size // med_tensor.shape[0]
+        med_tensor = med_tensor.repeat_interleave(samples_per_batch, dim=0)
+        # Project to fixed-size med embedding (LazyLinear infers input dim on first call)
+        med_embed = torch.tanh(self.med_proj(med_tensor))  # [B, med_embed_dim]
+       
+        if torch.isnan(med_tensor).any() or torch.isinf(med_tensor).any():
+            activate_auto_debug_mode(self, "apply_SDE_fun", "med_context", med_tensor)
+            raise RuntimeError("Non-finite values in med_context. Auto-debug mode activated.")
+        
         if self.debug:
             try:
                 print(
-                    f"  [DBG] med_context: mean={med_context.mean().item():.4e} std={med_context.std().item():.4e} min={med_context.min().item():.4e} max={med_context.max().item():.4e}"
+                    f"  [DBG] med_tensor:{med_tensor.shape} {med_tensor[0,:]}"
                 )
             except Exception:
                 pass
@@ -1016,11 +997,7 @@ class Hybrid_SDE(LightningModule):
                 time_b = time_feats.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)
                 parts.append(time_b)
             # Optional medication embedding shared across nodes
-            if (
-                getattr(self, "med_proj", None) is not None
-                and med_context.shape[1] == self.n_medications * 2
-            ):
-                med_embed = torch.tanh(self.med_proj(med_context))  # [B,8]
+            if getattr(self, "med_proj", None) is not None:
                 med_b = med_embed.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)
                 parts.append(med_b)
             node_features = torch.cat(parts, dim=-1)  # [B,14,F]
@@ -1052,9 +1029,10 @@ class Hybrid_SDE(LightningModule):
                 scaled_output = (
                     u_raw * self.control_scales.to(u_raw.device)
                 ) * self.SDE_control_weighting
-            scaled_output = torch.nan_to_num(
-                scaled_output, nan=0.0, posinf=0.0, neginf=0.0
-            )
+            # Check for NaN/Inf in scaled output - FAIL FAST, NO SANITIZATION
+            check_for_nan_inf(scaled_output, "GAT_scaled_output", "apply_SDE_fun", self, raise_error=True)
+            
+            # Only clamp extreme values, but don't sanitize NaN/Inf
             scaled_output = torch.clamp(scaled_output, -5.0, 5.0)
 
             if self.debug:
@@ -1104,12 +1082,16 @@ class Hybrid_SDE(LightningModule):
                 activate_auto_debug_mode(self, "apply_SDE_fun (MLP path)", f"SDEnet parameter '{name}'", param.data)
                 raise RuntimeError(f"Detected non-finite values in SDEnet parameter '{name}'. Auto-debug mode activated.")
 
-        SDE_NN_input = torch.cat([SDE_NN_input, med_context], dim=-1)
+        # Append compact med embedding rather than raw med tensor to keep dims stable
+        SDE_NN_input = torch.cat([SDE_NN_input, med_embed], dim=-1)
 
         if self.debug:
             try:
                 print(
                     f"  [DBG] SDE_NN_input: shape={tuple(SDE_NN_input.shape)} mean={SDE_NN_input.mean().item():.4e} std={SDE_NN_input.std().item():.4e} min={SDE_NN_input.min().item():.4e} max={SDE_NN_input.max().item():.4e}"
+                )
+                print(
+                    f"  [DBG] SDE_NN_input[0, :]:{SDE_NN_input[0, :]}"
                 )
             except Exception:
                 pass
@@ -1146,10 +1128,9 @@ class Hybrid_SDE(LightningModule):
         # print(self.SDE_input_state)
         # breakpoint()
         # print('SDE_NN_output_latents example', SDE_NN_output_latents[0, :])
-        has_nonzero = SDE_NN_output_latents.ne(0.0).any()
-        # print('SDE_NN Has non-0 OUTPUT??', has_nonzero)
+        
         if self.debug:
-            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
+            t_idx = torch.floor_divide((t.to(self._t0) - self._t0), 10).to(
                 torch.long
             )
             if (t_idx.remainder(10) == 0).item():
@@ -1175,7 +1156,7 @@ class Hybrid_SDE(LightningModule):
             try:
                 scaled_output[:, self.disabled_control_indices] = 0.0
                 if self.debug:
-                    t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
+                    t_idx = torch.floor_divide((t.to(self._t0) - self._t0), 10).to(
                         torch.long
                     )
                     if (t_idx.remainder(10) == 0).item():
@@ -1188,6 +1169,9 @@ class Hybrid_SDE(LightningModule):
                         f"[WARN] Failed to zero controls {self.disabled_control_indices}: {e}"
                     )
 
+        # Final check for NaN/Inf in output - FAIL FAST, NO SANITIZATION
+        check_for_nan_inf(scaled_output, "apply_SDE_fun_output", "apply_SDE_fun", self, raise_error=True)
+        
         return scaled_output
 
     def normalise_sde_inputs(self, expert_vars):
@@ -1232,6 +1216,10 @@ class Hybrid_SDE(LightningModule):
         return normalized_expert_vars
 
     def f(self, t, y, Tx, time_to_treatment):  # Approximate posterior drift.
+        # Check for NaN/Inf in inputs - FAIL FAST, NO SANITIZATION
+        check_for_nan_inf(y, "f_input_y", "f_drift", self, raise_error=True)
+        check_for_nan_inf(t, "f_input_t", "f_drift", self, raise_error=True)
+        
         if self.debug and t.item() % 10 == 0:
             pass
 
@@ -1462,6 +1450,9 @@ class Hybrid_SDE(LightningModule):
                     f"[DEBUG] Hybrid_SDE f_aug: t_idx={int(t_idx)}, f_out_shape={f_out.shape}"
                 )
 
+        # Check for NaN/Inf in output - FAIL FAST, NO SANITIZATION
+        check_for_nan_inf(f_out, "f_output", "f_drift", self, raise_error=True)
+        
         return f_out
 
     # 4. Fixed h method:
@@ -1499,6 +1490,10 @@ class Hybrid_SDE(LightningModule):
 
     # 5. Fixed g method:
     def g(self, t, y):
+        # Check for NaN/Inf in inputs - FAIL FAST, NO SANITIZATION
+        check_for_nan_inf(y, "g_input_y", "g_diffusion", self, raise_error=True)
+        check_for_nan_inf(t, "g_input_t", "g_diffusion", self, raise_error=True)
+        
         if self.debug:
             t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
                 torch.long
@@ -1522,7 +1517,12 @@ class Hybrid_SDE(LightningModule):
             sigma_val = self.sigma.item()
 
         # Return as a tensor with shape [batch_size, 1]
-        return torch.full((batch_size, 1), sigma_val, device=y.device)
+        g_out = torch.full((batch_size, 1), sigma_val, device=y.device)
+        
+        # Check for NaN/Inf in output - FAIL FAST, NO SANITIZATION
+        check_for_nan_inf(g_out, "g_output", "g_diffusion", self, raise_error=True)
+        
+        return g_out
 
     # 6. Fixed g_aug method:
     def g_aug(self, t, y):
@@ -2065,6 +2065,11 @@ class Hybrid_SDE(LightningModule):
                         raise RuntimeError(f"Non-finite gradient detected in parameter '{name}'. Auto-debug mode activated.")
                     total_norm_sq += float(g.norm(2).item() ** 2)
                     count += 1
+                    
+        # Additional check for parameter values after backward pass
+        for name, p in self.named_parameters():
+            if p is not None:
+                check_for_nan_inf(p.data, f"parameter '{name}'", "on_after_backward", self, raise_error=True)
 
     def on_before_optimizer_step(self, optimizer) -> None:
         # Always fail-fast if parameters contain non-finite values before stepping
@@ -2214,7 +2219,7 @@ class Hybrid_SDE(LightningModule):
                 med_trajectory_values,
                 med_trajectory_mask,
                 med_trajectory_time,
-                med_context,
+                med_tensors,
             ) = batch
         else:
             raise NotImplementedError(
@@ -2314,7 +2319,7 @@ class Hybrid_SDE(LightningModule):
         valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
 
         # Attach precomputed med_context for fast per-step indexing
-        self.current_med_context = med_context if med_context is not None else None
+        self.current_med_tensors = med_tensors if med_tensors is not None else None
 
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,

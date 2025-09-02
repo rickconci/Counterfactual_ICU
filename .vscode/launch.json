@@ -1,12 +1,14 @@
+// .vscode/launch.json
 {
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug Hybrid SDE",
-            "type": "python",
+            "name": "Hybrid SDE (abs path)",
+            "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/src_new/models/hybrid_sde_main.py",
-            "python": "/n/holylfs06/LABS/mzitnik_lab/Lab/rconci/micromamba/envs/cf_icu2/bin/python",
+            "program": "/n/holylfs06/LABS/mzitnik_lab/Lab/rconci/Counterfactual_ICU/src_new/models/hybrid_sde_main.py",
+            "cwd": "/n/holylfs06/LABS/mzitnik_lab/Lab/rconci/Counterfactual_ICU",
+            "console": "internalConsole",
             "args": [
                 "--dataset_type",
                 "mimic",
@@ -23,7 +25,7 @@
                 "--num_samples",
                 "3",
                 "--seed",
-                "42",
+                "64",
                 "--batch_size",
                 "32",
                 "--plot_outputs_train",
@@ -40,18 +42,16 @@
                 "--control_energy_weight",
                 "0.000001",
                 "--SDEnet_hidden_dim",
-                "512",
+                "768",
                 "--controller_type",
                 "mlp",
-                "--devices",
-                "1",
                 "--debug"
             ],
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
             "env": {
-                "CUDA_VISIBLE_DEVICES": "0"
-            }
+                "PYTHONPATH": "/n/holylfs06/LABS/mzitnik_lab/Lab/rconci/Counterfactual_ICU"
+            },
+            "justMyCode": false,
+            "subProcess": true
         }
     ]
 }
