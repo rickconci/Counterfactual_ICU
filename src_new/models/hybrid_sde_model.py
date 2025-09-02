@@ -30,6 +30,76 @@ from utils_beta import (
 # but instance-level self.debug passed from main_beta.py is the primary control.
 DEBUG = False
 
+# Global auto-debug mode that activates on first NaN/Inf detection
+AUTO_DEBUG_ACTIVATED = False
+
+
+def activate_auto_debug_mode(model_instance, location: str, tensor_name: str, tensor_value=None):
+    """Activate global debug mode and log comprehensive state information."""
+    global AUTO_DEBUG_ACTIVATED, DEBUG
+    
+    if not AUTO_DEBUG_ACTIVATED:
+        AUTO_DEBUG_ACTIVATED = True
+        DEBUG = True
+        model_instance.debug = True
+        
+        print("\n" + "="*80)
+        print("🚨 AUTO-DEBUG MODE ACTIVATED 🚨")
+        print("="*80)
+        print(f"Location: {location}")
+        print(f"Tensor: {tensor_name}")
+        print(f"Global step: {getattr(model_instance, 'global_step', 'unknown')}")
+        print(f"Current epoch: {getattr(model_instance, 'current_epoch', 'unknown')}")
+        print("="*80)
+        
+        # Log tensor statistics if provided
+        if tensor_value is not None:
+            try:
+                print(f"Tensor shape: {tensor_value.shape}")
+                print(f"Tensor dtype: {tensor_value.dtype}")
+                print(f"Tensor device: {tensor_value.device}")
+                print(f"NaN count: {torch.isnan(tensor_value).sum().item()}")
+                print(f"Inf count: {torch.isinf(tensor_value).sum().item()}")
+                print(f"Min value: {tensor_value.min().item()}")
+                print(f"Max value: {tensor_value.max().item()}")
+                print(f"Mean value: {tensor_value.mean().item()}")
+                print(f"Std value: {tensor_value.std().item()}")
+            except Exception as e:
+                print(f"Could not log tensor stats: {e}")
+        
+        # Log model state
+        try:
+            print("\nModel State:")
+            print(f"  use_encoder: {model_instance.use_encoder}")
+            print(f"  normalise_for_SDENN: {model_instance.normalise_for_SDENN}")
+            print(f"  controller_type: {model_instance.controller_type}")
+            print(f"  SDE_control_weighting: {model_instance.SDE_control_weighting}")
+            print(f"  learning_rate: {model_instance.learning_rate}")
+            print(f"  SDEnet_out_dims: {model_instance.SDEnet_out_dims}")
+            print(f"  expert_latent_dims: {model_instance.expert_latent_dims}")
+            print(f"  num_samples: {model_instance.num_samples}")
+            print(f"  integration_step_size: {model_instance.integration_step_size}")
+            print(f"  integration_method: {model_instance.integration_method}")
+        except Exception as e:
+            print(f"Could not log model state: {e}")
+        
+        # Log parameter statistics
+        try:
+            print("\nParameter Statistics:")
+            total_params = 0
+            for name, param in model_instance.named_parameters():
+                if param is not None:
+                    total_params += param.numel()
+                    if torch.isnan(param).any() or torch.isinf(param).any():
+                        print(f"  ❌ {name}: {param.shape} - CONTAINS NaN/Inf!")
+                    else:
+                        print(f"  ✅ {name}: {param.shape} - OK")
+            print(f"  Total parameters: {total_params:,}")
+        except Exception as e:
+            print(f"Could not log parameter stats: {e}")
+        
+        print("="*80 + "\n")
+
 
 class Hybrid_SDE(LightningModule):
     def __init__(
@@ -819,7 +889,8 @@ class Hybrid_SDE(LightningModule):
             [dP, r_tpr, fhr, F, dpa_base, dpv_base, sigma, s_dot], dim=-1
         )
         if torch.isnan(physics_feats).any() or torch.isinf(physics_feats).any():
-            raise RuntimeError("Non-finite values in physics_feats. Aborting for debugging.")
+            activate_auto_debug_mode(self, "apply_SDE_fun", "physics_feats", physics_feats)
+            raise RuntimeError("Non-finite values in physics_feats. Auto-debug mode activated.")
         # Normalize physics features if we normalize SDEnn inputs (zero-mean, unit-std across batch)
         if self.normalise_for_SDENN:
             pf_mean = physics_feats.mean(dim=0, keepdim=True)
@@ -912,7 +983,8 @@ class Hybrid_SDE(LightningModule):
                 t, batch_size
             )  # (batch, 2*n_meds)
         if torch.isnan(med_context).any() or torch.isinf(med_context).any():
-            raise RuntimeError("Non-finite values in med_context. Aborting for debugging.")
+            activate_auto_debug_mode(self, "apply_SDE_fun", "med_context", med_context)
+            raise RuntimeError("Non-finite values in med_context. Auto-debug mode activated.")
         if self.normalise_for_SDENN and med_context.numel() > 0:
             mc_mean = med_context.mean(dim=0, keepdim=True)
             mc_std = med_context.std(dim=0, keepdim=True).clamp_min(1e-6)
@@ -953,7 +1025,8 @@ class Hybrid_SDE(LightningModule):
                 parts.append(med_b)
             node_features = torch.cat(parts, dim=-1)  # [B,14,F]
             if torch.isnan(node_features).any() or torch.isinf(node_features).any():
-                raise RuntimeError("Non-finite values in GAT node_features. Aborting for debugging.")
+                activate_auto_debug_mode(self, "apply_SDE_fun (GAT path)", "node_features", node_features)
+                raise RuntimeError("Non-finite values in GAT node_features. Auto-debug mode activated.")
             # Additional stabilization for attention: clamp and layer-normalize features per node
             node_features = torch.clamp(node_features, -50.0, 150.0)
             try:
@@ -968,7 +1041,8 @@ class Hybrid_SDE(LightningModule):
                 if param is None:
                     continue
                 if torch.isnan(param).any() or torch.isinf(param).any():
-                    raise RuntimeError(f"Detected non-finite values in GAT parameter '{name}'. Aborting for debugging.")
+                    activate_auto_debug_mode(self, "apply_SDE_fun (GAT path)", f"GAT parameter '{name}'", param)
+                    raise RuntimeError(f"Detected non-finite values in GAT parameter '{name}'. Auto-debug mode activated.")
 
             u_raw = self.gat_controller(node_features)  # [B,4]
             if self.force_no_controls:
@@ -1018,15 +1092,17 @@ class Hybrid_SDE(LightningModule):
             inf_cnt = int(torch.isinf(SDE_NN_input).sum().item())
             bad_mask = torch.isnan(SDE_NN_input) | torch.isinf(SDE_NN_input)
             bad_rows = bad_mask.any(dim=1).nonzero(as_tuple=False).flatten()[:5]
+            activate_auto_debug_mode(self, "apply_SDE_fun (MLP path)", "SDE_NN_input", SDE_NN_input)
             raise RuntimeError(
-                f"SDE_NN_input contains non-finite values (NaN={nan_cnt}, Inf={inf_cnt}). Sample bad rows: {bad_rows.tolist()}"
+                f"SDE_NN_input contains non-finite values (NaN={nan_cnt}, Inf={inf_cnt}). Sample bad rows: {bad_rows.tolist()}. Auto-debug mode activated."
             )
 
         for name, param in self.SDEnet.named_parameters():
             if param is None or param.data is None:
                 continue
             if torch.isnan(param.data).any() or torch.isinf(param.data).any():
-                raise RuntimeError(f"Detected non-finite values in SDEnet parameter '{name}'. Aborting for debugging.")
+                activate_auto_debug_mode(self, "apply_SDE_fun (MLP path)", f"SDEnet parameter '{name}'", param.data)
+                raise RuntimeError(f"Detected non-finite values in SDEnet parameter '{name}'. Auto-debug mode activated.")
 
         SDE_NN_input = torch.cat([SDE_NN_input, med_context], dim=-1)
 
@@ -1055,7 +1131,8 @@ class Hybrid_SDE(LightningModule):
                 * self.control_scales.to(SDE_NN_output_latents.device)
             ) * self.SDE_control_weighting
         if torch.isnan(scaled_output).any() or torch.isinf(scaled_output).any():
-            raise RuntimeError("Non-finite values in scaled_output. Aborting for debugging.")
+            activate_auto_debug_mode(self, "apply_SDE_fun (MLP path)", "scaled_output", scaled_output)
+            raise RuntimeError("Non-finite values in scaled_output. Auto-debug mode activated.")
         scaled_output = torch.clamp(scaled_output, -5.0, 5.0)
 
         if torch.isnan(SDE_NN_output_latents).any() or torch.isinf(SDE_NN_output_latents).any():
@@ -1063,7 +1140,8 @@ class Hybrid_SDE(LightningModule):
                 torch.autograd.set_detect_anomaly(True)
             except Exception:
                 pass
-            raise RuntimeError("SDE_NN_output contains non-finite values. Aborting for debugging.")
+            activate_auto_debug_mode(self, "apply_SDE_fun (MLP path)", "SDE_NN_output_latents", SDE_NN_output_latents)
+            raise RuntimeError("SDE_NN_output contains non-finite values. Auto-debug mode activated.")
         # print(SDE_NN_output_latents)
         # print(self.SDE_input_state)
         # breakpoint()
@@ -1302,12 +1380,15 @@ class Hybrid_SDE(LightningModule):
 
         # Combine all with fail-fast non-finite checks
         if torch.isnan(dt_i_ext).any() or torch.isinf(dt_i_ext).any():
-            raise RuntimeError("Non-finite values in dt_i_ext. Aborting for debugging.")
+            activate_auto_debug_mode(self, "f()", "dt_i_ext", dt_i_ext)
+            raise RuntimeError("Non-finite values in dt_i_ext. Auto-debug mode activated.")
         dt_i_ext = dt_i_ext.clamp_(-10.0, 10.0)
         if torch.isnan(dt_expert).any() or torch.isinf(dt_expert).any():
-            raise RuntimeError("Non-finite values in dt_expert. Aborting for debugging.")
+            activate_auto_debug_mode(self, "f()", "dt_expert", dt_expert)
+            raise RuntimeError("Non-finite values in dt_expert. Auto-debug mode activated.")
         if torch.isnan(dt_neural_embedding).any() or torch.isinf(dt_neural_embedding).any():
-            raise RuntimeError("Non-finite values in dt_neural_embedding. Aborting for debugging.")
+            activate_auto_debug_mode(self, "f()", "dt_neural_embedding", dt_neural_embedding)
+            raise RuntimeError("Non-finite values in dt_neural_embedding. Auto-debug mode activated.")
         final_f_out = torch.cat([dt_i_ext, dt_expert, dt_neural_embedding], dim=-1)
 
         if self.debug:
@@ -1980,7 +2061,8 @@ class Hybrid_SDE(LightningModule):
                 if p.grad is not None:
                     g = p.grad.detach()
                     if torch.isnan(g).any() or torch.isinf(g).any():
-                        raise RuntimeError(f"Non-finite gradient detected in parameter '{name}'. Aborting for debugging.")
+                        activate_auto_debug_mode(self, "on_after_backward", f"gradient '{name}'", g)
+                        raise RuntimeError(f"Non-finite gradient detected in parameter '{name}'. Auto-debug mode activated.")
                     total_norm_sq += float(g.norm(2).item() ** 2)
                     count += 1
 
@@ -1991,7 +2073,8 @@ class Hybrid_SDE(LightningModule):
                 if p is None or p.data is None:
                     continue
                 if torch.isnan(p.data).any() or torch.isinf(p.data).any():
-                    raise RuntimeError(f"Non-finite parameter detected before optimizer step: '{name}'. Aborting for debugging.")
+                    activate_auto_debug_mode(self, "on_before_optimizer_step", f"parameter '{name}'", p.data)
+                    raise RuntimeError(f"Non-finite parameter detected before optimizer step: '{name}'. Auto-debug mode activated.")
 
     def compute_counterfactual_loss(self, true_fact, true_cf, pred_fact, pred_cf):
         if self.debug:
@@ -2107,8 +2190,9 @@ class Hybrid_SDE(LightningModule):
         if torch.isnan(z1_for_sde).any() or torch.isinf(z1_for_sde).any():
             nan_cnt = int(torch.isnan(z1_for_sde).sum().item())
             inf_cnt = int(torch.isinf(z1_for_sde).sum().item())
+            activate_auto_debug_mode(self, "_prepare_sde_initial_state", "z1_for_sde", z1_for_sde)
             raise RuntimeError(
-                f"Non-finite values in final z1_for_sde: NaN={nan_cnt}, Inf={inf_cnt}. Aborting for debugging."
+                f"Non-finite values in final z1_for_sde: NaN={nan_cnt}, Inf={inf_cnt}. Auto-debug mode activated."
             )
 
         return z1_for_sde
