@@ -721,7 +721,7 @@ class NSDE(LightningModule):
 
             y0 = zenker_state[:, :, :2]
 
-        y0_flattened = y0.reshape(-1, state_dim)  # [batch*samples, state_dim]
+        y0_flattened = y0.reshape(-1, 2)  # [batch*samples, state_dim]
 
         if self.debug:
             print(f"[DEBUG] NSDE forward_latent: y0_flattened shape = {y0_flattened.shape}")
@@ -740,7 +740,7 @@ class NSDE(LightningModule):
 
         # Reshape back: [time, batch*samples, state] -> [time, batch, samples, state] -> [batch, samples, time, state]
         time_steps = trajectory_flat.shape[0]
-        trajectory = trajectory_flat.view(time_steps, batch_size, num_samples, state_dim)
+        trajectory = trajectory_flat.view(time_steps, batch_size, num_samples, 2)
         trajectory = trajectory.permute(1, 2, 0, 3)  # [batch, samples, time, state]
 
         # Extract pressure trajectory (first 2 dimensions)

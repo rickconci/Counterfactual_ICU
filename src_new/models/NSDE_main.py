@@ -460,7 +460,7 @@ if __name__ == "__main__":
         help="Whether the control has a self reverting prior to it with a functional prior",
     )
     parser.add_argument(
-        "--encoder_ODENN_dims",
+        "--encoder_SDENN_dims",
         type=int,
         default=64,
         help="Encoder output used by SDENN",

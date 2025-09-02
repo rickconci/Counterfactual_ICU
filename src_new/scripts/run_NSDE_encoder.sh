@@ -22,7 +22,7 @@ mkdir -p ../../results/model_checkpoints
 echo "Starting training with nohup..."
 nohup python ../models/NSDE_main.py \
     --dataset_type mimic \
-    --use_encoder none \
+    --use_encoder raindrop \
     --num_samples 3 \
     --batch_size 32 \
     --seed 96 \
