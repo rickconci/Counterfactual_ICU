@@ -274,6 +274,12 @@ class Raindrop_v2(nn.Module):
         print(
             f"  Expected shape for transformer: [batch_size, seq_len] = [{batch_size}, {maxlen}]"
         )
+        # Extra runtime checks for mask consistency
+        if mask.shape != (batch_size, maxlen):
+            print(f"[MASK ERROR] Mask shape mismatch: got {mask.shape}, expected ({batch_size}, {maxlen})")
+        if mask.dtype != torch.bool:
+            print(f"[MASK ERROR] Mask dtype is {mask.dtype}, expected bool. Forcing conversion.")
+            mask = mask.bool()
         rd_debug_print(f"[Raindrop_v2] Mask shape: {mask.shape}")
         rd_debug_print(f"  mask snippet for batch 0: {mask[0, :10]}")
 

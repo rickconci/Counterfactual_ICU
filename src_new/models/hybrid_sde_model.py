@@ -818,7 +818,8 @@ class Hybrid_SDE(LightningModule):
         physics_feats = torch.cat(
             [dP, r_tpr, fhr, F, dpa_base, dpv_base, sigma, s_dot], dim=-1
         )
-        physics_feats = torch.nan_to_num(physics_feats, nan=0.0, posinf=0.0, neginf=0.0)
+        if torch.isnan(physics_feats).any() or torch.isinf(physics_feats).any():
+            raise RuntimeError("Non-finite values in physics_feats. Aborting for debugging.")
         # Normalize physics features if we normalize SDEnn inputs (zero-mean, unit-std across batch)
         if self.normalise_for_SDENN:
             pf_mean = physics_feats.mean(dim=0, keepdim=True)
@@ -910,7 +911,8 @@ class Hybrid_SDE(LightningModule):
             med_context = self.get_medication_context(
                 t, batch_size
             )  # (batch, 2*n_meds)
-        med_context = torch.nan_to_num(med_context, nan=0.0, posinf=0.0, neginf=0.0)
+        if torch.isnan(med_context).any() or torch.isinf(med_context).any():
+            raise RuntimeError("Non-finite values in med_context. Aborting for debugging.")
         if self.normalise_for_SDENN and med_context.numel() > 0:
             mc_mean = med_context.mean(dim=0, keepdim=True)
             mc_std = med_context.std(dim=0, keepdim=True).clamp_min(1e-6)
@@ -950,9 +952,8 @@ class Hybrid_SDE(LightningModule):
                 med_b = med_embed.unsqueeze(1).repeat(1, expert_raw.shape[1], 1)
                 parts.append(med_b)
             node_features = torch.cat(parts, dim=-1)  # [B,14,F]
-            node_features = torch.nan_to_num(
-                node_features, nan=0.0, posinf=0.0, neginf=0.0
-            )
+            if torch.isnan(node_features).any() or torch.isinf(node_features).any():
+                raise RuntimeError("Non-finite values in GAT node_features. Aborting for debugging.")
             # Additional stabilization for attention: clamp and layer-normalize features per node
             node_features = torch.clamp(node_features, -50.0, 150.0)
             try:
@@ -962,19 +963,12 @@ class Hybrid_SDE(LightningModule):
             except Exception:
                 pass
 
-            # Sanitize GAT controller parameters if any NaN/Inf is detected
-            bad_params = False
-            with torch.no_grad():
-                for name, param in self.gat_controller.named_parameters():
-                    if param is None:
-                        continue
-                    if torch.isnan(param).any() or torch.isinf(param).any():
-                        bad_params = True
-                        if self.debug:
-                            print(f"[WARN] GAT parameter has non-finite values: {name}")
-                        param.data = torch.nan_to_num(
-                            param.data, nan=0.0, posinf=0.0, neginf=0.0
-                        )
+            # Fail fast if any GAT controller parameter has NaN/Inf
+            for name, param in self.gat_controller.named_parameters():
+                if param is None:
+                    continue
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    raise RuntimeError(f"Detected non-finite values in GAT parameter '{name}'. Aborting for debugging.")
 
             u_raw = self.gat_controller(node_features)  # [B,4]
             if self.force_no_controls:
@@ -1018,13 +1012,21 @@ class Hybrid_SDE(LightningModule):
 
         # print('SDE_NN_input shape', SDE_NN_input.shape)
         # print('SDE_NN_input example', SDE_NN_input[0,:])
-        if torch.isnan(SDE_NN_input).any():
-            print("SDE_NN_input contains NaN!")
-            breakpoint()
+        # NaN/Inf fail-fast for inputs
+        if torch.isnan(SDE_NN_input).any() or torch.isinf(SDE_NN_input).any():
+            nan_cnt = int(torch.isnan(SDE_NN_input).sum().item())
+            inf_cnt = int(torch.isinf(SDE_NN_input).sum().item())
+            bad_mask = torch.isnan(SDE_NN_input) | torch.isinf(SDE_NN_input)
+            bad_rows = bad_mask.any(dim=1).nonzero(as_tuple=False).flatten()[:5]
+            raise RuntimeError(
+                f"SDE_NN_input contains non-finite values (NaN={nan_cnt}, Inf={inf_cnt}). Sample bad rows: {bad_rows.tolist()}"
+            )
+
         for name, param in self.SDEnet.named_parameters():
-            if torch.isnan(param).any():
-                print(f"[ERROR] NaN weights in {name}!")
-                breakpoint()
+            if param is None or param.data is None:
+                continue
+            if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                raise RuntimeError(f"Detected non-finite values in SDEnet parameter '{name}'. Aborting for debugging.")
 
         SDE_NN_input = torch.cat([SDE_NN_input, med_context], dim=-1)
 
@@ -1052,16 +1054,16 @@ class Hybrid_SDE(LightningModule):
                 SDE_NN_output_latents
                 * self.control_scales.to(SDE_NN_output_latents.device)
             ) * self.SDE_control_weighting
-        scaled_output = torch.nan_to_num(scaled_output, nan=0.0, posinf=0.0, neginf=0.0)
+        if torch.isnan(scaled_output).any() or torch.isinf(scaled_output).any():
+            raise RuntimeError("Non-finite values in scaled_output. Aborting for debugging.")
         scaled_output = torch.clamp(scaled_output, -5.0, 5.0)
 
-        if torch.isnan(SDE_NN_output_latents).any():
-            print("[ERROR] SDE_NN_output contains NaN! Enabling anomaly detection.")
+        if torch.isnan(SDE_NN_output_latents).any() or torch.isinf(SDE_NN_output_latents).any():
             try:
                 torch.autograd.set_detect_anomaly(True)
             except Exception:
                 pass
-            breakpoint()
+            raise RuntimeError("SDE_NN_output contains non-finite values. Aborting for debugging.")
         # print(SDE_NN_output_latents)
         # print(self.SDE_input_state)
         # breakpoint()
@@ -1298,14 +1300,14 @@ class Hybrid_SDE(LightningModule):
             dim=-1,
         )
 
-        # Combine all with NaN guards
-        dt_i_ext = torch.nan_to_num(dt_i_ext, nan=0.0, posinf=0.0, neginf=0.0).clamp_(
-            -10.0, 10.0
-        )
-        dt_expert = torch.nan_to_num(dt_expert, nan=0.0, posinf=0.0, neginf=0.0)
-        dt_neural_embedding = torch.nan_to_num(
-            dt_neural_embedding, nan=0.0, posinf=0.0, neginf=0.0
-        )
+        # Combine all with fail-fast non-finite checks
+        if torch.isnan(dt_i_ext).any() or torch.isinf(dt_i_ext).any():
+            raise RuntimeError("Non-finite values in dt_i_ext. Aborting for debugging.")
+        dt_i_ext = dt_i_ext.clamp_(-10.0, 10.0)
+        if torch.isnan(dt_expert).any() or torch.isinf(dt_expert).any():
+            raise RuntimeError("Non-finite values in dt_expert. Aborting for debugging.")
+        if torch.isnan(dt_neural_embedding).any() or torch.isinf(dt_neural_embedding).any():
+            raise RuntimeError("Non-finite values in dt_neural_embedding. Aborting for debugging.")
         final_f_out = torch.cat([dt_i_ext, dt_expert, dt_neural_embedding], dim=-1)
 
         if self.debug:
@@ -1970,40 +1972,26 @@ class Hybrid_SDE(LightningModule):
         return loss, -logpy.mean(), logqp.mean()
 
     def on_after_backward(self) -> None:
-        # Gradient norm diagnostics
-        if not self.debug:
-            return
+        # Fail-fast on non-finite gradients (always on)
         total_norm_sq = 0.0
         count = 0
-        nan_grads = 0
         with torch.no_grad():
             for name, p in self.named_parameters():
                 if p.grad is not None:
                     g = p.grad.detach()
                     if torch.isnan(g).any() or torch.isinf(g).any():
-                        nan_grads += 1
-                        print(f"[ERROR] NaN/Inf in grad: {name} | mean={g.mean().item():.3e} std={g.std().item():.3e}")
+                        raise RuntimeError(f"Non-finite gradient detected in parameter '{name}'. Aborting for debugging.")
                     total_norm_sq += float(g.norm(2).item() ** 2)
                     count += 1
-        if count > 0:
-            total_norm = total_norm_sq**0.5
-            print(f"[DEBUG] Grad global L2 norm: {total_norm:.6f} over {count} tensors (nan_grads={nan_grads})")
 
     def on_before_optimizer_step(self, optimizer) -> None:
-        if not self.debug:
-            return
-        # Param sanity check before applying the step
+        # Always fail-fast if parameters contain non-finite values before stepping
         with torch.no_grad():
-            bad_params = []
             for name, p in self.named_parameters():
                 if p is None or p.data is None:
                     continue
                 if torch.isnan(p.data).any() or torch.isinf(p.data).any():
-                    bad_params.append(name)
-            if bad_params:
-                print(f"[ERROR] NaN/Inf detected in parameters before optimizer step: {bad_params}")
-                # Optional: raise to stop training early in debug
-                # raise RuntimeError("Non-finite parameters detected")
+                    raise RuntimeError(f"Non-finite parameter detected before optimizer step: '{name}'. Aborting for debugging.")
 
     def compute_counterfactual_loss(self, true_fact, true_cf, pred_fact, pred_cf):
         if self.debug:
@@ -2116,10 +2104,12 @@ class Hybrid_SDE(LightningModule):
                 f"  final z1_for_sde shape: {z1_for_sde.shape}, snippet:\n{z1_for_sde[0, 0, :6]}"
             )
 
-        if torch.isnan(z1_for_sde).any():
-            print("[ERROR] NaN in final z1_for_sde!")
-            nan_locs = torch.where(torch.isnan(z1_for_sde))
-            print(f"NaN locations in z1_for_sde: {nan_locs}")
+        if torch.isnan(z1_for_sde).any() or torch.isinf(z1_for_sde).any():
+            nan_cnt = int(torch.isnan(z1_for_sde).sum().item())
+            inf_cnt = int(torch.isinf(z1_for_sde).sum().item())
+            raise RuntimeError(
+                f"Non-finite values in final z1_for_sde: NaN={nan_cnt}, Inf={inf_cnt}. Aborting for debugging."
+            )
 
         return z1_for_sde
 
@@ -2639,7 +2629,7 @@ class Hybrid_SDE(LightningModule):
         return return_dict
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-4)
 
         scheduler = {
             "monitor": "train_total_loss",
