@@ -80,7 +80,7 @@ class NODE(LightningModule):
 
         if self.debug:
             print(
-                f"[DEBUG] ODE __init__: Initializing... adjoint={adjoint}, use_encoder={use_encoder}, normalise_for_ODENN={normalise_for_ODENN}"
+                f"[DEBUG] ODE __init__: Initializing... adjoint={adjoint}, use_encoder={use_encoder}"
             )
 
         self.odeint_fn = odeint_adjoint if adjoint else odeint
@@ -522,7 +522,6 @@ class NODE(LightningModule):
         batch_size = y.shape[0]
 
         current_pressures = y
-
         normalized_pressures = self.normalize_pressures_only(current_pressures)
 
         # Combine with pre-normalized static Zenker context
@@ -562,6 +561,13 @@ class NODE(LightningModule):
 
         # Get pressure derivatives from network
         pressure_derivatives = self.ODEnet(nn_input)
+
+        if self.debug and hasattr(self, '_dt_grid'):
+            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
+            if (t_idx.remainder(5) == 0).item():  # Every 5 steps
+                print(
+                    f"[DEBUG] t={t.item():.1f}, pressure_derivatives: {pressure_derivatives[0].detach().cpu().numpy()}")
+                print(f"[DEBUG] current_pressures: {current_pressures[0].detach().cpu().numpy()}")
 
         # Only the first 2 elements (p_a, p_v) have non-zero derivatives
         return pressure_derivatives
@@ -697,37 +703,43 @@ class NODE(LightningModule):
                 print(f"[WARN] Med context precomputation failed: {e}")
 
         if self.use_encoder != "none":
-            # init_latents: [batch, 14 expert + encoder_dims]
-            zenker_state = init_latents[:, :self.expert_latent_dims]  # [batch, 14]
-            neural_embedding = init_latents[:, self.expert_latent_dims:]  # [batch, encoder_dims]
+            # init_latents: [batch, 1, 14 expert + encoder_dims]
+            zenker_state = init_latents[:, :, :self.expert_latent_dims]  # [batch, 1, 14]
+            neural_embedding = init_latents[:, :, self.expert_latent_dims:]  # [batch, 1, encoder_dims]
+
+            if self.debug:
+                print(f"[DEBUG] zenker_state shape: {zenker_state.shape}")
+                print(f"[DEBUG] neural_embedding shape: {neural_embedding.shape}")
 
             # Normalize static Zenker variables (positions 2-13) once
-            static_zenker_vars = zenker_state[:, 2:]  # [batch, 12]
-            self.normalized_static_zenker = self.normalize_static_zenker_vars(static_zenker_vars)
-            self.static_neural_embedding = neural_embedding
+            static_zenker_vars = zenker_state[:, :, 2:]  # [batch, 1, 12]
+            if self.debug:
+                print(f"[DEBUG] static_zenker_vars shape: {static_zenker_vars.shape}")
 
-            # Evolving state: just pressures
-            y0 = zenker_state[:, :2]  # [batch, 2]
+            self.normalized_static_zenker = self.normalize_static_zenker_vars(static_zenker_vars)[:, 0,:]  # [batch, 12]
+            self.static_neural_embedding = neural_embedding[:, 0, :]  # [batch, 1, encoder_dims]
+
+            # Evolving state: just pressures - squeeze for ODE integration
+            y0 = zenker_state[:, 0, :2]  # [batch, 2] - squeeze samples dimension for ODE
 
         else:
             # No encoder case
-            zenker_state = init_latents  # [batch, 14]
+            zenker_state = init_latents  # [batch, 1, 14]
+
+            if self.debug:
+                print(f"[DEBUG] No encoder - zenker_state shape: {zenker_state.shape}")
 
             # Normalize static Zenker variables (positions 2-13) once
-            static_zenker_vars = zenker_state[:, 2:]  # [batch, 12]
-            self.normalized_static_zenker = self.normalize_static_zenker_vars(static_zenker_vars)
+            static_zenker_vars = zenker_state[:, :, 2:]  # [batch, 1, 12]
+            if self.debug:
+                print(f"[DEBUG] No encoder - static_zenker_vars shape: {static_zenker_vars.shape}")
+
+            self.normalized_static_zenker = self.normalize_static_zenker_vars(static_zenker_vars)[:, 0, :]  # [batch, 12]
             self.static_neural_embedding = None
 
-            # Evolving state: just pressures
-            y0 = zenker_state[:, :2]
+            # Evolving state: just pressures - squeeze for ODE integration
+            y0 = zenker_state[:, 0, :2]
 
-
-        if init_latents.dim() == 3:
-            y0 = init_latents[:, 0, :]  # [batch, features]
-        else:
-            y0 = init_latents
-
-        assert y0.dim() == 2, f"Expected [batch, features], got {y0.shape}"
 
         # Integrate ODE
         trajectory = self.odeint_fn(

@@ -26,14 +26,14 @@ nohup python ../models/NODE_main.py \
     --num_samples 1 \
     --batch_size 32 \
     --seed 14 \
-    --max_epochs 50 \
+    --max_epochs 30 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 2 \
     --HPC_work True \
-    --output_scale 1 \
+    --output_scale 3 \
     --run_eval \
     --learning_rate 0.001 \
     --early_stopping_patience 10 \

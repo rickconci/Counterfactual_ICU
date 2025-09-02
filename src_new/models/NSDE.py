@@ -383,6 +383,26 @@ class NSDE(LightningModule):
 
         return transformed
 
+    def normalize_static_zenker_vars(self, static_vars):
+        """Normalize positions 2-13 of Zenker variables once at initialization"""
+        # static_vars: [batch, 1, 12] - positions 2-13 of Zenker state
+
+        remaining_min = self.physio_min_vals[2:].to(static_vars.device)  # Skip first 2
+        remaining_max = self.physio_max_vals[2:].to(static_vars.device)  # Skip first 2
+        midpoints = remaining_min + 0.5 * (remaining_max - remaining_min)
+        ranges = remaining_max - remaining_min
+        ranges = torch.clamp(ranges, min=1e-8)
+
+        normalized_static = (static_vars - midpoints) / ranges
+        return normalized_static
+
+    def normalize_pressures_only(self, pressures):
+        """Normalize only p_a, p_v using their specific mu/sigma"""
+        first_two_mu = self.first_two_normalization_mu.to(pressures.device)
+        first_two_sigma = self.first_two_normalization_sigma.to(pressures.device)
+        normalized_pressures = (pressures - first_two_mu) / first_two_sigma
+        return normalized_pressures
+
     def forward_enc(self, input_vals, time_in, static=None, lengths=None):
         if self.debug:
             print(
@@ -488,55 +508,52 @@ class NSDE(LightningModule):
         return result.repeat_interleave(samples_per_batch, dim=0)
 
     def f(self, t, y):
-        batch_size = y.shape[0]
+        """SDE drift: predict pressure derivatives using full Zenker context"""
+        batch_size = y.shape[0]  # This is actually batch*samples
 
-        # y structure: [expert_latents (14), neural_embedding (4)]
-        # Where expert_latents[:2] are the current p_a, p_v
+        # y is just [p_a, p_v] - the only evolving variables: [batch*samples, 2]
+        current_pressures = y
 
-        expert_latents = y[:, : self.expert_latent_dims]  # [batch, 14]
-        neural_embedding = y[
-            :,
-            self.expert_latent_dims : self.expert_latent_dims + self.encoder_SDENN_dims,
-        ]
+        # Normalize only the evolving pressures
+        normalized_pressures = self.normalize_pressures_only(current_pressures)
 
-        # Normalize expert latents (which include current pressures)
-        normalized_expert_latents = self.normalise_sde_inputs(expert_latents)
+        # Combine with pre-normalized static Zenker context (already flattened)
+        normalized_full_zenker = torch.cat([
+            normalized_pressures,  # [batch*samples, 2]
+            self.normalized_static_zenker  # [batch*samples, 12]
+        ], dim=-1)  # [batch*samples, 14]
 
-        # Get medication context
-        med_context = self.get_medication_context(t, batch_size)
+        # Build network input: normalized Zenker + neural embedding
+        if self.static_neural_embedding is not None:
+            nn_input = torch.cat([normalized_full_zenker, self.static_neural_embedding], dim=-1)
+        else:
+            nn_input = normalized_full_zenker
 
-        # Network input uses all available information
-        nn_input = torch.cat([normalized_expert_latents, neural_embedding], dim=-1)
-
+        # Add time encoding if enabled
         if self.include_time:
-            time_encoding = torch.stack([torch.sin(t), torch.cos(t)]).repeat(
-                batch_size, 1
-            )
+            time_encoding = torch.stack([torch.sin(t), torch.cos(t)]).repeat(batch_size, 1)
             nn_input = torch.cat([nn_input, time_encoding], dim=-1)
 
+        # Add medication context (need to expand for samples)
+        med_context = self.get_medication_context(t, batch_size)
         med_context = (med_context - 0.5) * 4.0
-
         nn_input = torch.cat([nn_input, med_context], dim=-1)
 
-        # Get derivatives for only p_a, p_v (first 2 elements)
-        pressure_derivatives = self.SDEnet(nn_input)  # [batch, 2]
+        # Get pressure derivatives from network
+        pressure_derivatives = self.SDEnet(nn_input)  # [batch*samples, 2]
 
-        # Only the first 2 elements (p_a, p_v) have non-zero derivatives
-        full_derivatives = torch.zeros_like(y)
-        full_derivatives[:, :2] = pressure_derivatives
-        return full_derivatives
+        return pressure_derivatives
 
     def g(self, t, y):
-        """Diffusion function - adds stochasticity"""
-        batch_size = y.shape[0]
+        """Diffusion function - adds stochasticity to pressures only"""
+        batch_size = y.shape[0]  # This is actually batch*samples
 
-        # Create diffusion matrix
-        diffusion = torch.zeros_like(y)
+        # Create diffusion matrix for 2D pressure state
+        diffusion = torch.zeros(batch_size, 2, device=y.device)
 
-        # Add noise only to pressure variables (first 2 dimensions)
+        # Add noise to both pressure variables
         diffusion[:, 0] = self.noise_scale  # p_a noise
-        diffusion[:, 1] = self.noise_scale
-        # diffusion[:, 2:] = 0  # No noise on other states
+        diffusion[:, 1] = self.noise_scale  # p_v noise
 
         return diffusion
 
@@ -668,7 +685,43 @@ class NSDE(LightningModule):
         self.current_med_mask = med_traj_mask
         self.current_med_time = med_traj_time
 
-        y0_flattened = init_latents.reshape(-1, state_dim)  # [batch*samples, state_dim]
+        if self.use_encoder != "none":
+            # init_latents: [batch, samples, 14 expert + encoder_dims]
+            zenker_state = init_latents[:, :, :self.expert_latent_dims]  # [batch, samples, 14]
+            neural_embedding = init_latents[:, :, self.expert_latent_dims:]  # [batch, samples, encoder_dims]
+
+            # Normalize static context and flatten for f() function access
+            static_zenker_vars = zenker_state[:, :, 2:]  # [batch, samples, 12]
+            self.normalized_static_zenker = self.normalize_static_zenker_vars(static_zenker_vars)
+            self.normalized_static_zenker = self.normalized_static_zenker.reshape(-1, 12)  # [batch*samples, 12]
+
+            self.static_neural_embedding = neural_embedding.reshape(-1,self.encoder_SDENN_dims)  # [batch*samples, encoder_dims]
+
+            # Evolving state: just pressures
+            y0 = zenker_state[:, :, :2]  # [batch, samples, 2]
+
+
+        else:
+
+            # No encoder case
+
+            zenker_state = init_latents  # [batch, samples, 14]
+
+            # Normalize static context and flatten for f() function access
+
+            static_zenker_vars = zenker_state[:, :, 2:]  # [batch, samples, 12]
+
+            self.normalized_static_zenker = self.normalize_static_zenker_vars(static_zenker_vars)
+
+            self.normalized_static_zenker = self.normalized_static_zenker.reshape(-1, 12)  # [batch*samples, 12]
+
+            self.static_neural_embedding = None
+
+            # Evolving state: just pressures
+
+            y0 = zenker_state[:, :, :2]
+
+        y0_flattened = y0.reshape(-1, state_dim)  # [batch*samples, state_dim]
 
         if self.debug:
             print(f"[DEBUG] NSDE forward_latent: y0_flattened shape = {y0_flattened.shape}")
