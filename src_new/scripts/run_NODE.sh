@@ -25,18 +25,18 @@ nohup python ../models/NODE_main.py \
     --use_encoder none \
     --num_samples 1 \
     --batch_size 32 \
-    --seed 14 \
-    --max_epochs 50 \
+    --seed 96 \
+    --max_epochs 10 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 2 \
     --HPC_work True \
-    --output_scale 1 \
+    --output_scale 3 \
     --final_activation tanh \
     --run_eval \
-    --learning_rate 0.0001 \
+    --learning_rate 0.0005 \
     --early_stopping_patience 10 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 

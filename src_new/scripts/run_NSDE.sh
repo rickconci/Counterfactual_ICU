@@ -25,17 +25,17 @@ nohup python ../models/NSDE_main.py \
     --use_encoder none \
     --num_samples 3 \
     --batch_size 32 \
-    --seed 14 \
-    --max_epochs 50 \
+    --seed 96 \
+    --max_epochs 100 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 2 \
-    --prior_tx_sigma 0.2 \
-    --output_scale 1 \
+    --prior_tx_sigma 0.1 \
+    --output_scale 3 \
     --run_eval \
     --log_wandb True \
-    --learning_rate 0.001 \
+    --learning_rate 0.0005 \
     --early_stopping_patience 10 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 

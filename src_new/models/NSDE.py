@@ -661,26 +661,23 @@ class NSDE(LightningModule):
         med_traj_mask=None,
         med_traj_time=None,
     ):
-        batch_size = init_latents.shape[0]
+        batch_size, num_samples, state_dim = init_latents.shape
 
         # Store medication context
         self.current_med_values = med_traj_values
         self.current_med_mask = med_traj_mask
         self.current_med_time = med_traj_time
 
-        y0 = init_latents  # [batch, 14]
+        y0_flattened = init_latents.reshape(-1, state_dim)  # [batch*samples, state_dim]
 
-        if init_latents.dim() == 3:
-            y0 = init_latents[:, 0, :]  # [batch, features]
-        else:
-            y0 = init_latents
+        if self.debug:
+            print(f"[DEBUG] NSDE forward_latent: y0_flattened shape = {y0_flattened.shape}")
+            print(f"[DEBUG] batch_size={batch_size}, num_samples={num_samples}")
 
-        assert y0.dim() == 2, f"Expected [batch, features], got {y0.shape}"
-
-        # Integrate ODE
-        trajectory = self.sdeint_fn(
+        # Integrate SDE with all samples in parallel
+        trajectory_flat = self.sdeint_fn(
             sde=self,
-            y0=y0,
+            y0=y0_flattened,
             ts=ts,
             method=self.integration_method,
             dt=self.integration_step_size,
@@ -688,12 +685,13 @@ class NSDE(LightningModule):
             atol=self.atol
         )
 
-        # Reshape and extract pressure trajectory
-        trajectory = trajectory.permute(1, 0, 2)  # [batch, time, features]
-        pressure_traj = trajectory[:, :, :2]  # Only p_a, p_v: [batch, time, 2]
+        # Reshape back: [time, batch*samples, state] -> [time, batch, samples, state] -> [batch, samples, time, state]
+        time_steps = trajectory_flat.shape[0]
+        trajectory = trajectory_flat.view(time_steps, batch_size, num_samples, state_dim)
+        trajectory = trajectory.permute(1, 2, 0, 3)  # [batch, samples, time, state]
 
-        # Add samples dimension for compatibility
-        pressure_traj = pressure_traj.unsqueeze(1)
+        # Extract pressure trajectory (first 2 dimensions)
+        pressure_traj = trajectory[:, :, :, :2]
 
         return pressure_traj, torch.zeros(batch_size), None
 

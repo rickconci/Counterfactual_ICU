@@ -22,7 +22,7 @@ mkdir -p ../../results/model_checkpoints
 echo "Starting training with nohup..."
 nohup python ../models/hybrid_sde_main.py \
     --dataset_type mimic \
-    --use_encoder none \
+    --use_encoder raindrop \
     --num_samples 3 \
     --batch_size 32 \
     --seed 14 \
@@ -35,13 +35,12 @@ nohup python ../models/hybrid_sde_main.py \
     --HPC_work True \
     --SDE_control_weighting 1 \
     --prior_tx_sigma 0.1 \
-    --output_scale 1 \
+    --output_scale 3 \
     --final_activation tanh \
     --run_eval \
     --learning_rate 0.001 \
     --early_stopping_patience 1 \
     --test_zenker True \
-    --max_samples 50 \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
 # Get the process ID

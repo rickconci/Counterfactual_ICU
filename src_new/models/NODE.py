@@ -189,7 +189,7 @@ class NODE(LightningModule):
         net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         if self.use_encoder != "none":
-            self.ic_consistency_weight = 0.1
+            self.ic_consistency_weight = 10
             # each medication has rate and last administration info
             net_input_dims = net_input_dims + n_medications * 2
         else:
@@ -521,17 +521,22 @@ class NODE(LightningModule):
     def f_ode(self, t, y):
         batch_size = y.shape[0]
 
-        # y structure: [expert_latents (14), neural_embedding (4)]
-        # Where expert_latents[:2] are the current p_a, p_v
+        current_pressures = y
 
-        expert_latents = y[:, : self.expert_latent_dims]  # [batch, 14]
-        neural_embedding = y[
-            :,
-            self.expert_latent_dims : self.expert_latent_dims + self.encoder_ODENN_dims,
-        ]
+        normalized_pressures = self.normalize_pressures_only(current_pressures)
 
-        # Normalize expert latents (which include current pressures)
-        normalized_expert_latents = self.normalise_ode_inputs(expert_latents)
+        # Combine with pre-normalized static Zenker context
+        normalized_full_zenker = torch.cat([
+            normalized_pressures,  # [batch, 2] - newly normalized
+            self.normalized_static_zenker  # [batch, 12] - pre-normalized
+        ], dim=-1)  # [batch, 14]
+
+        # Build network input: normalized Zenker + neural embedding
+        if self.static_neural_embedding is not None:
+            nn_input = torch.cat([normalized_full_zenker, self.static_neural_embedding], dim=-1)
+        else:
+            nn_input = normalized_full_zenker
+
 
         if hasattr(self, "current_med_context") and self.current_med_context is not None:
             if not hasattr(self, "_t0"):
@@ -546,67 +551,41 @@ class NODE(LightningModule):
         else:
             med_context = self.get_medication_context(t, batch_size)
 
-        med_context = (med_context - 0.5) * 4.0
-
-        # Network input uses all available information
-        nn_input = torch.cat([normalized_expert_latents, neural_embedding], dim=-1)
-
         if self.include_time:
             time_encoding = torch.stack([torch.sin(t), torch.cos(t)]).repeat(
                 batch_size, 1
             )
             nn_input = torch.cat([nn_input, time_encoding], dim=-1)
 
+        med_context = (med_context - 0.5) * 4.0
         nn_input = torch.cat([nn_input, med_context], dim=-1)
 
-        # Get derivatives for only p_a, p_v (first 2 elements)
-        pressure_derivatives = self.ODEnet(nn_input)  # [batch, 2]
+        # Get pressure derivatives from network
+        pressure_derivatives = self.ODEnet(nn_input)
 
         # Only the first 2 elements (p_a, p_v) have non-zero derivatives
-        full_derivatives = torch.zeros_like(y)
-        full_derivatives[:, :2] = pressure_derivatives
-        return full_derivatives
+        return pressure_derivatives
 
-    def normalise_ode_inputs(self, expert_vars):
-        """
-        Normalize expert variables with different strategies:
-        - First two variables: (x - mu) / sigma
-        - Remaining variables: (x - midpoint) / (max - min)
+    def normalize_static_zenker_vars(self, static_vars):
+        """Normalize positions 2-13 of Zenker variables once at initialization"""
+        # static_vars: [batch, 12] - positions 2-13 of Zenker state
 
-        Args:
-            expert_vars: Expert latent variables [batch, expert_latent_dims]
+        # Get ranges for positions 2-13
+        remaining_min = self.physio_min_vals[2:].to(static_vars.device)  # Skip first 2
+        remaining_max = self.physio_max_vals[2:].to(static_vars.device)  # Skip first 2
+        midpoints = remaining_min + 0.5 * (remaining_max - remaining_min)
+        ranges = remaining_max - remaining_min
+        ranges = torch.clamp(ranges, min=1e-8)
 
-        Returns:
-            normalized expert variables [batch, expert_latent_dims]
-        """
-        # Normalize first two expert variables with mu/sigma
-        first_two = expert_vars[:, :2]  # [batch, 2]
-        first_two_mu = self.first_two_normalization_mu.to(self.device)
-        first_two_sigma = self.first_two_normalization_sigma.to(self.device)
-        normalized_first_two = (first_two - first_two_mu) / first_two_sigma
+        normalized_static = (static_vars - midpoints) / ranges
+        return normalized_static
 
-        # Normalize remaining expert variables with midpoint normalization
-        remaining_vars = expert_vars[:, 2:]  # [batch, remaining_dims]
-        if remaining_vars.shape[1] > 0:
-            # Calculate midpoints and ranges for remaining variables
-            remaining_min = self.physio_min_vals[2:].to(self.device)  # Skip first 2
-            remaining_max = self.physio_max_vals[2:].to(self.device)  # Skip first 2
-            midpoints = remaining_min + 0.5 * (remaining_max - remaining_min)
-            ranges = remaining_max - remaining_min
-
-            # Avoid division by zero
-            ranges = torch.clamp(ranges, min=1e-8)
-
-            normalized_remaining = (remaining_vars - midpoints) / ranges
-
-            # Combine normalized parts
-            normalized_expert_vars = torch.cat(
-                [normalized_first_two, normalized_remaining], dim=-1
-            )
-        else:
-            normalized_expert_vars = normalized_first_two
-
-        return normalized_expert_vars
+    def normalize_pressures_only(self, pressures):
+        """Normalize only p_a, p_v using their specific mu/sigma"""
+        first_two_mu = self.first_two_normalization_mu.to(pressures.device)
+        first_two_sigma = self.first_two_normalization_sigma.to(pressures.device)
+        normalized_pressures = (pressures - first_two_mu) / first_two_sigma
+        return normalized_pressures
 
     def _prepare_encoder_input(self, X, init_states):
         """Prepares the input for the `forward_enc` method based on whether an encoder is used."""
@@ -717,7 +696,31 @@ class NODE(LightningModule):
             if self.debug:
                 print(f"[WARN] Med context precomputation failed: {e}")
 
-        y0 = init_latents  # [batch, 14]
+        if self.use_encoder != "none":
+            # init_latents: [batch, 14 expert + encoder_dims]
+            zenker_state = init_latents[:, :self.expert_latent_dims]  # [batch, 14]
+            neural_embedding = init_latents[:, self.expert_latent_dims:]  # [batch, encoder_dims]
+
+            # Normalize static Zenker variables (positions 2-13) once
+            static_zenker_vars = zenker_state[:, 2:]  # [batch, 12]
+            self.normalized_static_zenker = self.normalize_static_zenker_vars(static_zenker_vars)
+            self.static_neural_embedding = neural_embedding
+
+            # Evolving state: just pressures
+            y0 = zenker_state[:, :2]  # [batch, 2]
+
+        else:
+            # No encoder case
+            zenker_state = init_latents  # [batch, 14]
+
+            # Normalize static Zenker variables (positions 2-13) once
+            static_zenker_vars = zenker_state[:, 2:]  # [batch, 12]
+            self.normalized_static_zenker = self.normalize_static_zenker_vars(static_zenker_vars)
+            self.static_neural_embedding = None
+
+            # Evolving state: just pressures
+            y0 = zenker_state[:, :2]
+
 
         if init_latents.dim() == 3:
             y0 = init_latents[:, 0, :]  # [batch, features]
