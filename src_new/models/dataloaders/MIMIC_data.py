@@ -261,6 +261,9 @@ class MIMICDataset(Dataset):
             "med_time": med_traj_time_sec,  # [T_fwd]
             # Precomputed med context per time [T_fwd, 2*M]
             "med_tensors": med_tensors,
+            # IDs for traceability
+            "hadm_id": torch.tensor(int(hadm_id), dtype=torch.long),
+            "traj_id": torch.tensor(int(action_cluster_id), dtype=torch.long),
         }
 
 
@@ -290,6 +293,8 @@ class MIMICDataModule(L.LightningDataModule):
         self.context_max_len: int | None = None
         self.forward_max_len: int | None = None
         self.expert_latent_dim = expert_latent_dim
+        # Store nominal interval seconds if present in metadata (fallback to 10)
+        self.interval_seconds: int = 10
 
     def _resolve_num_workers(self) -> int:
         """Choose efficient default workers: 6-8 on non-macOS, 1 on macOS."""
@@ -360,9 +365,11 @@ class MIMICDataModule(L.LightningDataModule):
                     # Derived lengths
                     self.context_max_len = int(ctx_minutes // ctx_bin)
                     self.forward_max_len = int((fwd_minutes * 60) // interval_seconds)
+                    self.interval_seconds = interval_seconds
                 except Exception:
                     self.context_max_len = None
                     self.forward_max_len = None
+                    self.interval_seconds = 10
 
             if len(self.train_dataset) > 0:
                 sample0 = self.train_dataset[0]
@@ -452,7 +459,7 @@ class MIMICDataModule(L.LightningDataModule):
         # No fixed-size legacy context tensors to stack
         stack_keys = []
 
-        no_pad_keys = ["init_state", "ic_mask", "static", "rd_length"]
+        no_pad_keys = ["init_state", "ic_mask", "static", "rd_length", "hadm_id", "traj_id"]
 
         collated = {}
 
@@ -494,10 +501,16 @@ class MIMICDataModule(L.LightningDataModule):
                     seq_valid = seq[:valid_len]
                     if valid_len < y_max_len:
                         last_valid_time = seq_valid[-1]
-                        time_increment = 1.0
+                        # Use per-sample dt if available; fallback to module interval_seconds
+                        if valid_len >= 2:
+                            dt = (seq_valid[-1] - seq_valid[-2]).item()
+                            if not torch.isfinite(torch.tensor(dt)) or dt <= 0:
+                                dt = float(self.interval_seconds)
+                        else:
+                            dt = float(self.interval_seconds)
                         padding_times = (
                             torch.arange(1, y_max_len - valid_len + 1, dtype=seq.dtype)
-                            * time_increment
+                            * dt
                             + last_valid_time
                         )
                         padded_seq = torch.cat([seq_valid, padding_times], dim=0)
@@ -573,4 +586,6 @@ class MIMICDataModule(L.LightningDataModule):
             collated["med_mask"],  # [B, T_fwd, M]
             collated["med_time"],  # [B, T_fwd]
             collated["med_tensors"],  # [B, T_fwd, 2*M]
+            collated["hadm_id"],  # [B]
+            collated["traj_id"],  # [B]
         )

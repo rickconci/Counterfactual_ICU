@@ -2220,6 +2220,8 @@ class Hybrid_SDE(LightningModule):
                 med_trajectory_mask,
                 med_trajectory_time,
                 med_tensors,
+                hadm_ids,
+                traj_ids,
             ) = batch
         else:
             raise NotImplementedError(
@@ -2380,12 +2382,20 @@ class Hybrid_SDE(LightningModule):
             "combined_mask": combined_mask,
             "i_ext_path": i_ext_path,
             "z1_for_sde": z1_for_sde,
+            "hadm_ids": hadm_ids,
+            "traj_ids": traj_ids,
         }
 
     def training_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
             print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
         result = self.common_step(batch, batch_idx)
+        # Stash IDs for plotting filenames if present
+        try:
+            self._last_hadm_ids = result.get("hadm_ids", None)
+            self._last_traj_ids = result.get("traj_ids", None)
+        except Exception:
+            pass
 
         total_loss = result["total_loss"]
         loss = result["loss"]
@@ -2496,6 +2506,11 @@ class Hybrid_SDE(LightningModule):
             print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
 
         result = self.common_step(batch, batch_idx)
+        try:
+            self._last_hadm_ids = result.get("hadm_ids", None)
+            self._last_traj_ids = result.get("traj_ids", None)
+        except Exception:
+            pass
 
         # Log the individual components
         self.log(
@@ -2899,9 +2914,15 @@ class Hybrid_SDE(LightningModule):
                     }
                 )
             else:
+                try:
+                    last_hadm = int(getattr(self, "_last_hadm_ids", [None])[patient_idx])
+                    last_traj = int(getattr(self, "_last_traj_ids", [None])[patient_idx])
+                    id_suffix = f"_hadm{last_hadm}_traj{last_traj}" if last_hadm is not None and last_traj is not None else ""
+                except Exception:
+                    id_suffix = ""
                 out_path = os.path.join(
                     self.train_dir,
-                    f"nature_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}_uncertainty.png",
+                    f"nature_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}_uncertainty.png",
                 )
                 plt.savefig(out_path, dpi=300, bbox_inches="tight")
                 print(f"[PLOT] Saved: {out_path}")
@@ -3266,9 +3287,15 @@ class Hybrid_SDE(LightningModule):
                     }
                 )
             else:
+                try:
+                    last_hadm = int(getattr(self, "_last_hadm_ids", [None])[patient_idx])
+                    last_traj = int(getattr(self, "_last_traj_ids", [None])[patient_idx])
+                    id_suffix = f"_hadm{last_hadm}_traj{last_traj}" if last_hadm is not None and last_traj is not None else ""
+                except Exception:
+                    id_suffix = ""
                 out_path = os.path.join(
                     self.train_dir,
-                    f"control_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}_controls.png",
+                    f"control_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}_controls.png",
                 )
                 plt.savefig(out_path, dpi=300, bbox_inches="tight")
                 print(f"[PLOT] Saved: {out_path}")

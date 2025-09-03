@@ -354,10 +354,11 @@ def main(args):
     trainer = Trainer(
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
+        precision=args.precision,
         logger=wandb_logger,
         log_every_n_steps=args.log_every_n_steps,
         callbacks=callbacks,
-        gradient_clip_val=2.0,  # Increased to 2.0 for extra stability
+        gradient_clip_val=1.0,  # Increased to 2.0 for extra stability
         gradient_clip_algorithm="norm",
         overfit_batches=args.overfit_batches,
         num_sanity_val_steps=0 if args.disable_sanity_check else 2,
@@ -404,12 +405,12 @@ if __name__ == "__main__":
         help="Where to save if HPC",
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="Random seed for initialization"
+        "--seed", type=int, default=64, help="Random seed for initialization"
     )
     parser.add_argument(
         "--project_name",
         type=str,
-        default="sdehybrid_rc",
+        default="sdehybrid_rc_2",
         help="Wandb project name",
     )
     parser.add_argument(
@@ -417,7 +418,7 @@ if __name__ == "__main__":
         type=str2bool,
         nargs="?",
         const=True,
-        default=False,
+        default=True,
         help="Whether to log to Weights & Biases",
     )
     parser.add_argument(
@@ -437,7 +438,7 @@ if __name__ == "__main__":
         help="Enable model checkpointing",
     )
     parser.add_argument(
-        "--plot_every", type=int, default=1, help="Plot every how many global steps? "
+        "--plot_every", type=int, default=10, help="Plot every how many global steps? "
     )
 
     # Data specific args
@@ -463,13 +464,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--static_hidden_dim",
         type=int,
-        default=32,
+        default=64,
         help="Hidden dimension for the static encoder MLP.",
     )
     parser.add_argument(
         "--fusion_hidden_dim",
         type=int,
-        default=64,
+        default=128,
         help="Hidden dimension for the fusion MLP.",
     )
     parser.add_argument(
@@ -528,7 +529,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_encoder",
         type=str,
-        default="none",
+        default="raindrop",
         choices=["full", "partial", "none", "raindrop"],
         help="what to do with the encoder!",
     )
@@ -609,7 +610,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--encoder_SDENN_dims",
         type=int,
-        default=64,
+        default=128,
         help="Encoder output used by SDENN",
     )
 
@@ -617,7 +618,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=1,
+        default=3,
         help="Number of SDE samples- is affected if sigma >0 ",
     )
     parser.add_argument(
@@ -635,7 +636,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--SDE_control_weighting",
         type=float,
-        default=1,
+        default=1.5,
         help="how much to scale the output of the SDE NN",
     )
     # Smoothness/inductive bias flags
@@ -670,7 +671,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--control_energy_weight",
         type=float,
-        default=1e-4,
+        default=1e-6,
         help="Weight for control energy regularizer added to total loss",
     )
 
@@ -682,27 +683,34 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--plot_outputs_train",
-        action="store_true",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
         help="Whether to plot the outputs of the SDE during training",
     )
 
     # Model specific args
     parser.add_argument(
         "--start_dec_at_treatment",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=True,
         help="Whether to encode the data until treatment and the decode or decode from the beginning!)",
     )
     parser.add_argument(
         "--variational_encoder",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=False,
         help="Whether encoder is variational or not - not finished variational)",
     )
     parser.add_argument(
         "--encoder_hidden_dim",
         type=int,
-        default=64,
+        default=128,
         help="Output of the encoder into a latent space. This needs to match the total SDE input dims ",
     )
     parser.add_argument(
@@ -739,7 +747,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--normalise_for_SDENN",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=True,
         help="Whether to normalise data when handing it to the SDE NN or just scale it )",
     )
@@ -752,7 +762,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--med_embed_dim", 
         type=int, 
-        default=64, 
+        default=32, 
         help="Num output dims for med embedding"
     )
     parser.add_argument(
@@ -781,7 +791,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=0.0005,
+        default=1e-5,
         help="Learning rate for the optimizer",
     )
     parser.add_argument("--batch_size", 
@@ -789,7 +799,7 @@ if __name__ == "__main__":
         help="Training batch size")
     
     parser.add_argument(
-        "--max_epochs", type=int, default=15, help="Maximum number of epochs to train"
+        "--max_epochs", type=int, default=40, help="Maximum number of epochs to train"
     )
     parser.add_argument(
         "--accelerator",
@@ -801,14 +811,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--precision",
         type=str,
-        default="16-mixed",
+        default="32-true",
         choices=["32-true", "16-mixed", "bf16-mixed", "64-true"],
         help="Lightning precision (use 16-mixed or bf16-mixed for speed)",
     )
     parser.add_argument(
         "--log_every_n_steps",
         type=int,
-        default=1,
+        default=4,
         help="Lightning logging frequency in steps",
     )
     parser.add_argument(
@@ -830,7 +840,12 @@ if __name__ == "__main__":
         help="Max dataset length (None for production)",
     )
     parser.add_argument(
-        "--run_eval", action="store_true", help="Run evaluation after training"
+        "--run_eval", 
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Run evaluation after training"
     )
     parser.add_argument(
         "--early_stopping_patience", 
@@ -890,6 +905,78 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable sanity validation to start training immediately (sets num_sanity_val_steps=0).",
     )
+    parser.add_argument(
+        "--audit_one_batch",
+        action="store_true",
+        help="Run a one-batch audit of dataloader and model inputs then exit",
+    )
+    parser.add_argument(
+        "--audit_print_samples",
+        type=int,
+        default=3,
+        help="How many batch elements to print during audit",
+    )
 
     args = parser.parse_args()
-    main(args)
+    if args.audit_one_batch and args.dataset_type == "mimic":
+        # Lightweight in-place audit without training
+        dm = MIMICDataModule(
+            data_root=args.data_root,
+            icu_stays_path=args.icu_stays_path,
+            batch_size=args.batch_size,
+            num_workers=0,
+            random_state=args.seed,
+            max_samples=args.max_samples,
+            use_raindrop_context=True,
+            expert_latent_dim=14,
+        )
+        dm.setup("fit")
+        loader = dm.train_dataloader()
+        batch = next(iter(loader))
+        (
+            rd_src,
+            rd_times,
+            rd_length,
+            static_features,
+            init_states,
+            ic_mask,
+            Y,
+            Y_mask,
+            t_Y,
+            med_values,
+            med_mask,
+            med_time,
+            med_tensors,
+            hadm_ids,
+            traj_ids,
+        ) = batch
+        print("=== One-batch audit (MIMIC) ===")
+        def stat(name, t):
+            t = t.detach() if hasattr(t, "detach") else t
+            print(f"{name:>16s}: shape={tuple(t.shape)}, NaN={(~torch.isfinite(t)).sum().item()}, min={torch.nanmin(t.float()) if t.dtype!=torch.bool else 'NA'}, max={torch.nanmax(t.float()) if t.dtype!=torch.bool else 'NA'}")
+        stat("rd_src", rd_src)
+        stat("rd_times", rd_times)
+        stat("rd_length", rd_length)
+        stat("static", static_features)
+        stat("init_state", init_states)
+        stat("ic_mask", ic_mask)
+        stat("Y", Y)
+        stat("Y_mask", Y_mask)
+        stat("t_Y", t_Y)
+        stat("med_values", med_values)
+        stat("med_mask", med_mask)
+        stat("med_time", med_time)
+        stat("med_tensors", med_tensors)
+        print("IDs:", hadm_ids[: args.audit_print_samples].tolist(), traj_ids[: args.audit_print_samples].tolist())
+        # Monotonicity checks
+        diffs = t_Y[:, 1:] - t_Y[:, :-1]
+        nonmono = (diffs <= 0).any(dim=1)
+        print("Non-monotonic t_Y samples idx:", torch.where(nonmono)[0].tolist())
+        # Mask validity
+        mask_bad = ((Y_mask < 0) | (Y_mask > 1)).any()
+        print("Y_mask outside [0,1]?:", bool(mask_bad))
+        # Basic consistency lengths
+        print("rd_length min/max:", int(rd_length.min()), int(rd_length.max()))
+        print("Audit complete. Exiting.")
+    else:
+        main(args)

@@ -26,7 +26,7 @@ NUM_GPUS=${#GPU_IDS_ARR[@]}
 echo "Detected/Using GPUs: ${GPU_IDS_ARR[*]} (count=${NUM_GPUS})"
 
 # Variable params (ordered by importance)
-ENCODERS=(none) #raindrop
+ENCODERS=(none raindrop)
 SDE_WEIGHTS=(1)
 LRS=(1e-5 5e-5)
 SIGMAS=(0.00001)
