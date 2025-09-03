@@ -26,7 +26,7 @@ nohup python ../models/NSDE_main.py \
     --num_samples 3 \
     --batch_size 32 \
     --seed 96 \
-    --max_epochs 50 \
+    --max_epochs 10 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --model_checkpoint True \
     --early_stopping True \

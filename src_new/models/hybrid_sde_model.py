@@ -14,6 +14,8 @@ from torch import distributions, nn
 from torch.special import erf
 from ZenkerModel import ZenkerODE
 
+import torch.utils.checkpoint as checkpoint
+
 # Add the project root and utils directory to Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 utils_path = os.path.join(project_root, "src_new", "utils")
@@ -102,6 +104,36 @@ def activate_auto_debug_mode(model_instance, location: str, tensor_name: str, te
             print(f"  Total parameters: {total_params:,}")
         except Exception as e:
             print(f"Could not log parameter stats: {e}")
+
+        try:
+            if hasattr(model_instance, '_debug_predicted_traj') and hasattr(model_instance, '_debug_true_traj'):
+                print("\n🔍 FULL TRAJECTORIES (First 5 samples):")
+                pred_traj = model_instance._debug_predicted_traj
+                true_traj = model_instance._debug_true_traj
+
+                batch_size = min(5, pred_traj.shape[0])
+                for i in range(batch_size):
+                    print(f"\n--- Sample {i} ---")
+                    print(f"True trajectory ({true_traj[i].shape}):")
+                    print(true_traj[i].detach().cpu().numpy())
+
+                    if pred_traj.shape[1] > 1:  # Multiple samples
+                        pred_mean = pred_traj[i].mean(0)
+                        print(f"Predicted trajectory (mean over {pred_traj.shape[1]} samples):")
+                        print(pred_mean.detach().cpu().numpy())
+
+                        # Also print individual samples for first patient
+                        if i == 0:
+                            print(f"Individual prediction samples for patient 0:")
+                            for s_idx in range(min(3, pred_traj.shape[1])):
+                                print(f"  Sample {s_idx}:")
+                                print(f"  {pred_traj[i, s_idx].detach().cpu().numpy()}")
+                    else:
+                        print(f"Predicted trajectory:")
+                        print(pred_traj[i, 0].detach().cpu().numpy())
+                print("--- End Trajectories ---\n")
+        except Exception as e:
+            print(f"Could not print trajectories: {e}")
         
         print("="*80 + "\n")
         
@@ -585,8 +617,8 @@ class Hybrid_SDE(LightningModule):
 
         # check baroreflex sensitivity
         self.physio_ranges = {
-            "p_a": (39, 180.0),
-            "p_v": (0.0, 39.0),
+            "p_a": (40, 180.0),
+            "p_v": (0.0, 30),
             "s_reflex": (0, 1),
             "sv": (40.0, 120.0),
             "r_tpr_mod": (-1.0, 1.0),
@@ -789,6 +821,15 @@ class Hybrid_SDE(LightningModule):
             )
         return z1, z1_logvar, logqp0
 
+    def get_adaptive_control_scales(self, current_step):
+        """Gradually increase control authority as training progresses"""
+        base_scales = torch.tensor([0.1, 0.02, 0.01, 0.01], dtype=torch.float32)
+
+        # Start with 1% control authority, ramp up to 100% over 1000 steps
+        ramp_progress = min(current_step / 1000.0, 1.0)
+        scale_multiplier = 0.01 + 0.99 * ramp_progress
+
+        return base_scales * scale_multiplier
 
     def apply_SDE_fun(self, t, y):
         """
@@ -964,8 +1005,12 @@ class Hybrid_SDE(LightningModule):
         # expand over samples if needed
         samples_per_batch = batch_size // med_tensor.shape[0]
         med_tensor = med_tensor.repeat_interleave(samples_per_batch, dim=0)
+        #med_safe = torch.sign(med_tensor) * torch.log1p(torch.abs(med_tensor))
+        #med_safe = torch.nan_to_num(med_safe, nan=0.0, posinf=3.0, neginf=-3.0)  # Clean NaN/Inf first
+        #med_safe = torch.clamp(med_safe, min=-3.0, max=3.0)
         # Project to fixed-size med embedding (LazyLinear infers input dim on first call)
         med_embed = torch.tanh(self.med_proj(med_tensor))  # [B, med_embed_dim]
+        #med_embed = torch.zeros(batch_size, self.med_embed_dim, device=self.device)
        
         if torch.isnan(med_tensor).any() or torch.isinf(med_tensor).any():
             activate_auto_debug_mode(self, "apply_SDE_fun", "med_context", med_tensor)
@@ -1099,7 +1144,14 @@ class Hybrid_SDE(LightningModule):
         # if self.debug:
         #    print(f"SDE_NN_input shape: {SDE_NN_input.shape}")
 
-        SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
+        # Use gradient checkpointing for control network to prevent accumulation
+        def control_forward(sde_input):
+            return self.SDEnet(sde_input)
+
+        if self.training:
+            SDE_NN_output_latents = checkpoint.checkpoint(control_forward, SDE_NN_input)
+        else:
+            SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
 
         # TODO do these clamps make sense
         # control_scales = torch.tensor([100.0, 30.0], device=SDE_NN_output_latents.device)
@@ -1108,10 +1160,8 @@ class Hybrid_SDE(LightningModule):
             scaled_output = torch.zeros_like(SDE_NN_output_latents)
         else:
             # Apply per-head scales and global weighting
-            scaled_output = (
-                SDE_NN_output_latents
-                * self.control_scales.to(SDE_NN_output_latents.device)
-            ) * self.SDE_control_weighting
+            current_scales = self.get_adaptive_control_scales(self.global_step)
+            scaled_output = (SDE_NN_output_latents * current_scales.to(SDE_NN_output_latents.device)) * self.SDE_control_weighting
         if torch.isnan(scaled_output).any() or torch.isinf(scaled_output).any():
             activate_auto_debug_mode(self, "apply_SDE_fun (MLP path)", "scaled_output", scaled_output)
             raise RuntimeError("Non-finite values in scaled_output. Auto-debug mode activated.")
@@ -1866,8 +1916,8 @@ class Hybrid_SDE(LightningModule):
             latent_out, self.decoder_output_dims
         )
 
-        pa = torch.clamp(output_traj[..., 0], min=40.0, max=220.0)
-        pv = torch.clamp(output_traj[..., 1], min=0, max=39)
+        pa = torch.clamp(output_traj[..., 0], min=40.0, max=180)
+        pv = torch.clamp(output_traj[..., 1], min=0, max=30)
 
         output_traj = torch.stack([pa, pv], dim=-1)
 
@@ -2236,9 +2286,27 @@ class Hybrid_SDE(LightningModule):
                 src = rd_src.permute(1, 0, 2)
                 times = rd_times.permute(1, 0)
                 lengths = rd_length
-                temporal_embedding, _, _ = self.temporal_encoder(
-                    src=src, static=None, times=times, lengths=lengths
-                )
+
+                def encoder_forward(src, times, lengths):
+                    return self.temporal_encoder(src=src, static=None, times=times, lengths=lengths)
+
+                if self.training:
+                    temporal_embedding, _, _ = checkpoint.checkpoint(encoder_forward, src, times, lengths)
+                else:
+                    temporal_embedding, _, _ = self.temporal_encoder(src=src, static=None, times=times, lengths=lengths)
+
+                # Continue with static encoder and fusion (might need checkpointing too)
+                static_embedding = self.static_encoder(static_features)
+                fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
+
+                # Checkpoint the fusion MLP too if needed
+                def fusion_forward(fused_emb):
+                    return self.fusion_mlp(fused_emb)
+
+                if self.training:
+                    fused_rep = checkpoint.checkpoint(fusion_forward, fused_embedding)
+                else:
+                    fused_rep = self.fusion_mlp(fused_embedding)
                 logqp0 = 0
             else:
                 raise NotImplementedError(
@@ -2247,9 +2315,6 @@ class Hybrid_SDE(LightningModule):
 
             if self.debug:
                 print(f"Static features shape: {static_features.shape}")
-            static_embedding = self.static_encoder(static_features)
-            fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
-            fused_rep = self.fusion_mlp(fused_embedding)
 
             predicted_ode_latents_sigmoid = (
                 self.ode_latent_head(fused_rep)
@@ -2335,7 +2400,14 @@ class Hybrid_SDE(LightningModule):
         )
 
         decoded_traj = self.forward_dec(latent_traj)
-
+        try:
+            self._debug_predicted_traj = decoded_traj.detach().clone()
+            self._debug_true_traj = Y.detach().clone()
+            if self.debug:
+                print(f"[DEBUG] Stored trajectories in common_step")
+        except Exception as e:
+            if self.debug:
+                print(f"[WARN] Failed to store debug trajectories: {e}")
         # Mask for loss computation (already respects valid lengths)
         combined_mask = Y_mask
         if self.debug:

@@ -22,13 +22,12 @@ mkdir -p ../../results/model_checkpoints
 echo "Starting training with nohup..."
 nohup python ../models/hybrid_sde_main.py \
     --dataset_type mimic \
-    --use_encoder raindrop \
+    --use_encoder none \
     --num_samples 3 \
     --batch_size 32 \
     --seed 14 \
-    --max_epochs 5 \
+    --max_epochs 30 \
     --data_root '../../data/mimic_3_data/processed_data' \
-    --log_wandb True \
     --model_checkpoint True \
     --early_stopping True \
     --integration_step_size 0.1 \
@@ -39,7 +38,8 @@ nohup python ../models/hybrid_sde_main.py \
     --final_activation tanh \
     --run_eval \
     --learning_rate 0.001 \
-    --early_stopping_patience 1 \
+    --early_stopping_patience 10 \
+    --plot_outputs_train False \
     --test_zenker True \
     > ../../results/logs/training_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
