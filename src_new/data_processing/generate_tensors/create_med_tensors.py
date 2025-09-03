@@ -627,6 +627,43 @@ def create_time_grid(
     }
 
 
+def get_medications_at_t0(
+    events_full_patient: pd.DataFrame,
+    item_labels: List[str],
+    t0_time: pd.Timestamp,
+    rate_column: str = "rate/weight_normalized",
+) -> Dict[str, float]:
+    """
+    Get medications that are active at t0 and their rates.
+    
+    Args:
+        events_full_patient: Full patient medication data
+        item_labels: List of all medication labels
+        t0_time: The t0 timestamp
+        rate_column: Column name for rate values
+        
+    Returns:
+        Dictionary mapping medication labels to their rates at t0
+    """
+    medications_at_t0 = {}
+    
+    for item_label in item_labels:
+        # Find medications active at t0 (start_time <= t0 < end_time)
+        active_meds = events_full_patient[
+            (events_full_patient["item_label"] == item_label) &
+            (events_full_patient["start_time"] <= t0_time) &
+            (events_full_patient["end_time"] > t0_time)
+        ]
+        
+        if len(active_meds) > 0:
+            # Take the first active medication (should be only one)
+            rate_value = float(active_meds.iloc[0][rate_column])
+            if np.isfinite(rate_value) and rate_value > 0:
+                medications_at_t0[item_label] = rate_value
+    
+    return medications_at_t0
+
+
 def process_single_trajectory(
     traj_key: str,
     traj_info: Dict,
@@ -801,6 +838,14 @@ def create_med_tensors_from_parquet(
                 t0_time=t0_time,
                 rate_column="rate/weight_normalized",
             )
+            
+            # Get medications active at t0
+            medications_at_t0 = get_medications_at_t0(
+                events_full_patient=patient_full,
+                item_labels=unique_item_labels,
+                t0_time=t0_time,
+                rate_column="rate/weight_normalized",
+            )
 
             cfg = MedFeatureConfig()
             tau_seconds_per_med = build_tau_seconds_per_med(unique_item_labels, cfg)
@@ -843,6 +888,8 @@ def create_med_tensors_from_parquet(
                 "file_path": filepath,
                 "has_data": np.any(mask_array > 0),
                 "total_nonzero_values": int(np.sum(mask_array)),
+                "medications_at_t0": medications_at_t0,
+                "n_medications_at_t0": len(medications_at_t0),
             }
 
             saved_files.append(filepath)
@@ -879,6 +926,14 @@ def create_med_tensors_from_parquet(
         t0_time = traj_info["t0_time"]
         patient_full = df_full_loc[df_full_loc["hadm_id"] == hadm_id]
         pre_ctx = build_precontext_from_events(
+            events_full_patient=patient_full,
+            item_labels=item_labels_loc,
+            t0_time=t0_time,
+            rate_column="rate/weight_normalized",
+        )
+        
+        # Get medications active at t0
+        medications_at_t0 = get_medications_at_t0(
             events_full_patient=patient_full,
             item_labels=item_labels_loc,
             t0_time=t0_time,
@@ -922,6 +977,8 @@ def create_med_tensors_from_parquet(
             "file_path": filepath,
             "has_data": bool(np.any(mask_array > 0)),
             "total_nonzero_values": int(np.sum(mask_array)),
+            "medications_at_t0": medications_at_t0,
+            "n_medications_at_t0": len(medications_at_t0),
         }
         return traj_key, meta, feature_names
 
@@ -960,10 +1017,17 @@ def create_med_tensors_from_parquet(
         "med_feature_names": med_feature_names,
     }
 
+    # Create item_to_idx mapping for easy index-to-label conversion
+    item_labels_final = existing_metadata.get("item_labels", unique_item_labels) if isinstance(existing_metadata, dict) else unique_item_labels
+    item_to_idx = {item: idx for idx, item in enumerate(item_labels_final)}
+    idx_to_item = {idx: item for item, idx in item_to_idx.items()}
+    
     # Step 6: Save metadata (merge with existing)
     final_metadata = {
         "trajectories": trajectory_metadata,
-        "item_labels": existing_metadata.get("item_labels", unique_item_labels) if isinstance(existing_metadata, dict) else unique_item_labels,
+        "item_labels": item_labels_final,
+        "item_to_idx": item_to_idx,
+        "idx_to_item": idx_to_item,
         "n_intervals": n_intervals,
         "interval_seconds": interval_seconds,
         "total_trajectories": len(trajectories),
@@ -976,6 +1040,10 @@ def create_med_tensors_from_parquet(
         pickle.dump(final_metadata, f)
 
     # Step 7: Save summary statistics
+    # Calculate t0 medication statistics
+    t0_med_counts = [meta.get("n_medications_at_t0", 0) for meta in trajectory_metadata.values()]
+    trajectories_with_meds_at_t0 = sum(1 for count in t0_med_counts if count > 0)
+    
     summary_stats = {
         "total_trajectories": len(trajectories),
         "total_tensor_files": len(saved_files),
@@ -985,6 +1053,9 @@ def create_med_tensors_from_parquet(
         "time_grid_intervals": n_intervals,
         "interval_seconds": interval_seconds,
         "max_duration_hours": grid_params["max_duration"] / 3600.0,
+        "trajectories_with_medications_at_t0": trajectories_with_meds_at_t0,
+        "avg_medications_at_t0": np.mean(t0_med_counts) if t0_med_counts else 0.0,
+        "max_medications_at_t0": max(t0_med_counts) if t0_med_counts else 0,
     }
 
     print("\n=== Summary ===")
@@ -995,6 +1066,28 @@ def create_med_tensors_from_parquet(
     print(f"Metadata saved to: {metadata_file}")
 
     return final_metadata
+
+
+def get_medication_mappings(metadata: Dict) -> Tuple[Dict[str, int], Dict[int, str]]:
+    """
+    Extract medication label-to-index and index-to-label mappings from metadata.
+    
+    Args:
+        metadata: Metadata dictionary from med_tensors_metadata.pkl
+        
+    Returns:
+        Tuple of (item_to_idx, idx_to_item) mappings
+    """
+    item_to_idx = metadata.get("item_to_idx", {})
+    idx_to_item = metadata.get("idx_to_item", {})
+    
+    # Fallback: create from item_labels if mappings not present
+    if not item_to_idx and "item_labels" in metadata:
+        item_labels = metadata["item_labels"]
+        item_to_idx = {item: idx for idx, item in enumerate(item_labels)}
+        idx_to_item = {idx: item for item, idx in item_to_idx.items()}
+    
+    return item_to_idx, idx_to_item
 
 
 def load_and_inspect_tensor(tensor_path: str) -> None:
@@ -1028,8 +1121,8 @@ def load_and_inspect_tensor(tensor_path: str) -> None:
 # Example usage
 if __name__ == "__main__":
     # Example usage - adjust paths as needed
-    parquet_path = "mv_filtered_10min.parquet"
-    output_dir = "data/med_tensors_output"
+    parquet_path = "/n/netscratch/mzitnik_lab/Lab/rconci/BIOMM/numerics/mv_filtered.bin"
+    output_dir = "/n/netscratch/mzitnik_lab/Lab/rconci/BIOMM/processed_data/med_tensors_output"
 
     if os.path.exists(parquet_path):
         metadata = create_med_tensors_from_parquet(

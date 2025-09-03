@@ -11,6 +11,7 @@ from create_ic_targets import create_physiological_tensors
 
 # Local imports (modules live in the same directory)
 from create_med_tensors import create_med_tensors_from_parquet
+from consolidate_trajectory_metadata import consolidate_trajectory_metadata
 
 
 def _configure_logging(verbosity: int) -> None:
@@ -44,6 +45,7 @@ def generate_all_tensors(
     force_reload: bool = False,
     physio_workers: int = 6,
     context_workers: int = 6,
+    create_consolidated_metadata: bool = True,
 ) -> Dict[str, Any]:
     """Generate medication tensors, physiological IC/target tensors, and context tensors.
 
@@ -176,8 +178,32 @@ def generate_all_tensors(
             except Exception:
                 baseline_metadata_obj = None
 
+    # Optional: Create consolidated trajectory metadata
+    consolidated_metadata_path = base_output / "consolidated_trajectory_metadata.pkl"
+    consolidated_metadata_obj: Dict[str, Any] | None = None
+    
+    if create_consolidated_metadata:
+        if consolidated_metadata_path.exists() and not force_reload:
+            logging.info("Consolidated trajectory metadata already exists. Skipping (use --force-reload to regenerate).")
+            try:
+                with open(consolidated_metadata_path, "rb") as f:
+                    consolidated_metadata_obj = pickle.load(f)
+            except Exception:
+                consolidated_metadata_obj = None
+        else:
+            logging.info("Creating consolidated trajectory metadata...")
+            try:
+                consolidated_metadata_obj = consolidate_trajectory_metadata(
+                    med_metadata_path=str(med_metadata_path),
+                    physio_metadata_path=str(physio_metadata_path),
+                    med_data_path=med_parquet_path,
+                    output_path=str(consolidated_metadata_path),
+                )
+            except Exception as e:
+                logging.warning(f"Failed to create consolidated metadata: {e}")
+                consolidated_metadata_obj = None
+
     combined_metadata: Dict[str, Any] = {
-        "created_at": datetime.now().isoformat(),
         "inputs": {
             "waveforms_parquet_path": str(waveforms_parquet_path),
             "med_parquet_path": str(med_parquet_path),
@@ -205,6 +231,7 @@ def generate_all_tensors(
         "physio_metadata": physio_metadata,
         "context_metadata": context_metadata,
         "baseline_metadata": baseline_metadata_obj,
+        "consolidated_metadata": consolidated_metadata_obj,
     }
 
     # Persist a single top-level metadata artifact
@@ -298,6 +325,11 @@ def _parse_args() -> argparse.Namespace:
         help="Regenerate tensors even if outputs already exist.",
     )
     parser.add_argument(
+        "--no-consolidated-metadata",
+        action="store_true",
+        help="Skip creation of consolidated trajectory metadata.",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -324,6 +356,7 @@ def main() -> None:
         force_reload=args.force_reload,
         physio_workers=args.physio_workers,
         context_workers=args.context_workers,
+        create_consolidated_metadata=not args.no_consolidated_metadata,
     )
 
 

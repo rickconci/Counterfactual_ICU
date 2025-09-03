@@ -76,68 +76,6 @@ def load_waveforms_data(parquet_path: str, interval_seconds: int = 10) -> pd.Dat
     return df
 
 
-def align_waveforms_with_trajectories(
-    waveforms_df: pd.DataFrame, trajectories_metadata: Dict
-) -> Dict:
-    """
-    Align waveforms data with medication trajectories by hadm_id and time.
-
-    Args:
-        waveforms_df: Physiological waveforms dataframe
-        trajectories_metadata: Metadata from med tensors with trajectory info
-    """
-    print("Aligning waveforms with medication trajectories...")
-
-    aligned_trajectories = {}
-
-    # Get unique hadm_ids that have both med trajectories and waveform data
-    med_hadm_ids = set()
-    for traj_info in trajectories_metadata["trajectories"].values():
-        med_hadm_ids.add(traj_info["hadm_id"])
-
-    waveform_hadm_ids = set(waveforms_df["hadm_id"].unique())
-    common_hadm_ids = med_hadm_ids.intersection(waveform_hadm_ids)
-
-    print(f"Med trajectories: {len(med_hadm_ids)} patients")
-    print(f"Waveform data: {len(waveform_hadm_ids)} patients")
-    print(f"Common patients: {len(common_hadm_ids)} patients")
-
-    matched_count = 0
-
-    for traj_key, traj_info in tqdm(
-        trajectories_metadata["trajectories"].items(), desc="Matching trajectories"
-    ):
-        hadm_id = traj_info["hadm_id"]
-
-        if hadm_id not in common_hadm_ids:
-            continue
-
-        # Get waveform data for this patient
-        patient_waveforms = waveforms_df[waveforms_df["hadm_id"] == hadm_id].copy()
-
-        if len(patient_waveforms) == 0:
-            continue
-
-        # Find waveform data within the trajectory time window
-        t0_time = pd.to_datetime(traj_info["t0_time"])
-        trajectory_end_time = pd.to_datetime(traj_info["trajectory_end_time"])
-
-        # Get waveforms within trajectory window
-        trajectory_waveforms = patient_waveforms[
-            (patient_waveforms["absolute_timestamp"] >= t0_time)
-            & (patient_waveforms["absolute_timestamp"] < trajectory_end_time)
-        ].copy()
-
-        if len(trajectory_waveforms) > 0:
-            aligned_trajectories[traj_key] = {
-                **traj_info,  # Include all original trajectory info
-                "waveform_data": trajectory_waveforms,
-            }
-            matched_count += 1
-
-    print(f"Successfully matched {matched_count} trajectories with waveform data")
-    return aligned_trajectories
-
 
 def create_ic_tensor(
     traj_key: str, traj_info: Dict
@@ -505,6 +443,9 @@ def create_physiological_tensors(
             ic_metadata[traj_key] = ic_meta
             pred_metadata[traj_key] = pred_meta
 
+    # Calculate total trajectories that were attempted (processed + skipped)
+    total_trajectories_attempted = len(ic_metadata) + skipped_trajectories
+    
     # Save metadata
     physio_metadata = {
         "ic_tensors": ic_metadata,
@@ -514,12 +455,12 @@ def create_physiological_tensors(
         "timestamps_aligned_to_grid": True,
         "exact_t0_match_required": True,
         "nan_values_rejected": True,
-        "total_trajectories": len(aligned_trajectories),
+        "total_trajectories": total_trajectories_attempted,
         "created_at": datetime.now().isoformat(),
         "source_waveforms": waveforms_parquet_path,
         "source_med_metadata": med_tensors_metadata_path,
         "total_trajectories_processed": len(ic_metadata),
-        "total_trajectories_aligned": len(aligned_trajectories),
+        "total_trajectories_aligned": total_trajectories_attempted,
         "skipped_trajectories": skipped_trajectories,
     }
 
@@ -534,7 +475,7 @@ def create_physiological_tensors(
     print(f"Total trajectories aligned: {len(ic_metadata) + skipped_trajectories}")
     print(f"Trajectories with exact t0 match: {len(ic_metadata)}")
     print(f"Trajectories skipped (no exact t0): {skipped_trajectories}")
-    print(f"Success rate: {len(ic_metadata) / len(aligned_trajectories) * 100:.1f}%")
+    print(f"Success rate: {len(ic_metadata) / total_trajectories_attempted * 100:.1f}%")
 
     # IC statistics
     ic_with_abp = sum(1 for meta in ic_metadata.values() if meta["has_abp_mean"])
