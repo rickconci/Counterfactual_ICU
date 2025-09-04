@@ -621,7 +621,7 @@ class Hybrid_SDE(LightningModule):
         # check baroreflex sensitivity
         self.physio_ranges = {
             "p_a": (40, 180.0),
-            "p_v": (0.0, 30),
+            "p_v": (0.0, 39),
             "s_reflex": (0, 1),
             "sv": (40.0, 120.0),
             "r_tpr_mod": (-1.0, 1.0),
@@ -1920,7 +1920,7 @@ class Hybrid_SDE(LightningModule):
         )
 
         pa = torch.clamp(output_traj[..., 0], min=40.0, max=180)
-        pv = torch.clamp(output_traj[..., 1], min=0, max=30)
+        pv = torch.clamp(output_traj[..., 1], min=0, max=39)
 
         output_traj = torch.stack([pa, pv], dim=-1)
 
@@ -2442,6 +2442,15 @@ class Hybrid_SDE(LightningModule):
                     u_mean = u.mean(1)  # [B,T,D]
                     du = u_mean[:, 1:, :] - u_mean[:, :-1, :]
                     tv_loss = (du**2).mean()
+                    if hasattr(self, 'use_control_tv_loss') and self.use_control_tv_loss:
+                        try:
+                            # tv_loss should be available from the computation above
+                            self.log("train_tv_loss", tv_loss.detach(), on_step=True, on_epoch=True, prog_bar=False,
+                                     logger=True)
+                            self.log("train_tv_contribution", self.control_tv_weight * tv_loss.detach(), on_step=True,
+                                     on_epoch=True, prog_bar=False, logger=True)
+                        except:
+                            pass
                     total_loss = total_loss + self.control_tv_weight * tv_loss
             except Exception:
                 pass

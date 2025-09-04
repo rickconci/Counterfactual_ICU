@@ -56,7 +56,7 @@ class ZenkerODE:
 
         # Define physiological ranges for clamping (min, max)
         self.physio_ranges = {
-            "p_a": (40.0, 220.0),  # Arterial pressure (mmHg)
+            "p_a": (40.0, 180.0),  # Arterial pressure (mmHg)
             "p_v": (0.0, 39.0),  # Venous pressure (mmHg)
             "s_reflex": (0.0, 1.0),  # Reflex state (normalized)
             "sv": (20.0, 150.0),  # Stroke volume (ml)
