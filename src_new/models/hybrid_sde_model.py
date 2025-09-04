@@ -30,6 +30,9 @@ from src_new.utils.utils_beta import (
     MLPSimple,
     _stable_division,
     select_tensor_by_index_list_advanced,
+    activate_auto_debug_mode,
+    check_for_nan_inf,
+    fail_on_nan_inf,
 )
 
 # <<< Global DEBUG flag for model_beta.py, to be set by instance >>>
@@ -3142,6 +3145,7 @@ class Hybrid_SDE(LightningModule):
                     predictions_full[patient_idx].detach().cpu().numpy()
                 )  # [S,T,C]
                 max_overlays = min(samples_np.shape[0], 6)
+                print(f"[DEBUG] Drawing {max_overlays} arterial sample overlays for patient {patient_idx}")
                 for s_idx in range(max_overlays):
                     sample_line = samples_np[s_idx, :, 0].copy()
                     sample_line[~arterial_mask] = np.nan
@@ -3149,9 +3153,10 @@ class Hybrid_SDE(LightningModule):
                         time_seconds,
                         sample_line,
                         color=colors["arterial_pred"],
-                        linewidth=0.8,
+                        linewidth=1.2,
                         linestyle="-",
-                        alpha=0.35,
+                        alpha=0.6,
+                        label="Sample traces" if s_idx == 0 else "",
                     )
 
             venous_true = true_patient[:, 1].copy()
@@ -3192,6 +3197,7 @@ class Hybrid_SDE(LightningModule):
                     predictions_full[patient_idx].detach().cpu().numpy()
                 )  # [S,T,C]
                 max_overlays = min(samples_np.shape[0], 6)
+                print(f"[DEBUG] Drawing {max_overlays} venous sample overlays for patient {patient_idx}")
                 for s_idx in range(max_overlays):
                     sample_line = samples_np[s_idx, :, 1].copy()
                     sample_line[~venous_mask] = np.nan
@@ -3199,9 +3205,10 @@ class Hybrid_SDE(LightningModule):
                         time_seconds,
                         sample_line,
                         color=colors["venous_pred"],
-                        linewidth=0.8,
+                        linewidth=1.2,
                         linestyle="-",
-                        alpha=0.35,
+                        alpha=0.6,
+                        label="Sample traces" if s_idx == 0 else "",
                     )
 
             ax1.set_xlim(0, 1200)
@@ -3258,13 +3265,15 @@ class Hybrid_SDE(LightningModule):
                         .cpu()
                         .numpy()
                     )  # [S, T]
-                    for s_idx in range(min(sample_controls.shape[0], 6)):
+                    max_control_overlays = min(sample_controls.shape[0], 6)
+                    print(f"[DEBUG] Drawing {max_control_overlays} control {control_idx} sample overlays for patient {patient_idx}")
+                    for s_idx in range(max_control_overlays):
                         axc.plot(
                             time_seconds,
                             sample_controls[s_idx],
                             color=color,
-                            linewidth=0.8,
-                            alpha=0.35,
+                            linewidth=1.0,
+                            alpha=0.5,
                         )
                 axc.plot(
                     time_seconds,
@@ -3316,14 +3325,15 @@ class Hybrid_SDE(LightningModule):
                 )
                 # Overlay a few sample derivative traces for visibility
                 max_overlays = min(sample_derivs.shape[0], 6)
+                print(f"[DEBUG] Drawing {max_overlays} derivative sample overlays for control {control_idx}, patient {patient_idx}")
                 for s_idx in range(max_overlays):
                     axd.plot(
                         time_seconds,
                         sample_derivs[s_idx],
                         color=color,
-                        linewidth=0.7,
+                        linewidth=0.9,
                         linestyle="-",
-                        alpha=0.3,
+                        alpha=0.4,
                     )
                 axd.set_ylabel(f"dCtrl {control_idx + 1}/dt")
                 axd.grid(True, alpha=0.2)

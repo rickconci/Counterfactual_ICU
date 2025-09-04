@@ -584,6 +584,139 @@ class GaussianNLLLoss(torch.nn.modules.loss._Loss):
         )
 
 
+def activate_auto_debug_mode(model_instance, location: str, tensor_name: str, tensor_value=None):
+    """Activate global debug mode and log comprehensive state information."""
+    # Set debug flags
+    model_instance.debug = True
+    
+    print("\n" + "="*80)
+    print("🚨 AUTO-DEBUG MODE ACTIVATED 🚨")
+    print("="*80)
+    print(f"Location: {location}")
+    print(f"Tensor: {tensor_name}")
+    print(f"Global step: {getattr(model_instance, 'global_step', 'unknown')}")
+    print(f"Current epoch: {getattr(model_instance, 'current_epoch', 'unknown')}")
+    print("="*80)
+    
+    # Log tensor statistics if provided
+    if tensor_value is not None:
+        try:
+            print(f"Tensor shape: {tensor_value.shape}")
+            print(f"Tensor dtype: {tensor_value.dtype}")
+            print(f"Tensor device: {tensor_value.device}")
+            print(f"NaN count: {torch.isnan(tensor_value).sum().item()}")
+            print(f"Inf count: {torch.isinf(tensor_value).sum().item()}")
+            print(f"Min value: {tensor_value.min().item()}")
+            print(f"Max value: {tensor_value.max().item()}")
+            print(f"Mean value: {tensor_value.mean().item()}")
+            print(f"Std value: {tensor_value.std().item()}")
+        except Exception as e:
+            print(f"Could not log tensor stats: {e}")
+    
+    # Log model state
+    try:
+        print("\nModel State:")
+        print(f"  use_encoder: {model_instance.use_encoder}")
+        print(f"  normalise_for_SDENN: {model_instance.normalise_for_SDENN}")
+        print(f"  controller_type: {model_instance.controller_type}")
+        print(f"  SDE_control_weighting: {model_instance.SDE_control_weighting}")
+        print(f"  learning_rate: {model_instance.learning_rate}")
+        print(f"  SDEnet_out_dims: {model_instance.SDEnet_out_dims}")
+        print(f"  expert_latent_dims: {model_instance.expert_latent_dims}")
+        print(f"  num_samples: {model_instance.num_samples}")
+        print(f"  integration_step_size: {model_instance.integration_step_size}")
+        print(f"  integration_method: {model_instance.integration_method}")
+    except Exception as e:
+        print(f"Could not log model state: {e}")
+    
+    # Log parameter statistics
+    try:
+        print("\nParameter Statistics:")
+        total_params = 0
+        for name, param in model_instance.named_parameters():
+            if param is not None:
+                total_params += param.numel()
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    print(f"  ❌ {name}: {param.shape} - CONTAINS NaN/Inf!")
+                else:
+                    print(f"  ✅ {name}: {param.shape} - OK")
+        print(f"  Total parameters: {total_params:,}")
+    except Exception as e:
+        print(f"Could not log parameter stats: {e}")
+    
+    print("="*80 + "\n")
+    
+    # Set breakpoint for debugging
+    import pdb; pdb.set_trace()
+
+
+def check_for_nan_inf(tensor, name: str, location: str, model_instance=None, raise_error: bool = True):
+    """
+    Comprehensive NaN/Inf detection with detailed logging.
+    
+    Args:
+        tensor: Tensor to check
+        name: Name of the tensor for logging
+        location: Location where the check is performed
+        model_instance: Model instance for context
+        raise_error: Whether to raise an error on NaN/Inf detection
+    """
+    if tensor is None:
+        return False
+        
+    has_nan = torch.isnan(tensor).any()
+    has_inf = torch.isinf(tensor).any()
+    
+    if has_nan or has_inf:
+        print(f"\n🚨 NaN/Inf detected in {name} at {location}")
+        print(f"  Shape: {tensor.shape}")
+        print(f"  Dtype: {tensor.dtype}")
+        print(f"  Device: {tensor.device}")
+        print(f"  NaN count: {torch.isnan(tensor).sum().item()}")
+        print(f"  Inf count: {torch.isinf(tensor).sum().item()}")
+        
+        if has_nan:
+            nan_indices = torch.isnan(tensor).nonzero()
+            print(f"  NaN indices (first 10): {nan_indices[:10]}")
+            
+        if has_inf:
+            inf_indices = torch.isinf(tensor).nonzero()
+            print(f"  Inf indices (first 10): {inf_indices[:10]}")
+            
+        if model_instance is not None:
+            activate_auto_debug_mode(model_instance, location, name, tensor)
+            
+        if raise_error:
+            raise RuntimeError(f"NaN/Inf detected in {name} at {location}")
+            
+    return has_nan or has_inf
+
+
+def fail_on_nan_inf(param, name: str, location: str, model_instance=None):
+    """
+    Fail fast on NaN/Inf values with comprehensive debugging.
+    
+    Args:
+        param: Parameter tensor to check
+        name: Name of the parameter
+        location: Location where check occurs
+        model_instance: Model instance for context
+    """
+    if param is None:
+        return
+        
+    has_nan = torch.isnan(param).any()
+    has_inf = torch.isinf(param).any()
+    
+    if has_nan or has_inf:
+        print(f"[ERROR] NaN/Inf weights in {name}! FAILING FAST - NO SANITIZATION!")
+        
+        if model_instance is not None:
+            activate_auto_debug_mode(model_instance, location, name, param)
+            
+        raise RuntimeError(f"NaN/Inf detected in {name} at {location}. Failing fast for debugging.")
+
+
 def print_model_details(model, indent=0):
     for name, module in model.named_children():
         num_params = sum(p.numel() for p in module.parameters())
