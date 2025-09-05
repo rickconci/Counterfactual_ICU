@@ -471,7 +471,7 @@ class Hybrid_SDE(LightningModule):
         self.med_proj = nn.LazyLinear(self.med_embed_dim)
 
         if self.use_encoder != "none":
-            self.ic_consistency_weight = 0.1
+            self.ic_consistency_weight = 10
             # add fixed med embedding dims
             net_input_dims = net_input_dims + self.med_embed_dim
         else:
@@ -1170,7 +1170,7 @@ class Hybrid_SDE(LightningModule):
         else:
             # Apply per-head scales and global weighting
             current_scales = self.get_adaptive_control_scales(self.global_step)
-            scaled_output = (SDE_NN_output_latents) * self.SDE_control_weighting # * current_scales.to(SDE_NN_output_latents.device)
+            scaled_output = (SDE_NN_output_latents) * self.SDE_control_weighting * current_scales.to(SDE_NN_output_latents.device)
         if torch.isnan(scaled_output).any() or torch.isinf(scaled_output).any():
             activate_auto_debug_mode(self, "apply_SDE_fun (MLP path)", "scaled_output", scaled_output)
             raise RuntimeError("Non-finite values in scaled_output. Auto-debug mode activated.")
@@ -1327,66 +1327,10 @@ class Hybrid_SDE(LightningModule):
             self.device
         )
 
-        # Construct the output in the correct order to match the state vector y
-        # The order should be: i_ext (2), expert_latents (14), neural_embedding (4)
-        # Total: 20 dimensions
-
-        # For i_ext
-        dt_i_ext = torch.cat(
-            [
-                dt_i_ext_SDE_dict[f"dt_i_ext_SDE_{i+1}"]
-                for i in range(self.SDEnet_out_dims)
-            ],
-            dim=-1,
-        )
-        # Apply 10% control authority to specific parameter values
-
-        y_controlled = y_clamped.clone()
-        convergence_rate = 1
-
-        control_param_mapping = {
-            0: 1,  # Control 1 → p_v (index 1)
-            1: 3,  # Control 2 → sv (index 3)
-            2: 9,  # Control 3 → c_a (index 9)
-            3: 4,  # Control 4 → r_tpr_mod (index 4)
-        }
-
-        for control_idx in range(self.SDEnet_out_dims):
-            if control_idx in control_param_mapping:
-                param_idx = control_param_mapping[control_idx]
-                param_min = self.physio_min_vals[param_idx].item()
-                param_max = self.physio_max_vals[param_idx].item()
-
-                full_param_idx = self.SDEnet_out_dims + param_idx
-                param_current = y_controlled[:, full_param_idx:full_param_idx + 1]
-
-                # Use 10% adjustment range around current value instead of full physiological range
-                adjustment_range = 0.1 * (param_max - param_min)
-                target_value = param_current + dt_i_ext_SDE_dict[f"dt_i_ext_SDE_{control_idx + 1}"] * adjustment_range
-
-                # Move toward target with decay (prevents accumulation)
-                param_new = param_current + convergence_rate * (target_value - param_current)
-
-                y_controlled[:, full_param_idx:full_param_idx + 1] = param_new
-
-        # Clamp the adjusted values again
-        y_controlled = torch.cat(
-            [
-                y_controlled[:, : self.SDEnet_out_dims],  # Keep i_ext unchanged
-                torch.clamp(
-                    y_controlled[:, self.SDEnet_out_dims: self.SDEnet_out_dims + self.expert_latent_dims],
-                    min=self.physio_min_vals,
-                    max=self.physio_max_vals,
-                ),  # Clamp controlled physio vars
-                y_controlled[:, self.SDEnet_out_dims + self.expert_latent_dims:],  # Keep neural embedding unchanged
-            ],
-            dim=1,
-        )
-
 
         # compute the expert latents from
         # Pass only the expert slice to ensure indexing aligns with Zenker state order
-        expert_slice = y_controlled[
+        expert_slice = y_clamped[
             :, self.SDEnet_out_dims : self.SDEnet_out_dims + self.expert_latent_dims
         ]
         (
@@ -1427,10 +1371,10 @@ class Hybrid_SDE(LightningModule):
                     pass
 
         # apply model-specific transformations on Zenker model output using control DERIVATIVES
-        dpv_dt = dpv_dt #+ dt_i_ext_SDE_dict["dt_i_ext_SDE_1"]
-        dsv_dt = dsv_dt #+ dt_i_ext_SDE_dict["dt_i_ext_SDE_2"]
-        dt_ca = dt_ca #+ dt_i_ext_SDE_dict["dt_i_ext_SDE_3"]
-        dt_r_tpr_mod = dt_r_tpr_mod #+ dt_i_ext_SDE_dict["dt_i_ext_SDE_4"]
+        dpv_dt = dpv_dt + dt_i_ext_SDE_dict["dt_i_ext_SDE_1"]
+        dsv_dt = dsv_dt + dt_i_ext_SDE_dict["dt_i_ext_SDE_2"]
+        dt_ca = dt_ca + dt_i_ext_SDE_dict["dt_i_ext_SDE_3"]
+        dt_r_tpr_mod = dt_r_tpr_mod + dt_i_ext_SDE_dict["dt_i_ext_SDE_4"]
 
         if self.debug:
             t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
