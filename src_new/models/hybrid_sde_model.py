@@ -1360,13 +1360,6 @@ class Hybrid_SDE(LightningModule):
                 full_param_idx = self.SDEnet_out_dims + param_idx
                 param_current = y_controlled[:, full_param_idx:full_param_idx + 1]
 
-                if t.item() < 0.1:
-                    param_current = y_controlled[:, full_param_idx:full_param_idx + 1]
-                    print(f"Control {control_idx} -> param_idx {param_idx} -> full_param_idx {full_param_idx}")
-                    print(f"  y_controlled shape: {y_controlled.shape}")
-                    print(f"  param_current: {param_current[0].item():.6f}")
-                    print(f"  Expected from z1_for_sde index {param_idx}: should be one of the values you saw in z1_for_sde")
-
                 # Use 10% adjustment range around current value instead of full physiological range
                 adjustment_range = 0.1 * (param_max - param_min)
                 target_value = param_current + dt_i_ext_SDE_dict[f"dt_i_ext_SDE_{control_idx + 1}"] * adjustment_range
@@ -2383,11 +2376,24 @@ class Hybrid_SDE(LightningModule):
             if self.debug:
                 print(f"Static features shape: {static_features.shape}")
 
-            predicted_ode_latents_sigmoid = (
-                self.ode_latent_head(fused_rep)
-                .unsqueeze(1)
-                .repeat(1, self.num_samples, 1)
-            )
+            # In common_step, after computing fused_rep:
+            def ode_head_forward(fused_input):
+                return self.ode_latent_head(fused_input)
+
+            def neural_head_forward(fused_input):
+                return self.neural_embedding_head(fused_input)
+
+            if self.training:
+                predicted_ode_latents_sigmoid = checkpoint.checkpoint(ode_head_forward, fused_rep).unsqueeze(1).repeat(
+                    1, self.num_samples, 1)
+                neural_embedding = checkpoint.checkpoint(neural_head_forward, fused_rep).unsqueeze(1).repeat(1,
+                                                                                                             self.num_samples,
+                                                                                                             1)
+            else:
+                predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples,
+                                                                                                    1)
+                neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+
             predicted_ode_latents = self.transform_sigmoid_to_physiological_ranges(
                 predicted_ode_latents_sigmoid
             )
@@ -2428,11 +2434,7 @@ class Hybrid_SDE(LightningModule):
                     )
                 except Exception as e:
                     print(f"[WARN] IC debug stats failed: {e}")
-            neural_embedding = (
-                self.neural_embedding_head(fused_rep)
-                .unsqueeze(1)
-                .repeat(1, self.num_samples, 1)
-            )
+
             z1_for_sde = self._prepare_sde_initial_state(
                 predicted_ode_latents, neural_embedding, init_states, ic_mask
             )
