@@ -171,7 +171,7 @@ def build_values_mask_from_events(
     t0_time: pd.Timestamp,
     trajectory_end_time: pd.Timestamp,
     grid: TrajectoryGrid,
-    rate_column: str = "rate/weight_normalized",
+    rate_column: str = "rate_norm",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build [T, M] values and mask arrays from raw medication event rows.
@@ -337,113 +337,23 @@ def load_medication_data(parquet_path: str) -> pd.DataFrame:
 
     Attempts parquet first (regardless of file extension), then falls back to
     pandas pickle, raw pickle, and a safe torch.load probe. Normalizes schema
-    to include a 'rate/weight_normalized' column by mapping from common
+    to include a 'rate_norm' column by mapping from common
     alternatives when needed.
     """
     print(f"Loading medication data from {parquet_path}...")
 
-    df: t.Optional[pd.DataFrame] = None
-    loaders_tried: List[str] = []
-
-    # Always try parquet first; many .bin files are parquet saved with a custom extension
-    try:
-        df = pd.read_parquet(parquet_path)
-    except Exception as e_parquet:
-        loaders_tried.append(f"parquet:{e_parquet}")
-        # Try pandas' pickle reader
-        try:
-            df = pd.read_pickle(parquet_path)
-        except Exception as e_pd_pickle:
-            loaders_tried.append(f"pd.read_pickle:{e_pd_pickle}")
-            # Try raw pickle.load
-            try:
-                with open(parquet_path, "rb") as f:
-                    obj = pickle.load(f)
-                if isinstance(obj, pd.DataFrame):
-                    df = obj
-                else:
-                    raise TypeError("pickled object was not a pandas DataFrame")
-            except Exception as e_raw_pickle:
-                loaders_tried.append(f"pickle.load:{e_raw_pickle}")
-                # Try a lightweight torch.load probe (in case the file was saved via torch)
-                try:
-                    import torch as _torch
-
-                    obj = _torch.load(parquet_path, map_location="cpu")
-                    if isinstance(obj, pd.DataFrame):
-                        df = obj
-                    elif (
-                        isinstance(obj, dict)
-                        and "data" in obj
-                        and isinstance(obj["data"], pd.DataFrame)
-                    ):
-                        df = obj["data"]
-                    else:
-                        raise TypeError("torch file did not contain a pandas DataFrame")
-                except Exception as e_torch:
-                    loaders_tried.append(f"torch.load:{e_torch}")
-
+    df = pd.read_parquet(parquet_path)
     if df is None:
         raise ValueError(
-            f"Failed to load medication data from {parquet_path}. Tried: {loaders_tried}"
+            f"Failed to load medication data from {parquet_path}."
         )
 
     # Normalize column names where possible (map common variants to canonical)
     cols_lower_map = {c.lower(): c for c in df.columns}
 
-    def _ensure_column(
-        df_in: pd.DataFrame, canonical: str, candidates: List[str]
-    ) -> None:
-        for cand in candidates:
-            cand_lower = cand.lower()
-            if cand_lower in cols_lower_map:
-                src = cols_lower_map[cand_lower]
-                if src != canonical and canonical not in df_in.columns:
-                    df_in.rename(columns={src: canonical}, inplace=True)
-                return
-
-    _ensure_column(df, "hadm_id", ["hadm_id", "HADM_ID"])
-    _ensure_column(df, "start_time", ["start_time", "START_TIME", "STARTTIME"])
-    _ensure_column(df, "end_time", ["end_time", "END_TIME", "ENDTIME"])
-    _ensure_column(df, "item_label", ["item_label", "ITEM_LABEL"])
-
-    # Normalize rate column -> create 'rate/weight_normalized' if missing
-    rate_canonical = "rate/weight_normalized"
-    if rate_canonical not in df.columns:
-        # Candidates: common variants and fuzzy contains('rate') & contains('weight')
-        candidate_order = [
-            "rate_weight_normalized",
-            "rate_per_kg",
-            "rate_per_weight",
-            "rate/weight",
-            "rate",
-            "RATE",
-        ]
-        picked_src: t.Optional[str] = None
-
-        for cand in candidate_order:
-            if cand in df.columns:
-                picked_src = cand
-                break
-            if cand.lower() in cols_lower_map:
-                picked_src = cols_lower_map[cand.lower()]
-                break
-
-        if picked_src is None:
-            # Fuzzy search: any col name containing both 'rate' and 'weight'
-            fuzzy = [
-                c for c in df.columns if ("rate" in c.lower() and "weight" in c.lower())
-            ]
-            if len(fuzzy) > 0:
-                picked_src = fuzzy[0]
-
-        if picked_src is not None:
-            df[rate_canonical] = pd.to_numeric(df[picked_src], errors="coerce")
-        else:
-            # As a last resort, if a plain 'rate' exists, use it
-            if "rate" in df.columns:
-                df[rate_canonical] = pd.to_numeric(df["rate"], errors="coerce")
-
+    # Normalize rate column -> create 'rate_norm' if missing
+    rate_canonical = "rate_norm"
+   
     # Validate required columns
     required_cols = ["hadm_id", "start_time", "end_time", "item_label", rate_canonical]
     missing_cols = [col for col in required_cols if col not in df.columns]
@@ -473,35 +383,7 @@ def load_medication_data(parquet_path: str) -> pd.DataFrame:
             df["end_time"] = df["end_time"].dt.tz_localize(None)
 
     print(f"Loaded {len(df)} medication events")
-    # Clean meds: remove Esmolol; cap each medication at mean + 4*std (per item)
-    if "item_label" in df.columns:
-        # Drop Esmolol (case-insensitive)
-        mask_esmo = df["item_label"].str.lower() == "esmolol"
-        if mask_esmo.any():
-            df = df.loc[~mask_esmo].copy()
-            print(f"Removed {int(mask_esmo.sum())} Esmolol rows")
-
-        # Ensure numeric
-        df[rate_canonical] = pd.to_numeric(df[rate_canonical], errors="coerce")
-
-        # Compute per-medication caps at mean + 4*std
-        stats = df.groupby("item_label")[rate_canonical].agg(["mean", "std"])
-        stats["cap"] = stats["mean"] + 4.0 * stats["std"]
-
-        # Merge caps and clip
-        df = df.merge(
-            stats["cap"].rename("___cap"),
-            left_on="item_label",
-            right_index=True,
-            how="left",
-        )
-        before = df[rate_canonical]
-        df[rate_canonical] = before.clip(lower=0.0, upper=df["___cap"])
-        num_clipped = int((before > df["___cap"]).sum())
-        df.drop(columns=["___cap"], inplace=True)
-        if num_clipped > 0:
-            print(f"Capped {num_clipped} medication rows at mean+4*std per item_label")
-
+    
     df_triggers = df.dropna(subset=["action_cluster_id"])
     return df, df_triggers
 
@@ -631,7 +513,7 @@ def get_medications_at_t0(
     events_full_patient: pd.DataFrame,
     item_labels: List[str],
     t0_time: pd.Timestamp,
-    rate_column: str = "rate/weight_normalized",
+    rate_column: str = "rate_norm",
 ) -> Dict[str, float]:
     """
     Get medications that are active at t0 and their rates.
@@ -690,7 +572,7 @@ def process_single_trajectory(
         t0_time=t0_time,
         trajectory_end_time=trajectory_end_time,
         grid=grid,
-        rate_column="rate/weight_normalized",
+        rate_column="rate_norm",
     )
     return values_array, mask_array
 
@@ -836,7 +718,7 @@ def create_med_tensors_from_parquet(
                 events_full_patient=patient_full,
                 item_labels=unique_item_labels,
                 t0_time=t0_time,
-                rate_column="rate/weight_normalized",
+                rate_column="rate_norm",
             )
             
             # Get medications active at t0
@@ -844,7 +726,7 @@ def create_med_tensors_from_parquet(
                 events_full_patient=patient_full,
                 item_labels=unique_item_labels,
                 t0_time=t0_time,
-                rate_column="rate/weight_normalized",
+                rate_column="rate_norm",
             )
 
             cfg = MedFeatureConfig()
@@ -929,7 +811,7 @@ def create_med_tensors_from_parquet(
             events_full_patient=patient_full,
             item_labels=item_labels_loc,
             t0_time=t0_time,
-            rate_column="rate/weight_normalized",
+            rate_column="rate_norm",
         )
         
         # Get medications active at t0
@@ -937,7 +819,7 @@ def create_med_tensors_from_parquet(
             events_full_patient=patient_full,
             item_labels=item_labels_loc,
             t0_time=t0_time,
-            rate_column="rate/weight_normalized",
+            rate_column="rate_norm",
         )
 
         tau_seconds_per_med = build_tau_seconds_per_med(item_labels_loc, cfg_loc)

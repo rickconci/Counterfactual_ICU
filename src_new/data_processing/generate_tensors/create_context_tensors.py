@@ -232,7 +232,7 @@ def load_medication_data(parquet_path: str) -> pd.DataFrame:
 
     Attempts parquet first (regardless of file extension), then falls back to
     pandas pickle, raw pickle, and a safe torch.load probe. Normalizes schema
-    to include a 'rate/weight_normalized' column by mapping from common
+    to include a 'rate_norm' column by mapping from common
     alternatives when needed.
     """
     print(f"Loading medication data from {parquet_path}...")
@@ -302,8 +302,8 @@ def load_medication_data(parquet_path: str) -> pd.DataFrame:
     _ensure_column(df, "end_time", ["end_time", "END_TIME", "ENDTIME"])
     _ensure_column(df, "item_label", ["item_label", "ITEM_LABEL"])
 
-    # Normalize rate column -> create 'rate/weight_normalized' if missing
-    rate_canonical = "rate/weight_normalized"
+    # Normalize rate column -> create 'rate_norm' if missing
+    rate_canonical = "rate_norm"
     if rate_canonical not in df.columns:
         # Candidates: common variants and fuzzy contains('rate') & contains('weight')
         candidate_order = [
@@ -368,35 +368,7 @@ def load_medication_data(parquet_path: str) -> pd.DataFrame:
             df["end_time"] = df["end_time"].dt.tz_localize(None)
 
     print(f"Loaded {len(df)} medication events")
-    # Clean meds: remove Esmolol; cap each medication at mean + 4*std (per item)
-    if "item_label" in df.columns:
-        # Drop Esmolol (case-insensitive)
-        mask_esmo = df["item_label"].str.lower() == "esmolol"
-        if mask_esmo.any():
-            df = df.loc[~mask_esmo].copy()
-            print(f"Removed {int(mask_esmo.sum())} Esmolol rows")
-
-        # Ensure numeric
-        df[rate_canonical] = pd.to_numeric(df[rate_canonical], errors="coerce")
-
-        # Compute per-medication caps at mean + 4*std
-        stats = df.groupby("item_label")[rate_canonical].agg(["mean", "std"])
-        stats["cap"] = stats["mean"] + 4.0 * stats["std"]
-
-        # Merge caps and clip
-        df = df.merge(
-            stats["cap"].rename("___cap"),
-            left_on="item_label",
-            right_index=True,
-            how="left",
-        )
-        before = df[rate_canonical]
-        df[rate_canonical] = before.clip(lower=0.0, upper=df["___cap"])
-        num_clipped = int((before > df["___cap"]).sum())
-        df.drop(columns=["___cap"], inplace=True)
-        if num_clipped > 0:
-            print(f"Capped {num_clipped} medication rows at mean+4*std per item_label")
-
+   
     return df
 
 
@@ -606,7 +578,7 @@ def create_meds_context_tensor(
         last_idx_per_interval = masked_idx.max(axis=0)
 
         rates = (
-            pd.to_numeric(item_infusions["rate/weight_normalized"], errors="coerce")
+            pd.to_numeric(item_infusions["rate_norm"], errors="coerce")
             .fillna(0.0)
             .to_numpy(dtype=np.float32)
         )

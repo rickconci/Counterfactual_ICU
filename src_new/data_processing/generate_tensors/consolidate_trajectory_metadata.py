@@ -14,7 +14,7 @@ import pickle
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
+import os
 import pandas as pd
 
 
@@ -53,13 +53,15 @@ def extract_trigger_medications(
     
     for traj_key, traj_info in med_metadata["trajectories"].items():
         hadm_id = traj_info["hadm_id"]
-        t0_time = pd.to_datetime(traj_info["t0_time"])
+        action_cluster_id = traj_info["action_cluster_id"]
         
-        # Find medications that triggered this trajectory
-        patient_data = df_full[df_full["hadm_id"] == hadm_id]
-        trigger_meds = patient_data[
-            (patient_data["trigger"] == True) & 
-            (patient_data["start_time"] == t0_time)
+        # Find the specific trigger event(s) for this trajectory by filtering
+        # on both the patient ID and the specific action cluster ID. This is
+        # the most robust way to isolate the trigger.
+        trigger_meds = df_full[
+            (df_full["hadm_id"] == hadm_id) & 
+            (df_full["action_cluster_id"] == action_cluster_id) &
+            (df_full["trigger"] == True)
         ]
         
         # Get the medication labels for these triggers
