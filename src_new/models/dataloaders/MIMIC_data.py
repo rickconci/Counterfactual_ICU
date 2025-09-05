@@ -224,47 +224,28 @@ class MIMICDataset(Dataset):
         # static_feats = torch.zeros(10)
         static_feats = torch.load(baseline_path)
 
-        # Load main trajectory med tensor from memory cache (already normalized)
-        if traj_key in self.med_tensors_cache:
-            loaded = self.med_tensors_cache[traj_key]
-            # Backward/forward compatible unpacking (optionally includes med_context)
-            if len(loaded) == 6:
-                (
-                    med_traj_values,
-                    med_traj_mask,
-                    med_traj_time_sec,
-                    med_traj_time_hr,
-                    _n_intervals,
-                    med_tensors,
-                ) = loaded
-            else:
-                med_traj_values, med_traj_mask, med_traj_time_sec, med_traj_time_hr, _ = loaded
-                # Create a placeholder med_context (zeros) if not present
-                med_tensors = torch.zeros(
-                    med_traj_values.shape[0], med_traj_values.shape[1] * 2
-                )
+
+        # Fallback: load from disk if not in cache
+        med_traj_path = os.path.join(self.m_tensor_dir, f"med_tensor_{traj_key}.pt")
+        if not os.path.exists(med_traj_path):
+            raise FileNotFoundError(f"Med trajectory tensor not found: {med_traj_path}")
+        loaded = torch.load(med_traj_path)
+        # Backward/forward compatible unpacking (optionally includes med_context)
+        if len(loaded) == 6:
+            (
+                med_traj_values,
+                med_traj_mask,
+                med_traj_time_sec,
+                med_traj_time_hr,
+                _n_intervals,
+                med_tensors,
+            ) = loaded
         else:
-            # Fallback: load from disk if not in cache
-            med_traj_path = os.path.join(self.m_tensor_dir, f"med_tensor_{traj_key}.pt")
-            if not os.path.exists(med_traj_path):
-                raise FileNotFoundError(f"Med trajectory tensor not found: {med_traj_path}")
-            loaded = torch.load(med_traj_path)
-            # Backward/forward compatible unpacking (optionally includes med_context)
-            if len(loaded) == 6:
-                (
-                    med_traj_values,
-                    med_traj_mask,
-                    med_traj_time_sec,
-                    med_traj_time_hr,
-                    _n_intervals,
-                    med_tensors,
-                ) = loaded
-            else:
-                med_traj_values, med_traj_mask, med_traj_time_sec, med_traj_time_hr, _ = loaded
-                # Create a placeholder med_context (zeros) if not present
-                med_tensors = torch.zeros(
-                    med_traj_values.shape[0], med_traj_values.shape[1] * 2
-                )
+            med_traj_values, med_traj_mask, med_traj_time_sec, med_traj_time_hr, _ = loaded
+            # Create a placeholder med_context (zeros) if not present
+            med_tensors = torch.zeros(
+                med_traj_values.shape[0], med_traj_values.shape[1] * 2
+            )
 
 
         # Legacy meds context removed

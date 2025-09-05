@@ -1013,8 +1013,13 @@ class Hybrid_SDE(LightningModule):
         #med_safe = torch.nan_to_num(med_safe, nan=0.0, posinf=3.0, neginf=-3.0)  # Clean NaN/Inf first
         #med_safe = torch.clamp(med_safe, min=-3.0, max=3.0)
         # Project to fixed-size med embedding (LazyLinear infers input dim on first call)
-        med_embed = torch.tanh(self.med_proj(med_tensor))  # [B, med_embed_dim]
-        #med_embed = torch.zeros(batch_size, self.med_embed_dim, device=self.device)
+        def med_forward(med_input):
+            return torch.tanh(self.med_proj(med_input))
+
+        if self.training:
+            med_embed = checkpoint.checkpoint(med_forward, med_tensor)
+        else:
+            med_embed = torch.tanh(self.med_proj(med_tensor))
        
         if torch.isnan(med_tensor).any() or torch.isinf(med_tensor).any():
             activate_auto_debug_mode(self, "apply_SDE_fun", "med_context", med_tensor)
@@ -1365,10 +1370,6 @@ class Hybrid_SDE(LightningModule):
                 # Use 10% adjustment range around current value instead of full physiological range
                 adjustment_range = 0.1 * (param_max - param_min)
                 target_value = param_current + dt_i_ext_SDE_dict[f"dt_i_ext_SDE_{control_idx + 1}"] * adjustment_range
-
-                if t.item() < 0.1:
-                    target_raw = torch.tanh(dt_i_ext_SDE_dict[f"dt_i_ext_SDE_{control_idx + 1}"])
-                    print(f"  tanh(raw)={target_raw[0].item():.3f}, target={target_value[0].item():.3f}")
 
                 # Move toward target with decay (prevents accumulation)
                 param_new = param_current + convergence_rate * (target_value - param_current)
@@ -2355,7 +2356,14 @@ class Hybrid_SDE(LightningModule):
                     temporal_embedding, _, _ = self.temporal_encoder(src=src, static=None, times=times, lengths=lengths)
 
                 # Continue with static encoder and fusion (might need checkpointing too)
-                static_embedding = self.static_encoder(static_features)
+                def static_encoder_forward(static_feats):
+                    return self.static_encoder(static_feats)
+
+                if self.training:
+                    static_embedding = checkpoint.checkpoint(static_encoder_forward, static_features)
+                else:
+                    static_embedding = self.static_encoder(static_features)
+
                 fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
 
                 # Checkpoint the fusion MLP too if needed
