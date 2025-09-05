@@ -14,6 +14,80 @@ from tqdm import tqdm
 _WF_DF: Optional[pd.DataFrame] = None
 
 
+def _process_single_trajectory(args: Tuple[str, Dict, int, int, str, str, set]) -> Tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]], bool]:
+    """Worker function to process a single trajectory end-to-end."""
+    traj_key, traj_info, n_int, int_seconds, ic_dir_str, pred_dir_str, common_hadm_ids = args
+    # Filter waveform data for this trajectory using shared DataFrame
+    hadm_id = traj_info["hadm_id"]
+    
+    # Get common hadm_ids from the global waveform data
+    global _WF_DF
+    if _WF_DF is None:
+        return traj_key, None, None, True
+    
+    if hadm_id not in common_hadm_ids:  # quick skip
+        return traj_key, None, None, True
+
+    patient_waveforms = _WF_DF[_WF_DF["hadm_id"] == hadm_id].copy()
+    if len(patient_waveforms) == 0:
+        return traj_key, None, None, True
+
+    t0_time = pd.to_datetime(traj_info["t0_time"]).tz_localize("UTC")
+    trajectory_end_time = pd.to_datetime(traj_info["trajectory_end_time"]).tz_localize(
+        "UTC"
+    )
+    trajectory_waveforms = patient_waveforms[
+        (patient_waveforms["absolute_timestamp"] >= t0_time)
+        & (patient_waveforms["absolute_timestamp"] < trajectory_end_time)
+    ].copy()
+
+    if len(trajectory_waveforms) == 0:
+        return traj_key, None, None, True
+
+    # Build a local traj_info with waveform_data
+    local_traj_info = {**traj_info, "waveform_data": trajectory_waveforms}
+
+    ic_values, ic_mask = create_ic_tensor(traj_key, local_traj_info)
+    if not (ic_mask[0].item() or ic_mask[1].item()):
+        # skip saving if neither ABP nor CVP present at t0
+        return traj_key, None, None, True
+
+    ic_filepath = save_ic_tensor(traj_key, ic_values, ic_mask, Path(ic_dir_str))
+    pred_values, pred_mask = create_prediction_targets_tensor(
+        traj_key, local_traj_info, n_int, int_seconds
+    )
+    pred_filepath = save_prediction_targets_tensor(
+        traj_key, pred_values, pred_mask, n_int, int_seconds, Path(pred_dir_str)
+    )
+
+    ic_meta = {
+        "hadm_id": local_traj_info["hadm_id"],
+        "action_cluster_id": local_traj_info["action_cluster_id"],
+        "t0_time": local_traj_info["t0_time"],
+        "file_path": ic_filepath,
+        "has_abp_mean": bool(ic_mask[0].item()),
+        "has_cvp": bool(ic_mask[1].item()),
+        "abp_mean_value": float(ic_values[0].item()) if ic_mask[0] else None,
+        "cvp_value": float(ic_values[1].item()) if ic_mask[1] else None,
+    }
+
+    pred_meta = {
+        "hadm_id": local_traj_info["hadm_id"],
+        "action_cluster_id": local_traj_info["action_cluster_id"],
+        "t0_time": local_traj_info["t0_time"],
+        "trajectory_end_time": local_traj_info["trajectory_end_time"],
+        "duration_minutes": local_traj_info["duration_minutes"],
+        "file_path": pred_filepath,
+        "n_intervals": n_int,
+        "interval_seconds": int_seconds,
+        "total_abp_mean_measurements": int(torch.sum(pred_mask[:, 0] > 0).item()),
+        "total_cvp_measurements": int(torch.sum(pred_mask[:, 1] > 0).item()),
+        "timestamps_aligned": True,
+    }
+
+    return traj_key, ic_meta, pred_meta, False
+
+
 def load_waveforms_data(parquet_path: str, interval_seconds: int = 10) -> pd.DataFrame:
     """
     Load the combined_waveforms.cleaned.parquet file and align to 10-second grid.
@@ -33,14 +107,15 @@ def load_waveforms_data(parquet_path: str, interval_seconds: int = 10) -> pd.Dat
 
     # Check for required columns
     required_cols = ["hadm_id", "absolute_timestamp"]
-    physio_cols = ["ABP MEAN", "CVP"]  # ABP MEAN is same as MAP
 
     missing_required = [col for col in required_cols if col not in df.columns]
     if missing_required:
         raise ValueError(f"Missing required columns: {missing_required}")
 
-    available_physio = [col for col in physio_cols if col in df.columns]
-    print(f"Available physiological measurements: {available_physio}")
+    # Check for smoothed columns that will be aliased
+    smoothed_cols = ["ABP_MEAN_smooth4", "CVP_smooth4"]
+    available_smoothed = [col for col in smoothed_cols if col in df.columns]
+    print(f"Available smoothed physiological measurements: {available_smoothed}")
 
     # CRITICAL: Round timestamps DOWN to nearest 10-second interval
     print(f"Aligning timestamps to {interval_seconds}-second grid...")
@@ -72,6 +147,12 @@ def load_waveforms_data(parquet_path: str, interval_seconds: int = 10) -> pd.Dat
     print(
         f"New time range: {df['absolute_timestamp'].min()} to {df['absolute_timestamp'].max()}"
     )
+    
+    # Map smoothed columns to canonical names expected downstream
+    if "ABP_MEAN_smooth4" in df.columns:
+        df["ABP MEAN"] = pd.to_numeric(df["ABP_MEAN_smooth4"], errors="coerce")
+    if "CVP_smooth4" in df.columns:
+        df["CVP"] = pd.to_numeric(df["CVP_smooth4"], errors="coerce")
 
     return df
 
@@ -92,7 +173,7 @@ def create_ic_tensor(
         ValueError: If no exact physiological data found at t0
     """
     waveform_data = traj_info["waveform_data"]
-    t0_time = pd.to_datetime(traj_info["t0_time"])
+    t0_time = pd.to_datetime(traj_info["t0_time"]).tz_localize("UTC")
 
     # Initialize IC tensor: [ABP MEAN, CVP, 0, 0, 0]
     ic_values = np.zeros(5, dtype=np.float32)
@@ -153,7 +234,7 @@ def create_prediction_targets_tensor(
         pred_mask: (n_intervals, 2) - mask for valid measurements
     """
     waveform_data = traj_info["waveform_data"]
-    t0_time = pd.to_datetime(traj_info["t0_time"])
+    t0_time = pd.to_datetime(traj_info["t0_time"]).tz_localize("UTC")
     trajectory_duration_seconds = traj_info["duration_minutes"] * 60
 
     # Initialize tensors
@@ -345,78 +426,13 @@ def create_physiological_tensors(
     global _WF_DF
     _WF_DF = waveforms_df
 
-    # Worker utility to process a single trajectory end-to-end
-    def _process_single_trajectory(args: Tuple[str, Dict, int, int, str, str]) -> Tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]], bool]:
-        traj_key, traj_info, n_int, int_seconds, ic_dir_str, pred_dir_str = args
-        # Filter waveform data for this trajectory using shared DataFrame
-        hadm_id = traj_info["hadm_id"]
-        if hadm_id not in common_hadm_ids:  # quick skip
-            return traj_key, None, None, True
-
-        patient_waveforms = _WF_DF[_WF_DF["hadm_id"] == hadm_id].copy()
-        if len(patient_waveforms) == 0:
-            return traj_key, None, None, True
-
-        t0_time = pd.to_datetime(traj_info["t0_time"])
-        trajectory_end_time = pd.to_datetime(traj_info["trajectory_end_time"])
-        trajectory_waveforms = patient_waveforms[
-            (patient_waveforms["absolute_timestamp"] >= t0_time)
-            & (patient_waveforms["absolute_timestamp"] < trajectory_end_time)
-        ].copy()
-
-        if len(trajectory_waveforms) == 0:
-            return traj_key, None, None, True
-
-        # Build a local traj_info with waveform_data
-        local_traj_info = {**traj_info, "waveform_data": trajectory_waveforms}
-
-        ic_values, ic_mask = create_ic_tensor(traj_key, local_traj_info)
-        if not (ic_mask[0].item() or ic_mask[1].item()):
-            # skip saving if neither ABP nor CVP present at t0
-            return traj_key, None, None, True
-
-        ic_filepath = save_ic_tensor(traj_key, ic_values, ic_mask, Path(ic_dir_str))
-        pred_values, pred_mask = create_prediction_targets_tensor(
-            traj_key, local_traj_info, n_int, int_seconds
-        )
-        pred_filepath = save_prediction_targets_tensor(
-            traj_key, pred_values, pred_mask, n_int, int_seconds, Path(pred_dir_str)
-        )
-
-        ic_meta = {
-            "hadm_id": local_traj_info["hadm_id"],
-            "action_cluster_id": local_traj_info["action_cluster_id"],
-            "t0_time": local_traj_info["t0_time"],
-            "file_path": ic_filepath,
-            "has_abp_mean": bool(ic_mask[0].item()),
-            "has_cvp": bool(ic_mask[1].item()),
-            "abp_mean_value": float(ic_values[0].item()) if ic_mask[0] else None,
-            "cvp_value": float(ic_values[1].item()) if ic_mask[1] else None,
-        }
-
-        pred_meta = {
-            "hadm_id": local_traj_info["hadm_id"],
-            "action_cluster_id": local_traj_info["action_cluster_id"],
-            "t0_time": local_traj_info["t0_time"],
-            "trajectory_end_time": local_traj_info["trajectory_end_time"],
-            "duration_minutes": local_traj_info["duration_minutes"],
-            "file_path": pred_filepath,
-            "n_intervals": n_int,
-            "interval_seconds": int_seconds,
-            "total_abp_mean_measurements": int(torch.sum(pred_mask[:, 0] > 0).item()),
-            "total_cvp_measurements": int(torch.sum(pred_mask[:, 1] > 0).item()),
-            "timestamps_aligned": True,
-        }
-
-        return traj_key, ic_meta, pred_meta, False
-
     # Process trajectories (parallel if requested)
     ic_metadata: Dict[str, Any] = {}
     pred_metadata: Dict[str, Any] = {}
     skipped_trajectories = 0
 
     tasks = [
-        (tk, ti, n_intervals, interval_seconds, str(ic_dir), str(pred_dir))
+        (tk, ti, n_intervals, interval_seconds, str(ic_dir), str(pred_dir), common_hadm_ids)
         for tk, ti in med_metadata["trajectories"].items()
     ]
 

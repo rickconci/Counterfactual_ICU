@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+import typing as t
 
 
 class MIMICDataset(Dataset):
@@ -174,7 +175,7 @@ class MIMICDataset(Dataset):
         )
 
         # Compute normalization stats and load normalized tensors into memory
-        self.med_norm_stats, self.med_tensors_cache = self._compute_and_load_normalized_tensors()
+        #self.med_norm_stats, self.med_tensors_cache = self._compute_and_load_normalized_tensors()
 
     def __len__(self):
         return len(self.samples)
@@ -299,98 +300,7 @@ class MIMICDataset(Dataset):
             "traj_id": torch.tensor(int(action_cluster_id), dtype=torch.long),
         }
 
-    def _compute_and_load_normalized_tensors(self):
-        """Compute normalization statistics and load normalized tensors into memory."""
-        feature_names = self.med_feature_names
-        num_features = len(feature_names)  # 5 features per med
-        # Features to normalize: rate_hr_weight_norm, pre_on_hours_log1p, cumulative_since_start_hours_log1p
-        feature_indices_to_normalize = [0, 1, 2]  # First 3 features within each med block
-        
-        max_values = {}
-        med_tensors_cache = {}
-        
-        # Get all med tensor files
-        med_tensor_files = [f for f in os.listdir(self.m_tensor_dir) if f.startswith('med_tensor_') and f.endswith('.pt')]
-        
-        print(f"Computing normalization stats and loading normalized tensors for {len(med_tensor_files)} files...")
-        
-        # First pass: compute max values across all files
-        for med_tensor_file in med_tensor_files:
-            med_tensor_path = os.path.join(self.m_tensor_dir, med_tensor_file)
-            try:
-                med_tensor_data = torch.load(med_tensor_path, weights_only=False)
-                if len(med_tensor_data) >= 6:  # Has med_context
-                    med_context = med_tensor_data[-1]  # Last element is med_context
-                    
-                    # med_context is [T, M*F] where F=5 features per med
-                    # We need to reshape to [T, M, F] to access per-med, per-feature
-                    if med_context.shape[1] % num_features == 0:
-                        num_meds = med_context.shape[1] // num_features
-                        med_context_reshaped = med_context.view(med_context.shape[0], num_meds, num_features)
-                        
-                        # For each feature type we want to normalize
-                        for feat_idx in feature_indices_to_normalize:
-                            # Get all values for this feature across all meds and time steps
-                            feature_values = med_context_reshaped[:, :, feat_idx]  # [T, M]
-                            max_val = torch.max(feature_values).item()
-                            
-                            if feat_idx not in max_values:
-                                max_values[feat_idx] = max_val
-                            else:
-                                max_values[feat_idx] = max(max_values[feat_idx], max_val)
-            except Exception as e:
-                print(f"Warning: Could not process {med_tensor_file}: {e}")
-                continue
-        
-        # Ensure we have values for all features
-        for feat_idx in feature_indices_to_normalize:
-            if feat_idx not in max_values:
-                max_values[feat_idx] = 1.0  # Fallback to avoid division by zero
-        
-        print(f"Normalization stats computed: {max_values}")
-        
-        # Second pass: load and normalize all tensors into memory
-        for med_tensor_file in tqdm(med_tensor_files, desc="Loading normalized med tensors"):
-            med_tensor_path = os.path.join(self.m_tensor_dir, med_tensor_file)
-            try:
-                # Load the tensor file
-                med_tensor_data = torch.load(med_tensor_path, weights_only=False)
-                
-                if len(med_tensor_data) >= 6:  # Has med_context
-                    med_context = med_tensor_data[-1]  # Last element is med_context
-                    
-                    # Check if normalization is needed
-                    if med_context.shape[1] % num_features == 0:
-                        num_meds = med_context.shape[1] // num_features
-                        
-                        # Reshape to [T, M, F] for per-feature normalization
-                        med_context_reshaped = med_context.view(med_context.shape[0], num_meds, num_features)
-                        
-                        # Apply normalization to each feature
-                        for feat_idx in feature_indices_to_normalize:
-                            if feat_idx in max_values and max_values[feat_idx] > 0:
-                                med_context_reshaped[:, :, feat_idx] = (
-                                    med_context_reshaped[:, :, feat_idx] / max_values[feat_idx]
-                                )
-                        
-                        # Reshape back to [T, M*F]
-                        med_context_normalized = med_context_reshaped.view(med_context.shape[0], -1)
-                        
-                        # Update the tensor data with normalized med_context
-                        med_tensor_data_normalized = list(med_tensor_data)
-                        med_tensor_data_normalized[-1] = med_context_normalized
-                        
-                        # Store in memory cache instead of saving to disk
-                        traj_key = med_tensor_file.replace('med_tensor_', '').replace('.pt', '')
-                        med_tensors_cache[traj_key] = tuple(med_tensor_data_normalized)
-                        
-            except Exception as e:
-                print(f"Warning: Could not process {med_tensor_file}: {e}")
-                continue
-        
-        print(f"Loaded {len(med_tensors_cache)} normalized med tensors into memory!")
-        return max_values, med_tensors_cache
-
+    
 
 
 class MIMICDataModule(L.LightningDataModule):
