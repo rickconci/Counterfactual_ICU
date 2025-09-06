@@ -9,7 +9,7 @@ set -e  # Exit on any error
 echo "Starting Multi-GPU SDE Cardiovascular Model Training..."
 echo "Timestamp: $(date)"
 echo "Environment: $CONDA_DEFAULT_ENV"
-echo "GPUs: 5, 6, 7"
+echo "GPUs: 2, 3, 4"
 echo "Learning Rates: 1e-3, 1e-4, 5e-4"
 
 # Check if required packages are available
@@ -29,7 +29,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # Array of learning rates and corresponding GPUs
 declare -a learning_rates=("0.001" "0.0001" "0.0005")
-declare -a gpu_ids=("5" "6" "7")
+declare -a gpu_ids=("2" "3" "4")
 declare -a run_names=("sde_lr1e-3" "sde_lr1e-4" "sde_lr5e-4")
 
 # Array to store PIDs
@@ -49,7 +49,7 @@ for i in {0..2}; do
     # Set GPU and run training
     CUDA_VISIBLE_DEVICES=${gpu} nohup python ../models/NODE_main.py \
         --dataset_type mimic \
-        --use_encoder none \
+        --use_encoder raindrop \
         --num_samples 1 \
         --batch_size 32 \
         --seed 14 \
