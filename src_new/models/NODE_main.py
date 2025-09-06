@@ -16,6 +16,24 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
 from NODE import NODE
 
+def str2bool(v):
+    """Parse flexible boolean values from CLI.
+
+    Accepts: true/false, yes/no, y/n, 1/0 (case-insensitive). If provided without a value,
+    it evaluates to True when used with nargs='?'.
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    if s in ("yes", "true", "t", "y", "1"):
+        return True
+    if s in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected (true/false)")
+
+
 
 def set_seed(seed):
     seed_everything(seed, workers=True)
