@@ -55,11 +55,11 @@ for i in {0..2}; do
         --seed ${seed} \
         --max_epochs 100 \
         --data_root '../../data/mimic_3_data/processed_data' \
-        --log_wandb \
-        --model_checkpoint \
-        --early_stopping \
+        --log_wandb True\
+        --model_checkpoint True \
+        --early_stopping True \
         --integration_step_size 2 \
-        --HPC_work \
+        --HPC_work True\
         --output_scale 3 \
         --run_eval \
         --learning_rate 0.0005 \
