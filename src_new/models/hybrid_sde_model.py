@@ -499,8 +499,13 @@ class Hybrid_SDE(LightningModule):
             use_batch_norm=use_batch_norm,
             debug=self.debug,
         )
+        self._initial_sde_weights = None
+        for name, param in self.SDEnet.named_parameters():
+            if 'weight' in name:
+                self._initial_sde_weights = param.data.clone()
+                break
 
-        # Per-head control scales applied to SDE NN outputs (post-final-layer)
+                # Per-head control scales applied to SDE NN outputs (post-final-layer)
         # Head 0 (dpv_dt): ~0.1 mmHg/s
         # Head 1 (dsv_dt): ~0.02 units per time step
         # Head 2 (dt_ca): ~0.01 units per time step
@@ -950,6 +955,8 @@ class Hybrid_SDE(LightningModule):
             sde_latent_times = torch.full_like(y[:, 0], fill_value=t).unsqueeze(1)
             sin_time = torch.sin(sde_latent_times)
             cos_time = torch.cos(sde_latent_times)
+            sin_time = sin_time * 10.0  # Amplify time signals
+            cos_time = cos_time * 10.0
 
             if self.SDE_input_state == "full":
                 input_state = torch.cat(
@@ -1081,7 +1088,7 @@ class Hybrid_SDE(LightningModule):
             else:
                 # Apply per-head scales and global weighting
                 scaled_output = (
-                    u_raw * self.control_scales.to(u_raw.device)
+                    u_raw #* self.control_scales.to(u_raw.device)
                 ) * self.SDE_control_weighting
             # Check for NaN/Inf in scaled output - FAIL FAST, NO SANITIZATION
             check_for_nan_inf(scaled_output, "GAT_scaled_output", "apply_SDE_fun", self, raise_error=True)
@@ -1170,7 +1177,7 @@ class Hybrid_SDE(LightningModule):
         else:
             # Apply per-head scales and global weighting
             current_scales = self.get_adaptive_control_scales(self.global_step)
-            scaled_output = (SDE_NN_output_latents) * self.SDE_control_weighting * current_scales.to(SDE_NN_output_latents.device)
+            scaled_output = (SDE_NN_output_latents) * self.SDE_control_weighting #* current_scales.to(SDE_NN_output_latents.device)
         if torch.isnan(scaled_output).any() or torch.isinf(scaled_output).any():
             activate_auto_debug_mode(self, "apply_SDE_fun (MLP path)", "scaled_output", scaled_output)
             raise RuntimeError("Non-finite values in scaled_output. Auto-debug mode activated.")
@@ -1230,6 +1237,7 @@ class Hybrid_SDE(LightningModule):
 
         # Final check for NaN/Inf in output - FAIL FAST, NO SANITIZATION
         check_for_nan_inf(scaled_output, "apply_SDE_fun_output", "apply_SDE_fun", self, raise_error=True)
+        # In training_step(), replace the broken lines with:
         
         return scaled_output
 
@@ -1351,6 +1359,14 @@ class Hybrid_SDE(LightningModule):
             dt_tau,
         ) = zenker_derivatives(expert_slice, device=self.device, expert_start_index=0)
 
+        if (t.item() % 200 < 5):
+            print(f"[ZENKER BALANCE] t={t.item():.1f}")
+            print(f"  Zenker dpa_dt: {dpa_dt[0].item():.3f}")
+            print(f"  Zenker dpv_dt: {dpv_dt[0].item():.3f}")
+            print(f"  Control 1 (affects dpv): {dt_i_ext_SDE_dict['dt_i_ext_SDE_1'][0].item():.3f}")
+            print(f"  Final dpv_dt: {(dpv_dt + dt_i_ext_SDE_dict['dt_i_ext_SDE_1'])[0].item():.3f}")
+            print(f"  Net effect: {(dt_i_ext_SDE_dict['dt_i_ext_SDE_1'][0].item() + dpv_dt[0].item()):.3f}")
+
         if self.debug:
             t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
                 torch.long
@@ -1385,7 +1401,7 @@ class Hybrid_SDE(LightningModule):
                 print(
                     f"  controls (first sample): {y_clamped[0, :self.SDEnet_out_dims]}"
                 )
-                print(f"  control derivs (first sample): {dt_i_ext[0]}")
+                print(f"  control derivs (first sample): {dt_i_ext_SDE[0]}")
                 try:
                     print(
                         f"  dpv_dt(after ctl) mean={dpv_dt.mean().item():.4f}, dt_ca mean={dt_ca.mean().item():.6f}, dt_r_tpr_mod mean={dt_r_tpr_mod.mean().item():.6f}"
@@ -1414,17 +1430,17 @@ class Hybrid_SDE(LightningModule):
         )
 
         # Combine all with fail-fast non-finite checks
-        if torch.isnan(dt_i_ext).any() or torch.isinf(dt_i_ext).any():
-            activate_auto_debug_mode(self, "f()", "dt_i_ext", dt_i_ext)
-            raise RuntimeError("Non-finite values in dt_i_ext. Auto-debug mode activated.")
-        dt_i_ext = dt_i_ext.clamp_(-10.0, 10.0)
+        if torch.isnan(dt_i_ext_SDE).any() or torch.isinf(dt_i_ext_SDE).any():
+            activate_auto_debug_mode(self, "f()", "dt_i_ext", dt_i_ext_SDE)
+            raise RuntimeError("Non-finite values in dt_i_ext_SDE. Auto-debug mode activated.")
+        dt_i_ext_SDE = dt_i_ext_SDE.clamp_(-10.0, 10.0)
         if torch.isnan(dt_expert).any() or torch.isinf(dt_expert).any():
             activate_auto_debug_mode(self, "f()", "dt_expert", dt_expert)
             raise RuntimeError("Non-finite values in dt_expert. Auto-debug mode activated.")
         if torch.isnan(dt_neural_embedding).any() or torch.isinf(dt_neural_embedding).any():
             activate_auto_debug_mode(self, "f()", "dt_neural_embedding", dt_neural_embedding)
             raise RuntimeError("Non-finite values in dt_neural_embedding. Auto-debug mode activated.")
-        final_f_out = torch.cat([dt_i_ext, dt_expert, dt_neural_embedding], dim=-1)
+        final_f_out = torch.cat([dt_i_ext_SDE, dt_expert, dt_neural_embedding], dim=-1)
 
         if self.debug:
             t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
@@ -2532,6 +2548,7 @@ class Hybrid_SDE(LightningModule):
             control_energy = torch.tensor(0.0, device=total_loss.device)
 
         total_loss = total_loss + self.control_energy_weight * control_energy
+        print(f"Step {self.global_step}: control_energy={control_energy.item():.2e}, weight={self.control_energy_weight:.2e}, contribution={self.control_energy_weight * control_energy.item():.2e}, main_loss={loss.item():.2f}")
 
         # Optional training plots (controls only), gated by plot_every
         should_plot_now = False
@@ -2858,6 +2875,33 @@ class Hybrid_SDE(LightningModule):
             self.sigma = checkpoint["sigma"]
         if "theta" in checkpoint:
             self.theta = checkpoint["theta"]
+
+    def on_test_epoch_end(self):
+        """Log final test metrics to wandb"""
+        if self.log_wandb:
+            # Get the logged metrics
+            test_results = {
+                'final_test_loss': self.trainer.callback_metrics.get('test_total_loss', 0),
+                'final_test_mse': self.trainer.callback_metrics.get('test_mse', 0),
+                'final_test_mae': self.trainer.callback_metrics.get('test_mae', 0),
+                'final_test_nll': self.trainer.callback_metrics.get('test_NLL', 0),
+                'final_test_kl': self.trainer.callback_metrics.get('test_KL', 0)
+            }
+
+            # Log final summary
+            wandb.log(test_results)
+
+            # Create a summary table
+            test_summary = [
+                ['Metric', 'Value'],
+                ['Total Loss', f"{test_results['final_test_loss']:.4f}"],
+                ['MSE', f"{test_results['final_test_mse']:.4f}"],
+                ['MAE', f"{test_results['final_test_mae']:.4f}"],
+                ['NLL', f"{test_results['final_test_nll']:.4f}"],
+                ['KL Divergence', f"{test_results['final_test_kl']:.4f}"]
+            ]
+
+            wandb.log({"test_summary_table": wandb.Table(data=test_summary[1:], columns=test_summary[0])})
 
     def _setup_plot_style(self):
         """Shared plotting style configuration"""
