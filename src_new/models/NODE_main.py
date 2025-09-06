@@ -332,7 +332,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log_wandb",
         type=bool,
-        default=False,
+        default=True,
         help="Whether to log to Weights & Biases",
     )
     parser.add_argument(
