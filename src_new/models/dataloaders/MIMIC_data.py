@@ -21,7 +21,7 @@ class MIMICDataset(Dataset):
         val_ratio=0.15,
         random_state=42,
         max_samples=None,
-        filter_flat_trajectories=True,  # New parameter
+        filter_flat_trajectories=False,  # New parameter
         flatness_std_threshold=2.0,  # New parameter
         flatness_range_threshold=5.0,
         min_valid_points = 5
@@ -356,6 +356,7 @@ class MIMICDataModule(L.LightningDataModule):
         self,
         data_root,
         icu_stays_path,
+        filter_flat_trajectories = False,
         batch_size=32,
         num_workers=1,
         random_state=42,
@@ -379,6 +380,7 @@ class MIMICDataModule(L.LightningDataModule):
         self.expert_latent_dim = expert_latent_dim
         # Store nominal interval seconds if present in metadata (fallback to 10)
         self.interval_seconds: int = 10
+        self.filter_flat_trajectories = filter_flat_trajectories
 
     def _resolve_num_workers(self) -> int:
         """Choose efficient default workers: 6-8 on non-macOS, 1 on macOS."""
@@ -412,6 +414,7 @@ class MIMICDataModule(L.LightningDataModule):
                 split="train",
                 random_state=self.random_state,
                 max_samples=self.max_samples,
+                filter_flat_trajectories=self.filter_flat_trajectories
             )
             self.val_dataset = MIMICDataset(
                 self.data_root,
@@ -419,6 +422,7 @@ class MIMICDataModule(L.LightningDataModule):
                 split="val",
                 random_state=self.random_state,
                 max_samples=self.max_samples,
+                filter_flat_trajectories=self.filter_flat_trajectories
             )
 
             # Get static dim from metadata
@@ -470,6 +474,7 @@ class MIMICDataModule(L.LightningDataModule):
                 split="test",
                 random_state=self.random_state,
                 max_samples=self.max_samples,
+                filter_flat_trajectories=self.filter_flat_trajectories
             )
             if len(self.test_dataset) > 0 and self.encoder_input_dim is None:
                 sample0 = self.test_dataset[0]

@@ -25,8 +25,8 @@ nohup python ../models/NODE_main.py \
     --use_encoder none \
     --num_samples 1 \
     --batch_size 32 \
-    --seed 96 \
-    --max_epochs 30 \
+    --seed 14 \
+    --max_epochs 50 \
     --data_root '../../data/mimic_3_data/processed_data' \
     --log_wandb True \
     --model_checkpoint True \

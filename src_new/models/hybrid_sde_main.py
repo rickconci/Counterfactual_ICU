@@ -203,6 +203,7 @@ def main(args):
             max_samples=args.max_samples,
             use_raindrop_context=True,
             expert_latent_dim=14,
+            filter_flat_trajectories=args.filter_flat_trajectories
         )
         data_module.setup()
         unique_dir_name = f"MIMIC_DATA_seed={args.seed}"  # Simplified name for now
@@ -700,6 +701,14 @@ if __name__ == "__main__":
         help="Whether to encode the data until treatment and the decode or decode from the beginning!)",
     )
     parser.add_argument(
+        "--filter_flat_trajectories",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Whether to only train and test on flat trajectories",
+    )
+    parser.add_argument(
         "--variational_encoder",
         type=str2bool,
         nargs="?",
@@ -929,6 +938,7 @@ if __name__ == "__main__":
             max_samples=args.max_samples,
             use_raindrop_context=True,
             expert_latent_dim=14,
+            filter_flat_trajectories=args.filter_flat_trajectories
         )
         dm.setup("fit")
         loader = dm.train_dataloader()

@@ -164,6 +164,7 @@ def main(args):
             num_workers=num_workers,
             random_state=args.seed,
             max_samples=args.max_samples,
+            filter_flat_trajectories=args.filter_flat_trajectories
         )
         data_module.setup()
         unique_dir_name = f"MIMIC_DATA_seed={args.seed}"  # Simplified name for now
@@ -185,7 +186,7 @@ def main(args):
         # Encoder
         encoder_input_dim=data_module.encoder_input_dim,
         encoder_hidden_dim=args.encoder_hidden_dim,
-        expert_latent_dims=14,  # Fixed by the ODE model #todo check that
+        expert_latent_dims=14,
         encoder_ODENN_dims=0 if args.use_encoder == "none" else args.encoder_ODENN_dims,
         n_medications=22,
         encoder_context_len=data_module.context_max_len,
@@ -201,6 +202,7 @@ def main(args):
         static_input_dim=data_module.static_input_dim,
         static_hidden_dim=args.static_hidden_dim,
         fusion_hidden_dim=args.fusion_hidden_dim,
+        med_embed_dim=args.med_embed_dim,
         # SDE params
         num_samples=args.num_samples,
         prior_tx_sigma=args.prior_tx_sigma,
@@ -351,13 +353,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--static_hidden_dim",
         type=int,
-        default=16,
+        default=64,
         help="Hidden dimension for the static encoder MLP.",
     )
     parser.add_argument(
         "--fusion_hidden_dim",
         type=int,
-        default=32,
+        default=128,
         help="Hidden dimension for the fusion MLP.",
     )
     parser.add_argument(
@@ -407,7 +409,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--ODEnet_hidden_dim", type=int, default=300, help="Hidden dim for SDE NN  "
+        "--ODEnet_hidden_dim", type=int, default=512, help="Hidden dim for SDE NN  "
     )
     parser.add_argument(
         "--ODEnet_depth", type=int, default=6, help="Num layers for SDE NN  "
@@ -462,7 +464,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--encoder_ODENN_dims",
         type=int,
-        default=64,
+        default=128,
         help="Encoder output used by SDENN",
     )
     parser.add_argument(
@@ -505,7 +507,12 @@ if __name__ == "__main__":
         default=2,
         help="Number of layers in encoder GRU",
     )
-
+    parser.add_argument(
+        "--med_embed_dim",
+        type=int,
+        default=32,
+        help="Num output dims for med embedding"
+    )
     parser.add_argument(
         "--final_activation",
         type=str,
@@ -582,6 +589,14 @@ if __name__ == "__main__":
         type=bool,
         default=False,
         help="Whether encoder runs with inputs backwards in time)",
+    )
+    parser.add_argument(
+        "--filter_flat_trajectories",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Whether to only train and test on flat trajectories",
     )
 
     args = parser.parse_args()

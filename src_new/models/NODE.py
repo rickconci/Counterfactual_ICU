@@ -8,6 +8,7 @@ from lightning import LightningModule
 from raindrop import Raindrop_v2
 from torch import distributions, nn
 from torchdiffeq import odeint, odeint_adjoint
+import torch.utils.checkpoint as checkpoint
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
 from utils_beta import (
@@ -41,6 +42,7 @@ class NODE(LightningModule):
         static_input_dim,
         static_hidden_dim,
         fusion_hidden_dim,
+        med_embed_dim,
         # ODE params
         prior_tx_sigma,
         prior_tx_mu,
@@ -187,15 +189,18 @@ class NODE(LightningModule):
 
         net_input_dims = self.encoder_output_dim
         net_input_dims = net_input_dims + 2 if include_time else net_input_dims
+        self.med_embed_dim = med_embed_dim
+        # Use LazyLinear to infer input dim on first forward while keeping params registered
+        self.med_proj = nn.LazyLinear(self.med_embed_dim)
 
         if self.use_encoder != "none":
-            self.ic_consistency_weight = 0.1
+            self.ic_consistency_weight = 10
             # each medication has rate and last administration info
-            net_input_dims = net_input_dims + n_medications * 2
+            net_input_dims = net_input_dims + self.med_embed_dim
         else:
             self.ic_consistency_weight = 0
             # each medication has rate and last administration info
-            net_input_dims = self.expert_latent_dims + n_medications * 2
+            net_input_dims = self.expert_latent_dims + self.med_embed_dim
             net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "none": None}
@@ -429,96 +434,6 @@ class NODE(LightningModule):
             )
         return z1, z1_logvar, logqp0
 
-    def get_medication_context(self, t, expanded_batch_size):
-        """Medication context at time t, using precomputed per-time tensors when available."""
-        batch_size, _, n_meds = self.current_med_values.shape
-
-        # Fast path: precomputed per-time context
-        if hasattr(self, "med_context_by_time") and hasattr(self, "_dt_grid"):
-            t_tensor = (
-                t
-                if torch.is_tensor(t)
-                else torch.tensor(t, dtype=self._t0.dtype, device=self._t0.device)
-            )
-            idx = torch.round((t_tensor - self._t0) / self._dt_grid).to(torch.long)
-            idx = torch.clamp(idx, 0, self._time_len - 1)
-            ctx_bt = self.med_context_by_time[:, idx, :]  # [B, 2*M]
-            samples_per_batch = expanded_batch_size // batch_size
-            return ctx_bt.repeat_interleave(samples_per_batch, dim=0)
-
-        # Fallback: on-the-fly computation (slower)
-        time_steps = self.current_med_values.shape[1]
-        t_tensor = (
-            t
-            if torch.is_tensor(t)
-            else torch.tensor(
-                t, dtype=self.current_med_time.dtype, device=self.current_med_time.device
-            )
-        )
-        time_valid = self.current_med_time <= t_tensor  # (batch, time)
-        med_present = self.current_med_mask > 0  # (batch, time, meds)
-        valid_mask = time_valid.unsqueeze(-1) & med_present  # (batch, time, meds)
-
-        time_indices = torch.arange(time_steps, device=self.device).float()
-        time_indices = time_indices.view(1, time_steps, 1).expand(
-            batch_size, -1, n_meds
-        )
-        masked_indices = torch.where(
-            valid_mask, time_indices, torch.full_like(time_indices, -1e6)
-        )
-        last_valid_indices = masked_indices.argmax(dim=1)
-        has_valid_data = masked_indices.max(dim=1)[0] > -1e5
-        batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(1)
-        med_idx = torch.arange(n_meds, device=self.device).unsqueeze(0)
-        last_rates = self.current_med_values[batch_idx, last_valid_indices, med_idx]
-        last_times = self.current_med_time[batch_idx, last_valid_indices]
-        time_since = t_tensor - last_times
-        recency_weights = torch.clamp(time_since / 1200 - 1 / 1200, min=0)
-        last_rates = torch.where(has_valid_data, last_rates, torch.zeros_like(last_rates))
-        recency_weights = torch.where(
-            has_valid_data, recency_weights, torch.ones_like(recency_weights)
-        )
-        result = torch.stack([last_rates, recency_weights], dim=-1).flatten(start_dim=1)
-        samples_per_batch = expanded_batch_size // batch_size
-        return result.repeat_interleave(samples_per_batch, dim=0)
-
-    def _precompute_med_context(self, ts: torch.Tensor) -> None:
-        """Precompute medication context [rate, recency] for each time step.
-
-        Creates `self.med_context_by_time` with shape [B, T, 2*M] and stores
-        time grid params `_t0`, `_dt_grid`, `_time_len` for fast indexing.
-        """
-        B, T, M = self.current_med_values.shape
-        device = self.current_med_values.device
-        dtype = self.current_med_values.dtype
-
-        ts_dev = ts.to(device=device, dtype=dtype)
-        self._t0 = ts_dev[0]
-        self._time_len = int(ts_dev.shape[0])
-        self._dt_grid = (ts_dev[1] - ts_dev[0]).clamp_min(1e-6) if T > 1 else torch.tensor(1.0, device=device,
-                                                                                           dtype=dtype)
-
-        valid = (self.current_med_mask > 0)  # [B,T,M]
-        idxs = torch.arange(T, device=device).view(1, T, 1).expand(B, T, M)
-        valid_idxs = torch.where(valid, idxs + 1, torch.zeros_like(idxs))  # +1 sentinel
-        last_idx_plus1 = torch.cummax(valid_idxs, dim=1).values  # [B,T,M]
-        has_valid = last_idx_plus1 > 0
-        last_idx = torch.clamp(last_idx_plus1 - 1, min=0).to(torch.long)
-
-        last_rates = torch.gather(self.current_med_values, dim=1, index=last_idx)  # [B,T,M]
-        time_bt = self.current_med_time.unsqueeze(-1).expand(B, T, M)
-        last_times = torch.gather(time_bt, dim=1, index=last_idx)  # [B,T,M]
-
-        t_grid = ts_dev.view(1, T, 1).expand(B, T, M)
-        time_since = t_grid - last_times
-        recency = torch.clamp(time_since / 1200.0 - 1.0 / 1200.0, min=0.0)
-
-        last_rates = torch.where(has_valid, last_rates, torch.zeros_like(last_rates))
-        recency = torch.where(has_valid, recency, torch.ones_like(recency))
-
-        ctx = torch.stack([last_rates, recency], dim=-1)  # [B,T,M,2]
-        self.med_context_by_time = ctx.view(B, T, 2 * M).contiguous()
-
     def f_ode(self, t, y):
         batch_size = y.shape[0]
 
@@ -537,32 +452,49 @@ class NODE(LightningModule):
         else:
             nn_input = normalized_full_zenker
 
-
-        if hasattr(self, "current_med_context") and self.current_med_context is not None:
-            if not hasattr(self, "_t0"):
-                self._t0 = torch.tensor(0.0, device=self.device)
-            if not hasattr(self, "_dt_grid"):
-                self._dt_grid = torch.tensor(float(self.integration_step_size), device=self.device)
-            t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
-            t_idx = torch.clamp(t_idx, 0, self.current_med_context.shape[1] - 1)
-            med_context = self.current_med_context[:, t_idx, :]
-            samples_per_batch = batch_size // med_context.shape[0]
-            med_context = med_context.repeat_interleave(samples_per_batch, dim=0)
-        else:
-            med_context = self.get_medication_context(t, batch_size)
-
         if self.include_time:
             time_encoding = torch.stack([torch.sin(t), torch.cos(t)]).repeat(
                 batch_size, 1
             )
             nn_input = torch.cat([nn_input, time_encoding], dim=-1)
 
-        med_context = (med_context - 0.5) * 4.0
-        nn_input = torch.cat([nn_input, med_context], dim=-1)
+        # Index precomputed med context by time step
+        if not hasattr(self, "_t0"):
+            self._t0 = torch.tensor(0.0, device=self.device)
+        if not hasattr(self, "_dt_grid"):
+            self._dt_grid = torch.tensor(
+                float(self.integration_step_size), device=self.device
+            )
+        t_idx = torch.floor_divide((t.to(self._t0) - self._t0), 10).to(
+            torch.long
+        )
+        t_idx = torch.clamp(t_idx, 0, self.current_med_tensors.shape[1] - 1)
 
-        # Get pressure derivatives from network
-        pressure_derivatives = self.ODEnet(nn_input)
+        med_tensor = self.current_med_tensors[:, t_idx, :]
+        # expand over samples if needed
+        samples_per_batch = batch_size // med_tensor.shape[0]
+        med_tensor = med_tensor.repeat_interleave(samples_per_batch, dim=0)
 
+        # med_safe = torch.sign(med_tensor) * torch.log1p(torch.abs(med_tensor))
+        # med_safe = torch.nan_to_num(med_safe, nan=0.0, posinf=3.0, neginf=-3.0)  # Clean NaN/Inf first
+        # med_safe = torch.clamp(med_safe, min=-3.0, max=3.0)
+        # Project to fixed-size med embedding (LazyLinear infers input dim on first call)
+        def med_forward(med_input):
+            return torch.tanh(self.med_proj(med_input))
+
+        if self.training:
+            med_embed = checkpoint.checkpoint(med_forward, med_tensor)
+        else:
+            med_embed = torch.tanh(self.med_proj(med_tensor))
+        nn_input = torch.cat([nn_input, med_embed], dim=-1)
+
+        def ode_forward(ode_input):
+            return self.ODEnet(ode_input)
+
+        if self.training:
+            pressure_derivatives = checkpoint.checkpoint(ode_forward, nn_input)
+        else:
+            pressure_derivatives = self.ODEnet(nn_input)
         if self.debug and hasattr(self, '_dt_grid'):
             t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(torch.long)
             if (t_idx.remainder(5) == 0).item():  # Every 5 steps
@@ -694,14 +626,6 @@ class NODE(LightningModule):
             self._time_len = 1
             self._dt_grid = torch.tensor(float(self.integration_step_size), device=self.device)
 
-            # Add precomputation attempt (from SDE):
-        try:
-            self._precompute_med_context(ts)
-            if self.debug:
-                print("[DEBUG] Successfully precomputed medication context")
-        except Exception as e:
-            if self.debug:
-                print(f"[WARN] Med context precomputation failed: {e}")
 
         if self.use_encoder != "none":
             # init_latents: [batch, 1, 14 expert + encoder_dims]
@@ -965,7 +889,9 @@ class NODE(LightningModule):
                 med_trajectory_values,
                 med_trajectory_mask,
                 med_trajectory_time,
-                med_context,
+                med_tensors,
+                hadm_ids,
+                traj_ids,
             ) = batch
         else:
             raise NotImplementedError(
@@ -980,9 +906,34 @@ class NODE(LightningModule):
                 src = rd_src.permute(1, 0, 2)
                 times = rd_times.permute(1, 0)
                 lengths = rd_length
-                temporal_embedding, _, _ = self.temporal_encoder(
-                    src=src, static=None, times=times, lengths=lengths
-                )
+
+                def encoder_forward(src, times, lengths):
+                    return self.temporal_encoder(src=src, static=None, times=times, lengths=lengths)
+
+                if self.training:
+                    temporal_embedding, _, _ = checkpoint.checkpoint(encoder_forward, src, times, lengths)
+                else:
+                    temporal_embedding, _, _ = self.temporal_encoder(src=src, static=None, times=times, lengths=lengths)
+
+                # Continue with static encoder and fusion (might need checkpointing too)
+                def static_encoder_forward(static_feats):
+                    return self.static_encoder(static_feats)
+
+                if self.training:
+                    static_embedding = checkpoint.checkpoint(static_encoder_forward, static_features)
+                else:
+                    static_embedding = self.static_encoder(static_features)
+
+                fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
+
+                # Checkpoint the fusion MLP too if needed
+                def fusion_forward(fused_emb):
+                    return self.fusion_mlp(fused_emb)
+
+                if self.training:
+                    fused_rep = checkpoint.checkpoint(fusion_forward, fused_embedding)
+                else:
+                    fused_rep = self.fusion_mlp(fused_embedding)
                 logqp0 = 0
             else:
                 raise NotImplementedError(
@@ -991,23 +942,68 @@ class NODE(LightningModule):
 
             if self.debug:
                 print(f"Static features shape: {static_features.shape}")
-            static_embedding = self.static_encoder(static_features)
-            fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
-            fused_rep = self.fusion_mlp(fused_embedding)
 
-            predicted_ode_latents_sigmoid = (
-                self.ode_latent_head(fused_rep)
-                .unsqueeze(1)
-                .repeat(1, self.num_samples, 1)
-            )
+            # In common_step, after computing fused_rep:
+            def ode_head_forward(fused_input):
+                return self.ode_latent_head(fused_input)
+
+            def neural_head_forward(fused_input):
+                return self.neural_embedding_head(fused_input)
+
+            if self.training:
+                predicted_ode_latents_sigmoid = checkpoint.checkpoint(ode_head_forward, fused_rep).unsqueeze(1).repeat(
+                    1, self.num_samples, 1)
+                neural_embedding = checkpoint.checkpoint(neural_head_forward, fused_rep).unsqueeze(1).repeat(1,
+                                                                                                             self.num_samples,
+                                                                                                             1)
+            else:
+                predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples,
+                                                                                                    1)
+                neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+
             predicted_ode_latents = self.transform_sigmoid_to_physiological_ranges(
                 predicted_ode_latents_sigmoid
             )
-            neural_embedding = (
-                self.neural_embedding_head(fused_rep)
-                .unsqueeze(1)
-                .repeat(1, self.num_samples, 1)
-            )
+            if self.debug:
+                try:
+                    pred_mean_ic = predicted_ode_latents.mean(dim=1)  # [B,14]
+                    pred_min_ic, _ = predicted_ode_latents.min(dim=1)
+                    pred_max_ic, _ = predicted_ode_latents.max(dim=1)
+
+                    def _dims_str(t: torch.Tensor) -> str:
+                        vals = t.detach().mean(dim=0)
+                        return (
+                            f"pa={vals[0].item():.2f}, pv={vals[1].item():.2f}, s={vals[2].item():.3f}, sv={vals[3].item():.2f}, r_tpr_mod={vals[4].item():.3f}, ca={vals[9].item():.2f}, cv={vals[10].item():.2f}"
+                        )
+
+                    print("[DEBUG] Encoder IC@t0 (pred) batch-mean:", _dims_str(pred_mean_ic))
+                    print("[DEBUG] Encoder IC@t0 (pred) batch-min:", _dims_str(pred_min_ic))
+                    print("[DEBUG] Encoder IC@t0 (pred) batch-max:", _dims_str(pred_max_ic))
+                    # Compare to provided init_states on available dims
+                    num_ic_vars = init_states.shape[-1]
+                    pred_ic_used = pred_mean_ic[:, :num_ic_vars]
+                    gt_ic = init_states
+                    mask_ic = ic_mask
+                    valid = mask_ic > 0
+                    if valid.any():
+                        diff = (pred_ic_used - gt_ic).abs() * valid
+                        denom = torch.clamp(valid.sum(dim=0), min=1)
+                        mae_per_dim = diff.sum(dim=0) / denom
+                        print(
+                            f"[DEBUG] Encoder IC vs data (masked MAE per-dim up to {num_ic_vars}): {mae_per_dim.detach().cpu().tolist()}"
+                        )
+                        overall_mae = (diff.sum() / torch.clamp(valid.sum(), min=1)).item()
+                        print(
+                            f"[DEBUG] Encoder IC overall MAE on provided dims: {overall_mae:.3f}"
+                        )
+                    else:
+                        print("[DEBUG] No IC mask provided; IC similarity skipped.")
+                    print(
+                        "[DEBUG] Using encoder-predicted ICs at t0 (with observed dims overwritten by data via ic_mask) to initialise SDE latents feeding the decoder."
+                    )
+                except Exception as e:
+                    print(f"[WARN] IC debug stats failed: {e}")
+
             z1_for_ode = self._prepare_ode_initial_state(
                 predicted_ode_latents, neural_embedding, init_states, ic_mask
             )
@@ -1028,7 +1024,7 @@ class NODE(LightningModule):
         valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
 
         # Attach precomputed med_context for fast per-step indexing
-        self.current_med_context = med_context if med_context is not None else None
+        self.current_med_tensors = med_tensors if med_tensors is not None else None
 
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_ode,
@@ -1087,7 +1083,7 @@ class NODE(LightningModule):
             "decoded_traj": decoded_traj,
             "Y": Y,
             "combined_mask": combined_mask,
-            "i_ext_path": i_ext_path,
+            "i_ext_path": None,
             "z1_for_ode": z1_for_ode,
         }
 
@@ -1120,13 +1116,6 @@ class NODE(LightningModule):
                 zero_reg = 0.0 * total_loss
             total_loss = total_loss + zero_reg
 
-        # Also save for the first train batch of each step to guarantee at least one CSV
-        if batch_idx == 0:
-            try:
-                self._save_control_time_series(result["i_ext_path"], batch_idx)
-            except Exception as e:
-                if self.debug:
-                    print(f"[WARN] Control CSV save (first-batch) failed: {e}")
 
         # Log metrics
         self.log(
@@ -1347,7 +1336,7 @@ class NODE(LightningModule):
             )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-4)
 
         scheduler = {
             "monitor": "train_total_loss",

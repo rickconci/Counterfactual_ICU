@@ -485,7 +485,6 @@ class Hybrid_SDE(LightningModule):
         self.physics_feat_dims = 8
         net_input_dims = net_input_dims + self.physics_feat_dims
 
-        self.input_layer_norm = nn.LayerNorm(net_input_dims)
 
         activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "none": None}
         final_activation_real = activations[final_activation.lower()]
@@ -2408,11 +2407,6 @@ class Hybrid_SDE(LightningModule):
                 init_states, ic_mask
             )
             z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
-            print("=== NO-ENCODER INITIAL CONDITIONS ===")
-            print(f"Raw init_states: {init_states[0, :5]}")
-            print(f"IC mask: {ic_mask[0, :5]}")
-            print(f"Prepared initial condition: {initial_condition[0, :5]}")
-            print(f"z1_for_sde: {z1_for_sde[0, 0, :14]}")
             logqp0 = 0
             ic_consistency_loss = 0
 
