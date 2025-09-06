@@ -13,6 +13,7 @@ from raindrop import Raindrop_v2
 from torch import distributions, nn
 from torch.special import erf
 from ZenkerModel import ZenkerODE
+import torch.nn.functional as F
 
 import torch.utils.checkpoint as checkpoint
 
@@ -483,6 +484,8 @@ class Hybrid_SDE(LightningModule):
         # Append physics-derived feature count (ΔP, r_tpr, f_hr, F, dpa_base, dpv_base, sigma, s_dot)
         self.physics_feat_dims = 8
         net_input_dims = net_input_dims + self.physics_feat_dims
+
+        self.input_layer_norm = nn.LayerNorm(net_input_dims)
 
         activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "none": None}
         final_activation_real = activations[final_activation.lower()]
@@ -955,8 +958,6 @@ class Hybrid_SDE(LightningModule):
             sde_latent_times = torch.full_like(y[:, 0], fill_value=t).unsqueeze(1)
             sin_time = torch.sin(sde_latent_times)
             cos_time = torch.cos(sde_latent_times)
-            sin_time = sin_time * 10.0  # Amplify time signals
-            cos_time = cos_time * 10.0
 
             if self.SDE_input_state == "full":
                 input_state = torch.cat(
@@ -1162,11 +1163,13 @@ class Hybrid_SDE(LightningModule):
 
         # Use gradient checkpointing for control network to prevent accumulation
         def control_forward(sde_input):
+            #normalized_input = self.input_layer_norm(sde_input)  # Include in checkpoint
             return self.SDEnet(sde_input)
 
         if self.training:
             SDE_NN_output_latents = checkpoint.checkpoint(control_forward, SDE_NN_input)
         else:
+            #normalized_input = self.input_layer_norm(SDE_NN_input)
             SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
 
         # TODO do these clamps make sense
@@ -1358,14 +1361,6 @@ class Hybrid_SDE(LightningModule):
             dt_p_aset,
             dt_tau,
         ) = zenker_derivatives(expert_slice, device=self.device, expert_start_index=0)
-
-        if (t.item() % 200 < 5):
-            print(f"[ZENKER BALANCE] t={t.item():.1f}")
-            print(f"  Zenker dpa_dt: {dpa_dt[0].item():.3f}")
-            print(f"  Zenker dpv_dt: {dpv_dt[0].item():.3f}")
-            print(f"  Control 1 (affects dpv): {dt_i_ext_SDE_dict['dt_i_ext_SDE_1'][0].item():.3f}")
-            print(f"  Final dpv_dt: {(dpv_dt + dt_i_ext_SDE_dict['dt_i_ext_SDE_1'])[0].item():.3f}")
-            print(f"  Net effect: {(dt_i_ext_SDE_dict['dt_i_ext_SDE_1'][0].item() + dpv_dt[0].item()):.3f}")
 
         if self.debug:
             t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
@@ -1925,12 +1920,11 @@ class Hybrid_SDE(LightningModule):
             # print('latent_out', latent_out[1, 1, :, 0])
             # print('latent device', latent_out.device)
 
-        output_traj = select_tensor_by_index_list_advanced(
-            latent_out, self.decoder_output_dims
-        )
+        pa_raw = latent_out[..., 0]  # [batch, samples, time]
+        pv_raw = latent_out[..., 1]
 
-        pa = torch.clamp(output_traj[..., 0], min=40.0, max=180)
-        pv = torch.clamp(output_traj[..., 1], min=0, max=39)
+        pa = torch.clamp(pa_raw, 40.0, 180.0)
+        pv = torch.clamp(pv_raw, 0.0, 39.0)
 
         output_traj = torch.stack([pa, pv], dim=-1)
 
@@ -1938,6 +1932,13 @@ class Hybrid_SDE(LightningModule):
             print(
                 f"[DEBUG] Hybrid_SDE forward_dec: decoded_mean_shape={output_traj.shape}"
             )
+
+        for patient_idx in range(min(3, pa.shape[0])):
+            p_a_clamped = pa[patient_idx, 0, 0].item()
+            p_v_clamped = pv[patient_idx, 0, 0].item()
+            print(f"Patient {patient_idx} CLAMPED at t=0: p_a={p_a_clamped:.3f}, p_v={p_v_clamped:.3f}")
+
+        print("=" * 50 + "\n")
         return output_traj
 
     def compute_ic_consistency_loss(
@@ -1954,8 +1955,6 @@ class Hybrid_SDE(LightningModule):
 
         # Get the number of IC variables we have
         num_ic_vars = init_states.shape[-1]
-
-        # TODO compute loss over normlized values
 
         # predicted_ode_latents are already sigmoided, so use them directly
         sigmoid_predicted = predicted_ode_latents_sigmoid[
@@ -2433,7 +2432,6 @@ class Hybrid_SDE(LightningModule):
             med_traj_time=med_trajectory_time,
         )
 
-        decoded_traj = self.forward_dec(latent_traj)
         try:
             self._debug_predicted_traj = decoded_traj.detach().clone()
             self._debug_true_traj = Y.detach().clone()
@@ -2442,6 +2440,8 @@ class Hybrid_SDE(LightningModule):
         except Exception as e:
             if self.debug:
                 print(f"[WARN] Failed to store debug trajectories: {e}")
+
+        decoded_traj = self.forward_dec(latent_traj)
         # Mask for loss computation (already respects valid lengths)
         combined_mask = Y_mask
         if self.debug:
@@ -2951,7 +2951,7 @@ class Hybrid_SDE(LightningModule):
         pred_std = predictions_full.std(1, unbiased=False).detach()
         targets = targets.detach() if targets.requires_grad else targets
 
-        for patient_idx in range(min(3, predictions_full.shape[0])):
+        for patient_idx in range(min(8, predictions_full.shape[0])):
             patient_mask = combined_mask[patient_idx]
             time_seconds = (torch.arange(patient_mask.shape[0]).cpu().numpy()) * 10
             pred_mean_patient = pred_mean[patient_idx].detach().cpu().numpy()
@@ -3106,7 +3106,7 @@ class Hybrid_SDE(LightningModule):
         else:
             control_drift[:] = 0.0
 
-        for patient_idx in range(min(3, predictions_full.shape[0])):
+        for patient_idx in range(min(8, predictions_full.shape[0])):
             patient_mask = combined_mask[patient_idx]
             time_seconds = np.arange(patient_mask.shape[0]) * 10
 
@@ -3511,7 +3511,7 @@ class Hybrid_SDE(LightningModule):
 
             time_seconds = (np.arange(control_mean.shape[1]) * 10).reshape(-1, 1)
             num_dims = control_mean.shape[2]
-            for patient_idx in range(min(3, control_mean.shape[0])):
+            for patient_idx in range(min(8, control_mean.shape[0])):
                 # Build columns: time, mean_d0..mean_d{D-1}, std_d0..std_d{D-1}
                 data = [time_seconds]
                 for d in range(num_dims):

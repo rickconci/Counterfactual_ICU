@@ -21,6 +21,10 @@ class MIMICDataset(Dataset):
         val_ratio=0.15,
         random_state=42,
         max_samples=None,
+        filter_flat_trajectories=True,  # New parameter
+        flatness_std_threshold=2.0,  # New parameter
+        flatness_range_threshold=5.0,
+        min_valid_points = 5
     ):
         self.data_root = data_root
         self.m_tensor_dir = os.path.join(data_root, "med_tensors_output")
@@ -28,6 +32,10 @@ class MIMICDataset(Dataset):
         self.target_tensor_dir = os.path.join(
             data_root, "physio_tensors_output/prediction_targets"
         )
+        self.filter_flat_trajectories = filter_flat_trajectories
+        self.flatness_std_threshold = flatness_std_threshold
+        self.flatness_range_threshold = flatness_range_threshold
+        self.min_valid_points = min_valid_points
 
         # New: Context tensors directories
         self.context_tensors_dir = os.path.join(data_root, "context_tensors_output")
@@ -103,6 +111,36 @@ class MIMICDataset(Dataset):
                     "traj_key": traj_key,
                 }
             )
+        # Filter out flat trajectories if enabled
+        if self.filter_flat_trajectories:
+            print(f"Before filtering: {len(all_trajectories)} trajectories")
+
+            filtered_trajectories = []
+
+            for traj in all_trajectories:
+                traj_key = traj["traj_key"]
+
+                # Load prediction targets to check flatness
+                p_out_path = os.path.join(self.target_tensor_dir, f"pred_targets_{traj_key}.pt")
+                if not os.path.exists(p_out_path):
+                    continue
+
+                try:
+                    p_out_values, p_out_mask, _, _, _ = torch.load(p_out_path)
+
+                    # Use the class method to check flatness
+                    if not self.is_trajectory_flat(p_out_values, p_out_mask):
+                        filtered_trajectories.append(traj)
+
+                except Exception as e:
+                    print(f"Error loading trajectory {traj_key}: {e}")
+                    continue
+
+            print(f"After filtering: {len(filtered_trajectories)} trajectories")
+            print(f"Filtered out {len(all_trajectories)-len(filtered_trajectories)} flat trajectories")
+            all_trajectories = filtered_trajectories
+        else:
+            print("Flat trajectory filtering is disabled")
 
         # Split by subject_id instead of hadm_id to prevent data leakage
         subject_trajectory_counts = {}
@@ -257,6 +295,8 @@ class MIMICDataset(Dataset):
         full_fact_traj = p_out_values
         t_full = p_out_rel_time
 
+
+
         return {
             # Raindrop-ready context
             "rd_src": rd_src,  # [T_ctx, 2*d_inp]
@@ -281,7 +321,34 @@ class MIMICDataset(Dataset):
             "traj_id": torch.tensor(int(action_cluster_id), dtype=torch.long),
         }
 
-    
+    def is_trajectory_flat(self, p_out_values, p_out_mask):
+        """
+        Determine if a trajectory is too flat to be useful for training.
+        Uses channel-specific thresholds:
+        - Channel 0 (arterial): requires range >= 15
+        - Channel 1 (venous): requires range >= 5
+        """
+        # Channel-specific range thresholds
+        channel_range_thresholds = [15.0, 5.0]  # arterial, venous
+
+        for channel in range(p_out_values.shape[1]):
+            channel_values = p_out_values[:, channel]
+            channel_mask = p_out_mask[:, channel]
+
+            valid_values = channel_values[channel_mask > 0]
+
+            if len(valid_values) < self.min_valid_points:
+                continue
+
+            channel_range = (valid_values.max() - valid_values.min()).item()
+
+            # Get threshold for this channel (default to last threshold if more channels)
+            threshold = channel_range_thresholds[min(channel, len(channel_range_thresholds) - 1)]
+
+            # If any channel passes its threshold, trajectory is not flat
+            if channel_range >= threshold:
+                return False
+        return True
 
 
 class MIMICDataModule(L.LightningDataModule):
