@@ -487,6 +487,12 @@ class MIMICDataModule(L.LightningDataModule):
                     max_samples=self.max_samples,
                     filter_flat_trajectories=True  # Filtered data only
                 )
+                if len(self.test_dataset_all) > 0 and self.encoder_input_dim is None:
+                    sample0 = self.test_dataset[0]
+                    if self.use_raindrop_context and "rd_src" in sample0:
+                        self.encoder_input_dim = int(sample0["rd_src"].shape[-1] // 2)
+                    else:
+                        self.encoder_input_dim = sample0["X"].shape[-1]
             else:
                 # Single test dataset using the original filter setting
                 self.test_dataset = MIMICDataset(
@@ -496,24 +502,24 @@ class MIMICDataModule(L.LightningDataModule):
                     random_state=self.random_state,
                     max_samples=self.max_samples,
                     filter_flat_trajectories=self.filter_flat_trajectories)
-            if len(self.test_dataset) > 0 and self.encoder_input_dim is None:
-                sample0 = self.test_dataset[0]
-                if self.use_raindrop_context and "rd_src" in sample0:
-                    self.encoder_input_dim = int(sample0["rd_src"].shape[-1] // 2)
-                else:
-                    self.encoder_input_dim = sample0["X"].shape[-1]
-                # Also set static dim if not set
-                if self.static_input_dim is None:
-                    baseline_metadata_path = os.path.join(
-                        self.data_root,
-                        "baseline_tensors_output",
-                        "baseline_tensors",
-                        "baseline_metadata.pkl",
-                    )
-                    if os.path.exists(baseline_metadata_path):
-                        with open(baseline_metadata_path, "rb") as f:
-                            baseline_meta = pickle.load(f)
-                            self.static_input_dim = baseline_meta["feature_dim"]
+                if len(self.test_dataset) > 0 and self.encoder_input_dim is None:
+                    sample0 = self.test_dataset[0]
+                    if self.use_raindrop_context and "rd_src" in sample0:
+                        self.encoder_input_dim = int(sample0["rd_src"].shape[-1] // 2)
+                    else:
+                        self.encoder_input_dim = sample0["X"].shape[-1]
+                    # Also set static dim if not set
+            if self.static_input_dim is None:
+                baseline_metadata_path = os.path.join(
+                    self.data_root,
+                    "baseline_tensors_output",
+                    "baseline_tensors",
+                    "baseline_metadata.pkl",
+                )
+                if os.path.exists(baseline_metadata_path):
+                    with open(baseline_metadata_path, "rb") as f:
+                        baseline_meta = pickle.load(f)
+                        self.static_input_dim = baseline_meta["feature_dim"]
 
     def train_dataloader(self):
         kwargs = self._loader_common_kwargs()
