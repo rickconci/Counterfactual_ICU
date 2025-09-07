@@ -1208,9 +1208,9 @@ class NODE(LightningModule):
             "mask": result["combined_mask"],
         }
 
-    def test_step(self, batch, batch_idx):
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
         if self.debug and batch_idx == 0:
-            print(f"[DEBUG] Hybrid_ODE validation_step: batch_idx={batch_idx}")
+            print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
 
         result = self.common_step(batch, batch_idx)
 
@@ -1218,38 +1218,15 @@ class NODE(LightningModule):
         loss = result["loss"]
         nll = result["nll"]
         kl_div = result["kl_div"]
+        suffix = "_all" if dataloader_idx == 0 else "_filtered"
 
-        # Log the individual components
-        self.log(
-            "test_total_loss",
-            total_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_main_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_ic_consistency_loss",
-            result["ic_consistency_loss"],
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_NLL", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
-        self.log(
-            "test_KL", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
+        # Log with dataset-specific names
+        self.log(f"test_total_loss{suffix}", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_main_loss{suffix}", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_ic_consistency_loss{suffix}", result["ic_consistency_loss"], on_step=False, on_epoch=True,
+                 prog_bar=True, logger=True)
+        self.log(f"test_NLL{suffix}", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_KL{suffix}", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         # Compute additional test metrics
         decoded_traj = result["decoded_traj"]
@@ -1263,28 +1240,14 @@ class NODE(LightningModule):
             valid_elements = combined_mask.sum()
             valid_mse = mse_per_sample.sum() / valid_elements
             valid_mae = mae_per_sample.sum() / valid_elements
+            self.log(f"test_mse{suffix}", valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"test_mae{suffix}", valid_mae, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
-            self.log(
-                "test_mse",
-                valid_mse,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-            self.log(
-                "test_mae",
-                valid_mae,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-
-        if batch_idx < 10:
+        if batch_idx < 3:
             self.plot_nature_style_with_uncertainty(
-                decoded_traj, Y, combined_mask, batch_idx
+                decoded_traj, Y, combined_mask, batch_idx, suffix
             )
+
         return_dict = {
             "test_loss": loss,
             "test_nll": nll,
@@ -1301,39 +1264,63 @@ class NODE(LightningModule):
 
 
     def on_test_epoch_end(self):
-        """Log final test metrics to wandb"""
+        """Log final test metrics to wandb with proper handling of multiple test datasets"""
         if self.log_wandb:
-            # Get the logged metrics
-            test_results = {
-                "final_test_loss": self.trainer.callback_metrics.get(
-                    "test_total_loss", 0
-                ),
-                "final_test_mse": self.trainer.callback_metrics.get("test_mse", 0),
-                "final_test_mae": self.trainer.callback_metrics.get("test_mae", 0),
-                "final_test_nll": self.trainer.callback_metrics.get("test_NLL", 0),
-                "final_test_kl": self.trainer.callback_metrics.get("test_KL", 0),
+            # Extract metrics using the correct key format with dataloader_idx suffixes
+            all_metrics = {
+                'total_loss': float(self.trainer.callback_metrics.get('test_total_loss_all/dataloader_idx_0', 0)),
+                'main_loss': float(self.trainer.callback_metrics.get('test_main_loss_all/dataloader_idx_0', 0)),
+                'mse': float(self.trainer.callback_metrics.get('test_mse_all/dataloader_idx_0', 0)),
+                'mae': float(self.trainer.callback_metrics.get('test_mae_all/dataloader_idx_0', 0)),
+                'nll': float(self.trainer.callback_metrics.get('test_NLL_all/dataloader_idx_0', 0)),
+                'kl': float(self.trainer.callback_metrics.get('test_KL_all/dataloader_idx_0', 0)),
+                'ic_consistency': float(
+                    self.trainer.callback_metrics.get('test_ic_consistency_loss_all/dataloader_idx_0', 0))
             }
 
-            # Log final summary
-            wandb.log(test_results)
+            filtered_metrics = {
+                'total_loss': float(self.trainer.callback_metrics.get('test_total_loss_filtered/dataloader_idx_1', 0)),
+                'main_loss': float(self.trainer.callback_metrics.get('test_main_loss_filtered/dataloader_idx_1', 0)),
+                'mse': float(self.trainer.callback_metrics.get('test_mse_filtered/dataloader_idx_1', 0)),
+                'mae': float(self.trainer.callback_metrics.get('test_mae_filtered/dataloader_idx_1', 0)),
+                'nll': float(self.trainer.callback_metrics.get('test_NLL_filtered/dataloader_idx_1', 0)),
+                'kl': float(self.trainer.callback_metrics.get('test_KL_filtered/dataloader_idx_1', 0)),
+                'ic_consistency': float(
+                    self.trainer.callback_metrics.get('test_ic_consistency_loss_filtered/dataloader_idx_1', 0))
+            }
 
-            # Create a summary table
-            test_summary = [
-                ["Metric", "Value"],
-                ["Total Loss", f"{test_results['final_test_loss']:.4f}"],
-                ["MSE", f"{test_results['final_test_mse']:.4f}"],
-                ["MAE", f"{test_results['final_test_mae']:.4f}"],
-                ["NLL", f"{test_results['final_test_nll']:.4f}"],
-                ["KL Divergence", f"{test_results['final_test_kl']:.4f}"],
+            # Create comparison table
+            comparison_data = [
+                ['Metric', 'All Trajectories', 'Filtered Trajectories', 'Difference (All - Filtered)'],
+                ['MSE', f"{all_metrics['mse']:.4f}", f"{filtered_metrics['mse']:.4f}",
+                 f"{all_metrics['mse'] - filtered_metrics['mse']:.4f}"],
+                ['MAE', f"{all_metrics['mae']:.4f}", f"{filtered_metrics['mae']:.4f}",
+                 f"{all_metrics['mae'] - filtered_metrics['mae']:.4f}"],
+                ['Total Loss', f"{all_metrics['total_loss']:.4f}", f"{filtered_metrics['total_loss']:.4f}",
+                 f"{all_metrics['total_loss'] - filtered_metrics['total_loss']:.4f}"],
+                ['Main Loss', f"{all_metrics['main_loss']:.4f}", f"{filtered_metrics['main_loss']:.4f}",
+                 f"{all_metrics['main_loss'] - filtered_metrics['main_loss']:.4f}"],
+                ['NLL', f"{all_metrics['nll']:.4f}", f"{filtered_metrics['nll']:.4f}",
+                 f"{all_metrics['nll'] - filtered_metrics['nll']:.4f}"],
+                ['KL Divergence', f"{all_metrics['kl']:.4f}", f"{filtered_metrics['kl']:.4f}",
+                 f"{all_metrics['kl'] - filtered_metrics['kl']:.4f}"],
+                ['IC Consistency', f"{all_metrics['ic_consistency']:.4f}", f"{filtered_metrics['ic_consistency']:.4f}",
+                 f"{all_metrics['ic_consistency'] - filtered_metrics['ic_consistency']:.4f}"]
             ]
 
-            wandb.log(
-                {
-                    "test_summary_table": wandb.Table(
-                        data=test_summary[1:], columns=test_summary[0]
-                    )
-                }
-            )
+            wandb.log({"test_results_comparison": wandb.Table(data=comparison_data[1:], columns=comparison_data[0])})
+
+            # Print summary to console as well
+            print("\n" + "=" * 60)
+            print("TEST RESULTS SUMMARY")
+            print("=" * 60)
+            for row in comparison_data:
+                if row == comparison_data[0]:  # Header
+                    print(f"{row[0]:<15} {row[1]:<18} {row[2]:<18} {row[3]}")
+                    print("-" * 60)
+                else:
+                    print(f"{row[0]:<15} {row[1]:<18} {row[2]:<18} {row[3]}")
+            print("=" * 60)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-4)
@@ -1375,37 +1362,49 @@ class NODE(LightningModule):
         return colors
 
     def plot_nature_style_with_uncertainty(
-        self, predictions_full, targets, combined_mask, batch_idx
+            self, predictions_full, targets, combined_mask, batch_idx, suffix
     ):
         """Nature-style plots with uncertainty bands around predictions"""
         import os
 
         import matplotlib.pyplot as plt
 
+        try:
+            plt.switch_backend("Agg")
+        except Exception:
+            pass
+
         colors = self._setup_plot_style()
         os.makedirs(os.path.join(self.train_dir, "nature_plots"), exist_ok=True)
 
-        if predictions_full.dim() == 4:
-            pred_mean = predictions_full.squeeze(1)  # Remove fake samples dim
-            pred_std = torch.zeros_like(
-                pred_mean
-            )  # No uncertainty for deterministic NODE
-        else:
-            pred_mean = predictions_full
-            pred_std = torch.zeros_like(pred_mean)
+        pred_mean = predictions_full.mean(1).detach()
+        pred_std = predictions_full.std(1, unbiased=False).detach()
+        targets = targets.detach() if targets.requires_grad else targets
 
-        for patient_idx in range(min(3, predictions_full.shape[0])):
+        for patient_idx in range(min(8, predictions_full.shape[0])):
             patient_mask = combined_mask[patient_idx]
-            valid_both = patient_mask.sum(dim=1) == 2
-            valid_indices = torch.where(valid_both)[0].cpu().numpy()
+            time_seconds = (torch.arange(patient_mask.shape[0]).cpu().numpy()) * 10
+            pred_mean_patient = pred_mean[patient_idx].detach().cpu().numpy()
+            pred_std_patient = pred_std[patient_idx].detach().cpu().numpy()
+            true_patient = targets[patient_idx].detach().cpu().numpy()
 
-            if len(valid_indices) < 5:
-                continue
+            arterial_mask = patient_mask[:, 0].cpu().numpy().astype(bool)
+            venous_mask = patient_mask[:, 1].cpu().numpy().astype(bool)
 
-            time_seconds = valid_indices * 10
-            pred_mean_patient = pred_mean[patient_idx, valid_indices].cpu().numpy()
-            pred_std_patient = pred_std[patient_idx, valid_indices].cpu().numpy()
-            true_patient = targets[patient_idx, valid_indices].cpu().numpy()
+            # Mask out invalid points per channel (plot with gaps where missing)
+            arterial_true = true_patient[:, 0].copy()
+            arterial_pred = pred_mean_patient[:, 0].copy()
+            arterial_std = pred_std_patient[:, 0].copy()
+            arterial_true[~arterial_mask] = np.nan
+            arterial_pred[~arterial_mask] = np.nan
+            arterial_std[~arterial_mask] = np.nan
+
+            venous_true = true_patient[:, 1].copy()
+            venous_pred = pred_mean_patient[:, 1].copy()
+            venous_std = pred_std_patient[:, 1].copy()
+            venous_true[~venous_mask] = np.nan
+            venous_pred[~venous_mask] = np.nan
+            venous_std[~venous_mask] = np.nan
 
             fig, ax = plt.subplots(figsize=(7, 5))
             ax.set_xlim(0, 1200)
@@ -1413,7 +1412,7 @@ class NODE(LightningModule):
             # Use consistent colors and styling
             ax.plot(
                 time_seconds,
-                true_patient[:, 0],
+                arterial_true,
                 color=colors["arterial_true"],
                 linestyle="-",
                 linewidth=2.0,
@@ -1422,7 +1421,7 @@ class NODE(LightningModule):
             )
             ax.plot(
                 time_seconds,
-                pred_mean_patient[:, 0],
+                arterial_pred,
                 color=colors["arterial_pred"],
                 linestyle="--",
                 linewidth=1.5,
@@ -1432,8 +1431,8 @@ class NODE(LightningModule):
             )
             ax.fill_between(
                 time_seconds,
-                pred_mean_patient[:, 0] - pred_std_patient[:, 0],
-                pred_mean_patient[:, 0] + pred_std_patient[:, 0],
+                arterial_pred - arterial_std,
+                arterial_pred + arterial_std,
                 color=colors["arterial_pred"],
                 alpha=0.2,
                 zorder=1,
@@ -1441,7 +1440,7 @@ class NODE(LightningModule):
 
             ax.plot(
                 time_seconds,
-                true_patient[:, 1],
+                venous_true,
                 color=colors["venous_true"],
                 linestyle="-",
                 linewidth=2.0,
@@ -1450,7 +1449,7 @@ class NODE(LightningModule):
             )
             ax.plot(
                 time_seconds,
-                pred_mean_patient[:, 1],
+                venous_pred,
                 color=colors["venous_pred"],
                 linestyle="--",
                 linewidth=1.5,
@@ -1460,8 +1459,8 @@ class NODE(LightningModule):
             )
             ax.fill_between(
                 time_seconds,
-                pred_mean_patient[:, 1] - pred_std_patient[:, 1],
-                pred_mean_patient[:, 1] + pred_std_patient[:, 1],
+                venous_pred - venous_std,
+                venous_pred + venous_std,
                 color=colors["venous_pred"],
                 alpha=0.2,
                 zorder=1,
@@ -1469,8 +1468,10 @@ class NODE(LightningModule):
 
             ax.set_xlabel("Time (seconds)", fontweight="bold")
             ax.set_ylabel("Pressure (mmHg)", fontweight="bold")
+            epoch_tag = f"epoch{int(getattr(self, 'current_epoch', 0)):03d}_step{int(getattr(self, 'global_step', 0)):06d}"
             ax.set_title(
-                f"Patient {patient_idx} (Batch {batch_idx})", fontweight="bold"
+                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})",
+                fontweight="bold",
             )
             ax.legend(
                 loc="upper right", fancybox=False, facecolor="white", framealpha=1.0
@@ -1480,18 +1481,22 @@ class NODE(LightningModule):
             if self.log_wandb:
                 wandb.log(
                     {
-                        f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}": wandb.Image(
+                        f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}{suffix}": wandb.Image(
                             plt
                         )
                     }
                 )
             else:
-                plt.savefig(
-                    os.path.join(
-                        self.train_dir,
-                        f"nature_plots/patient_{batch_idx}_{patient_idx}_uncertainty.png",
-                    ),
-                    dpi=300,
-                    bbox_inches="tight",
+                try:
+                    last_hadm = int(getattr(self, "_last_hadm_ids", [None])[patient_idx])
+                    last_traj = int(getattr(self, "_last_traj_ids", [None])[patient_idx])
+                    id_suffix = f"_hadm{last_hadm}_traj{last_traj}" if last_hadm is not None and last_traj is not None else ""
+                except Exception:
+                    id_suffix = ""
+                out_path = os.path.join(
+                    self.train_dir,
+                    f"nature_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}{suffix}_uncertainty.png",
                 )
+                plt.savefig(out_path, dpi=300, bbox_inches="tight")
+                print(f"[PLOT] Saved: {out_path}")
             plt.close()
