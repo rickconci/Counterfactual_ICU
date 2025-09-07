@@ -1,3 +1,4 @@
+
 import os
 import platform
 import pickle
@@ -9,18 +10,20 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import typing as t
+from collections import defaultdict
 
 
 class MIMICDataset(Dataset):
     def __init__(
         self,
         data_root,
-        icu_stays_path,
         split="train",
+        split_mode="random",  # 'random', 'in_distribution', 'ood'
         train_ratio=0.7,
         val_ratio=0.15,
         random_state=42,
         max_samples=None,
+        ood_holdout_ratio=0.1, # Percentage of combos to hold out for OOD test
         filter_flat_trajectories=False,  # New parameter
         flatness_std_threshold=2.0,  # New parameter
         flatness_range_threshold=5.0,
@@ -44,11 +47,10 @@ class MIMICDataset(Dataset):
             self.data_root, "baseline_tensors_output", "baseline_tensors"
         )
         self.max_samples = max_samples
-
+        
         physio_metadata_path = os.path.join(
             data_root, "physio_tensors_output/physio_tensors_metadata.pkl"
         )
-
         # Load physio metadata from provided path
         with open(physio_metadata_path, "rb") as f:
             physio_metadata = pickle.load(f)
@@ -63,8 +65,22 @@ class MIMICDataset(Dataset):
             )
         with open(med_metadata_path, "rb") as f:
             med_metadata = pickle.load(f)
-        self.med_trajectories = med_metadata["trajectories"]
-        # Store med feature names for normalization
+
+        # Load consolidated metadata
+        consolidated_metadata_path = os.path.join(
+            data_root, "med_tensors_output/consolidated_trajectory_metadata.pkl"
+        )
+        if not os.path.exists(consolidated_metadata_path):
+            raise FileNotFoundError(
+                f"Consolidated metadata not found at {consolidated_metadata_path}"
+            )
+        with open(consolidated_metadata_path, "rb") as f:
+            self.metadata = pickle.load(f)
+        
+        self.trajectories_metadata = self.metadata["trajectories"]
+        self.med_combos_info = self.metadata.get("med_combos", {})
+        self.id_to_combo = self.med_combos_info.get("id_to_combo", {})
+
         self.med_feature_names = med_metadata.get("med_feature_names", [
             "rate_hr_weight_norm",
             "pre_on_hours_log1p", 
@@ -87,60 +103,60 @@ class MIMICDataset(Dataset):
             zip(admissions_df["HADM_ID"], admissions_df["SUBJECT_ID"])
         )
 
-        # Each trajectory from the IC metadata is a sample
+        # Each trajectory with complete data is a sample
         all_trajectories = []
-        for traj_key, ic_traj_info in self.ic_tensors_metadata.items():
-            hadm_id = ic_traj_info["hadm_id"]
-            action_cluster_id = ic_traj_info["action_cluster_id"]
-
+        for traj_key, traj_info in self.trajectories_metadata.items():
+            if not traj_info.get("has_complete_data", True): # Assume complete if key missing
+                continue
+                
+            hadm_id = traj_info["hadm_id"]
+            action_cluster_id = traj_info["action_cluster_id"]
+            
             # Get subject_id for this hadm_id
             if hadm_id not in hadm_to_subject:
                 continue
             subject_id = hadm_to_subject[hadm_id]
 
-            # Check if corresponding med trajectory exists
-            if traj_key not in self.med_trajectories:
-                continue
-
-            # Add this trajectory (now with subject_id)
             all_trajectories.append(
                 {
                     "hadm_id": hadm_id,
-                    "subject_id": subject_id,  # Add subject_id
-                    "action_cluster_id": action_cluster_id,
+                    "subject_id": subject_id,
+                    "action_cluster_id": traj_info["action_cluster_id"],
                     "traj_key": traj_key,
+                    "med_combo_id": traj_info.get("med_combo_id", -1)
                 }
             )
-        # Filter out flat trajectories if enabled
-        if self.filter_flat_trajectories:
-            print(f"Before filtering: {len(all_trajectories)} trajectories")
 
-            filtered_trajectories = []
+            # Filter out flat trajectories if enabled
+            if self.filter_flat_trajectories:
+                print(f"Before filtering: {len(all_trajectories)} trajectories")
 
-            for traj in all_trajectories:
-                traj_key = traj["traj_key"]
+                filtered_trajectories = []
 
-                # Load prediction targets to check flatness
-                p_out_path = os.path.join(self.target_tensor_dir, f"pred_targets_{traj_key}.pt")
-                if not os.path.exists(p_out_path):
-                    continue
+                for traj in all_trajectories:
+                    traj_key = traj["traj_key"]
 
-                try:
-                    p_out_values, p_out_mask, _, _, _ = torch.load(p_out_path)
+                    # Load prediction targets to check flatness
+                    p_out_path = os.path.join(self.target_tensor_dir, f"pred_targets_{traj_key}.pt")
+                    if not os.path.exists(p_out_path):
+                        continue
 
-                    # Use the class method to check flatness
-                    if not self.is_trajectory_flat(p_out_values, p_out_mask):
-                        filtered_trajectories.append(traj)
+                    try:
+                        p_out_values, p_out_mask, _, _, _ = torch.load(p_out_path)
 
-                except Exception as e:
-                    print(f"Error loading trajectory {traj_key}: {e}")
-                    continue
+                        # Use the class method to check flatness
+                        if not self.is_trajectory_flat(p_out_values, p_out_mask):
+                            filtered_trajectories.append(traj)
 
-            print(f"After filtering: {len(filtered_trajectories)} trajectories")
-            print(f"Filtered out {len(all_trajectories)-len(filtered_trajectories)} flat trajectories")
-            all_trajectories = filtered_trajectories
-        else:
-            print("Flat trajectory filtering is disabled")
+                    except Exception as e:
+                        print(f"Error loading trajectory {traj_key}: {e}")
+                        continue
+
+                print(f"After filtering: {len(filtered_trajectories)} trajectories")
+                print(f"Filtered out {len(all_trajectories)-len(filtered_trajectories)} flat trajectories")
+                all_trajectories = filtered_trajectories
+            else:
+                print("Flat trajectory filtering is disabled")
 
         # Split by subject_id instead of hadm_id to prevent data leakage
         subject_trajectory_counts = {}
@@ -150,70 +166,145 @@ class MIMICDataset(Dataset):
                 subject_trajectory_counts.get(subject_id, 0) + 1
             )
 
-        # Randomly shuffle subjects (not hadm_ids)
-        subjects_with_counts = [
-            (subject_id, count)
-            for subject_id, count in subject_trajectory_counts.items()
-        ]
+
+        
+
+        # --- Data Splitting Logic ---
         np.random.seed(random_state)
-        np.random.shuffle(subjects_with_counts)
+        
+        if split_mode == 'random':
+            self.samples = self._random_subject_split(all_trajectories, split, train_ratio, val_ratio, random_state)
+        elif split_mode == 'in_distribution_meds_combo':
+            self.samples = self._in_distribution_split(all_trajectories, split, train_ratio, val_ratio, random_state)
+        elif split_mode == 'ood_meds_combo':
+            self.samples = self._ood_split(all_trajectories, split, train_ratio, val_ratio, ood_holdout_ratio, random_state)
+        elif split_mode == 'variance_test_only':
+            self.samples = self._variance_test_only_split(all_trajectories, split, train_ratio, val_ratio, random_state)
+        else:
+            raise ValueError(f"Unknown split mode: {split_mode}")
 
-        total_trajectories = len(all_trajectories)
-        target_train = int(train_ratio * total_trajectories)
-        target_val = int(val_ratio * total_trajectories)
-        target_test = total_trajectories - target_train - target_val
-
-        # Greedy assignment by subject
-        train_subjects = []
-        val_subjects = []
-        test_subjects = []
-        train_count = val_count = test_count = 0
-
-        for subject_id, traj_count in subjects_with_counts:
-            train_deficit = target_train - train_count
-            val_deficit = target_val - val_count
-            test_deficit = target_test - test_count
-
-            if (
-                train_deficit >= val_deficit
-                and train_deficit >= test_deficit
-                and train_deficit > 0
-            ):
-                train_subjects.append(subject_id)
-                train_count += traj_count
-            elif val_deficit >= test_deficit and val_deficit > 0:
-                val_subjects.append(subject_id)
-                val_count += traj_count
-            else:
-                test_subjects.append(subject_id)
-                test_count += traj_count
-
-        # Select subjects for this split
-        if split == "train":
-            split_subject_ids = set(train_subjects)
-        elif split == "val":
-            split_subject_ids = set(val_subjects)
-        elif split == "test":
-            split_subject_ids = set(test_subjects)
-
-        # Filter trajectories by subject_id (not hadm_id)
-        self.samples = [
-            traj for traj in all_trajectories if traj["subject_id"] in split_subject_ids
-        ]
 
         if self.max_samples is not None:
             self.samples = self.samples[: int(max_samples)]
             print(f"[DEBUG] Limited to {len(self.samples)} samples for testing")
 
-        print(f"Split '{split}': {len(self.samples)} trajectories")
-        print(f"Target trajectory split: {target_train}/{target_val}/{target_test}")
-        print(f"Actual trajectory split: {train_count}/{val_count}/{test_count}")
-        print(
-            f"Trajectory percentages: {train_count / total_trajectories * 100:.1f}%/{val_count / total_trajectories * 100:.1f}%/{test_count / total_trajectories * 100:.1f}%"
-        )
+        print(f"Split '{split}' ({split_mode}): {len(self.samples)} trajectories from {len(set(s['subject_id'] for s in self.samples))} subjects.")
 
         # Compute normalization stats and load normalized tensors into memory
         #self.med_norm_stats, self.med_tensors_cache = self._compute_and_load_normalized_tensors()
+
+    def _random_subject_split(self, trajectories, split, train_ratio, val_ratio, random_state):
+        """Original random split by subject ID."""
+        subject_to_trajs = defaultdict(list)
+        for traj in trajectories:
+            subject_to_trajs[traj['subject_id']].append(traj)
+
+        subjects = list(subject_to_trajs.keys())
+        np.random.shuffle(subjects)
+
+        n_train = int(len(subjects) * train_ratio)
+        n_val = int(len(subjects) * val_ratio)
+
+        if split == 'train':
+            split_subjects = subjects[:n_train]
+        elif split == 'val':
+            split_subjects = subjects[n_train : n_train + n_val]
+        else: # test
+            split_subjects = subjects[n_train + n_val:]
+            
+        split_samples = []
+        for subj_id in split_subjects:
+            split_samples.extend(subject_to_trajs[subj_id])
+        return split_samples
+
+    def _in_distribution_split(self, trajectories, split, train_ratio, val_ratio, random_state):
+        """Ensures all med combos are represented in each split, subject-wise."""
+        combo_to_subjects = defaultdict(set)
+        for traj in trajectories:
+            combo_to_subjects[traj['med_combo_id']].add(traj['subject_id'])
+            
+        train_subjects, val_subjects, test_subjects = set(), set(), set()
+
+        for combo_id, subjects in combo_to_subjects.items():
+            subject_list = sorted(list(subjects))
+            np.random.shuffle(subject_list)
+            
+            n_train = int(len(subject_list) * train_ratio)
+            n_val = int(len(subject_list) * val_ratio)
+            
+            train_subjects.update(subject_list[:n_train])
+            val_subjects.update(subject_list[n_train : n_train + n_val])
+            test_subjects.update(subject_list[n_train + n_val:])
+        
+        # Resolve overlaps - a subject can only be in one split
+        val_subjects -= train_subjects
+        test_subjects -= (train_subjects | val_subjects)
+        
+        if split == 'train':
+            split_subject_ids = train_subjects
+        elif split == 'val':
+            split_subject_ids = val_subjects
+        else: # test
+            split_subject_ids = test_subjects
+            
+        return [t for t in trajectories if t['subject_id'] in split_subject_ids]
+
+    def _ood_split(self, trajectories, split, train_ratio, val_ratio, ood_holdout_ratio, random_state):
+        """Holds out a fraction of med combos entirely for the test set."""
+        combo_df = self.med_combos_info.get("combo_df")
+        if combo_df is None or combo_df.empty:
+            print("Warning: Combo DF not found for OOD split. Falling back to random split.")
+            return self._random_subject_split(trajectories, split, train_ratio, val_ratio, random_state)
+
+        # Sort combos by frequency (most common first)
+        sorted_combos = combo_df.sort_values('count', ascending=False)
+        
+        # Determine number of combos to hold out
+        n_holdout = int(len(sorted_combos) * ood_holdout_ratio)
+        if n_holdout == 0 and len(sorted_combos) > 0:
+            n_holdout = 1 # Hold out at least one
+        
+        # Get IDs of combos to hold out (least common ones)
+        ood_combo_tuples = list(sorted_combos.tail(n_holdout)['combo'])
+        combo_to_id = self.med_combos_info.get("combo_to_id", {})
+        ood_combo_ids = {combo_to_id[combo] for combo in ood_combo_tuples if combo in combo_to_id}
+        
+        print(f"OOD Split: Holding out {len(ood_combo_ids)} least common medication combos for testing.")
+
+        test_trajectories = [t for t in trajectories if t['med_combo_id'] in ood_combo_ids]
+        
+        if split == 'test':
+            return test_trajectories
+        
+        # The rest are for train/val
+        remaining_trajs = [t for t in trajectories if t['med_combo_id'] not in ood_combo_ids]
+        
+        # Split remaining trajectories by subject for train/val
+        # Adjust ratio because test set is already removed
+        remaining_total = len(remaining_trajs)
+        if remaining_total == 0:
+            return [] # No data left for train/val
+            
+        new_train_ratio = train_ratio / (train_ratio + val_ratio)
+
+        subject_to_trajs = defaultdict(list)
+        for traj in remaining_trajs:
+            subject_to_trajs[traj['subject_id']].append(traj)
+
+        subjects = list(subject_to_trajs.keys())
+        np.random.shuffle(subjects)
+        
+        n_train = int(len(subjects) * new_train_ratio)
+        
+        if split == 'train':
+            split_subjects = subjects[:n_train]
+        else: # val
+            split_subjects = subjects[n_train:]
+            
+        split_samples = []
+        for subj_id in split_subjects:
+            split_samples.extend(subject_to_trajs[subj_id])
+        return split_samples
 
     def __len__(self):
         return len(self.samples)
@@ -223,6 +314,7 @@ class MIMICDataset(Dataset):
         hadm_id = sample_info["hadm_id"]
         action_cluster_id = sample_info["action_cluster_id"]
         traj_key = sample_info["traj_key"]
+        med_combo_id = sample_info["med_combo_id"]
 
         # Load Raindrop-ready context (required)
         rd_context_dir = os.path.join(self.context_tensors_dir, "raindrop_context")
@@ -319,6 +411,7 @@ class MIMICDataset(Dataset):
             # IDs for traceability
             "hadm_id": torch.tensor(int(hadm_id), dtype=torch.long),
             "traj_id": torch.tensor(int(action_cluster_id), dtype=torch.long),
+            "med_combo_id": torch.tensor(int(med_combo_id), dtype=torch.long),
         }
 
     def is_trajectory_flat(self, p_out_values, p_out_mask):
@@ -362,6 +455,8 @@ class MIMICDataModule(L.LightningDataModule):
         num_workers=1,
         random_state=42,
         max_samples=None,
+        split_mode: str = "random",
+        ood_holdout_ratio: float = 0.1,
         use_raindrop_context: bool = True,
         expert_latent_dim: int | None = None,
     ):
@@ -374,6 +469,8 @@ class MIMICDataModule(L.LightningDataModule):
         self.random_state = random_state
         self.static_input_dim = None
         self.max_samples = max_samples
+        self.split_mode = split_mode
+        self.ood_holdout_ratio = ood_holdout_ratio
         self.use_raindrop_context = use_raindrop_context
         # Derived lengths from generation config (filled in setup from combined metadata)
         self.context_max_len: int | None = None
@@ -381,6 +478,8 @@ class MIMICDataModule(L.LightningDataModule):
         self.expert_latent_dim = expert_latent_dim
         # Store nominal interval seconds if present in metadata (fallback to 10)
         self.interval_seconds: int = 10
+        # For logging and plotting
+        self.id_to_combo: dict = {}
         self.filter_flat_trajectories = filter_flat_trajectories
         self.test_both_filtered_and_unfiltered = test_both_filtered_and_unfiltered
 
@@ -412,20 +511,25 @@ class MIMICDataModule(L.LightningDataModule):
         if stage == "fit" or stage is None:
             self.train_dataset = MIMICDataset(
                 self.data_root,
-                self.icu_stays_path,
                 split="train",
+                split_mode=self.split_mode,
                 random_state=self.random_state,
                 max_samples=self.max_samples,
+                ood_holdout_ratio=self.ood_holdout_ratio,
                 filter_flat_trajectories=self.filter_flat_trajectories
             )
             self.val_dataset = MIMICDataset(
                 self.data_root,
-                self.icu_stays_path,
                 split="val",
+                split_mode=self.split_mode,
                 random_state=self.random_state,
                 max_samples=self.max_samples,
+                ood_holdout_ratio=self.ood_holdout_ratio,
                 filter_flat_trajectories=self.filter_flat_trajectories
             )
+            # Store combo map from one of the datasets (they are the same)
+            self.id_to_combo = self.train_dataset.id_to_combo
+
 
             # Get static dim from metadata
             baseline_metadata_path = os.path.join(
@@ -497,10 +601,11 @@ class MIMICDataModule(L.LightningDataModule):
                 # Single test dataset using the original filter setting
                 self.test_dataset = MIMICDataset(
                     self.data_root,
-                    self.icu_stays_path,
-                    split="test",
+                        split="test",
+                split_mode=self.split_mode,
                     random_state=self.random_state,
                     max_samples=self.max_samples,
+                ood_holdout_ratio=self.ood_holdout_ratio,
                     filter_flat_trajectories=self.filter_flat_trajectories)
                 if len(self.test_dataset) > 0 and self.encoder_input_dim is None:
                     sample0 = self.test_dataset[0]
@@ -592,7 +697,7 @@ class MIMICDataModule(L.LightningDataModule):
         # No fixed-size legacy context tensors to stack
         stack_keys = []
 
-        no_pad_keys = ["init_state", "ic_mask", "static", "rd_length", "hadm_id", "traj_id"]
+        no_pad_keys = ["init_state", "ic_mask", "static", "rd_length", "hadm_id", "traj_id", "med_combo_id"]
 
         collated = {}
 
@@ -721,4 +826,5 @@ class MIMICDataModule(L.LightningDataModule):
             collated["med_tensors"],  # [B, T_fwd, 2*M]
             collated["hadm_id"],  # [B]
             collated["traj_id"],  # [B]
+            collated["med_combo_id"], # [B]
         )

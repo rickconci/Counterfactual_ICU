@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import os
 import pandas as pd
+from collections import Counter, defaultdict
+import numpy as np
 
 
 def load_metadata(metadata_path: str) -> Dict[str, Any]:
@@ -71,6 +73,130 @@ def extract_trigger_medications(
     return trigger_medications
 
 
+# --- helpers
+def _to_utc(s): 
+    return pd.to_datetime(s, errors="coerce", utc=True)
+
+def _norm_label(x: str) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)): 
+        return ""
+    return str(x).strip()
+
+# Treat IV bolus of NaCl/LR as distinct tokens
+_BOLUS_NAME = "03-IV Fluid Bolus"
+_LR_ALIASES = {"LR"}
+_NACL_ALIASES = {"NaCl 0.9%"}  # extend as needed
+
+def _med_token(row: pd.Series) -> str:
+    base = _norm_label(row.get("item_label"))
+    iname = str(row.get("input_name", "")).strip()
+    if iname == _BOLUS_NAME:
+        if base in _NACL_ALIASES:
+            return f"{base} [Bolus]"
+        if base in _LR_ALIASES:
+            return f"{base} [Bolus]"
+    return base
+
+def rank_action_window_combinations(
+    df: pd.DataFrame,
+    window_minutes: int = 20,
+    drop_empty: bool = True,
+):
+    """
+    For each (hadm_id, action_cluster_id):
+      • t0 = earliest trigger start_time; fallback to earliest start if no trigger in cluster
+      • action window = [t0, t0 + window_minutes]
+      • include any med rows that overlap the window:
+          start_time <= window_end  AND  (end_time is NA OR end_time >= t0)
+      • build a unique, sorted tuple of med tokens for that cluster
+        (NaCl/LR IV bolus gets a '[Bolus]' tag separate from drips)
+
+    Returns:
+      combo_df: DataFrame with columns ['combo','count','percent','example_pairs']
+      cluster_combo_map: DataFrame mapping each (hadm_id, action_cluster_id) to its 'combo'
+    """
+    m = df.copy()
+    # keep only clusters
+    m = m[m["action_cluster_id"].notna()]
+    if m.empty:
+        return (
+            pd.DataFrame(columns=["combo","count","percent","example_pairs"]),
+            pd.DataFrame(columns=["hadm_id","action_cluster_id","combo"])
+        )
+
+    # times
+    m["start_time"] = _to_utc(m["start_time"])
+    m["end_time"]   = _to_utc(m.get("end_time"))
+
+    gkeys = ["hadm_id", "action_cluster_id"]
+
+    # t0 = earliest trigger; fallback to earliest start
+    trig_mask = m["trigger"].fillna(False)
+    t0_trigger  = m.loc[trig_mask].groupby(gkeys)["start_time"].min()
+    t0_fallback = m.groupby(gkeys)["start_time"].min()
+    t0_series   = t0_trigger.combine_first(t0_fallback)
+
+    delta = pd.Timedelta(minutes=window_minutes)
+
+    cluster_pairs   = []
+    cluster_combos  = []
+    for (hadm, cid), t0 in t0_series.items():
+        sub = m[(m["hadm_id"] == hadm) & (m["action_cluster_id"] == cid)]
+        if pd.isna(t0):
+            continue
+        window_end = t0 + delta
+
+        # overlap with action window
+        st = sub["start_time"]
+        et = sub["end_time"]
+        overlap = (st <= window_end) & (et.isna() | (et >= t0))
+        win = sub.loc[overlap].copy()
+        if win.empty and drop_empty:
+            continue
+
+        # make tokens (bolus NaCl/LR distinct)
+        win["med_token"] = win.apply(_med_token, axis=1)
+        meds = tuple(sorted(t for t in win["med_token"].dropna().unique() if t and t.strip()))
+        if not meds and drop_empty:
+            continue
+
+        cluster_pairs.append((hadm, cid))
+        cluster_combos.append(meds)
+
+    if not cluster_combos:
+        return (
+            pd.DataFrame(columns=["combo","count","percent","example_pairs"]),
+            pd.DataFrame(columns=["hadm_id","action_cluster_id","combo"])
+        )
+
+    # Count combos across all clusters
+    counter = Counter(cluster_combos)
+    total   = sum(counter.values())
+
+    # Ranked table
+    rows = []
+    # collect up to a few example pairs per combo
+    examples = defaultdict(list)
+    for pair, combo in zip(cluster_pairs, cluster_combos):
+        if len(examples[combo]) < 5:
+            examples[combo].append(pair)
+
+    for combo, cnt in counter.most_common():
+        rows.append({
+            "combo": combo,
+            "count": cnt,
+            "percent": cnt / total if total else np.nan,
+            "example_pairs": examples[combo],  # list of (hadm_id, action_cluster_id)
+        })
+    combo_df = pd.DataFrame(rows)
+
+    # Mapping each cluster -> its combo
+    cluster_combo_map = pd.DataFrame(cluster_pairs, columns=["hadm_id","action_cluster_id"])
+    cluster_combo_map["combo"] = cluster_combos
+
+    return combo_df, cluster_combo_map
+
+
 def consolidate_trajectory_metadata(
     med_metadata_path: str,
     physio_metadata_path: str,
@@ -98,13 +224,26 @@ def consolidate_trajectory_metadata(
     print(f"Loaded med metadata with {len(med_metadata['trajectories'])} trajectories")
     print(f"Loaded physio metadata with {len(physio_metadata['ic_tensors'])} IC tensors")
     
-    # Extract trigger medications if medication data is provided
+    # Extract trigger medications and rank action combos if medication data is provided
     trigger_medications = {}
+    combo_df = pd.DataFrame()
+    cluster_combo_map = pd.DataFrame()
+    
     if med_data_path and os.path.exists(med_data_path):
+        from create_med_tensors import load_medication_data
+        df_full, _ = load_medication_data(med_data_path)
         trigger_medications = extract_trigger_medications(med_data_path, med_metadata)
+        print("Ranking medication combinations...")
+        combo_df, cluster_combo_map = rank_action_window_combinations(df_full)
+        # Create a lookup map from (hadm_id, action_cluster_id) to combo
+        combo_lookup = cluster_combo_map.set_index(['hadm_id', 'action_cluster_id'])['combo'].to_dict()
+        # Create a mapping from combo tuple to a unique integer ID
+        combo_to_id = {combo: i for i, combo in enumerate(combo_df['combo'])}
     else:
-        print("No medication data path provided. Trigger information will be empty.")
+        print("No medication data path provided. Trigger and combo information will be empty.")
         trigger_medications = {traj_key: [] for traj_key in med_metadata["trajectories"].keys()}
+        combo_lookup = {}
+        combo_to_id = {}
     
     # Consolidate trajectory information
     print("\n=== Consolidating Trajectory Metadata ===")
@@ -116,6 +255,12 @@ def consolidate_trajectory_metadata(
         ic_info = physio_metadata["ic_tensors"].get(traj_key)
         pred_info = physio_metadata["prediction_targets"].get(traj_key)
         
+        # Get medication combination for this trajectory
+        hadm_id = med_traj_info["hadm_id"]
+        action_cluster_id = med_traj_info["action_cluster_id"]
+        combo = combo_lookup.get((hadm_id, action_cluster_id), tuple())
+        combo_id = combo_to_id.get(combo, -1) # -1 for combos not found (e.g., empty)
+        
         # Build consolidated trajectory info
         consolidated_traj = {
             # Basic trajectory info
@@ -126,6 +271,10 @@ def consolidate_trajectory_metadata(
             "trajectory_end_time": med_traj_info["trajectory_end_time"],
             "duration_minutes": med_traj_info["duration_minutes"],
             
+            # Medication combination info
+            "med_combo": combo,
+            "med_combo_id": combo_id,
+
             # Medication information at t0
             "medications_at_t0": med_traj_info.get("medications_at_t0", {}),
             "n_medications_at_t0": med_traj_info.get("n_medications_at_t0", 0),
@@ -177,6 +326,11 @@ def consolidate_trajectory_metadata(
             "med_data_path": med_data_path,
         },
         "trajectories": consolidated_trajectories,
+        "med_combos": {
+            "combo_df": combo_df,
+            "combo_to_id": combo_to_id,
+            "id_to_combo": {i: combo for combo, i in combo_to_id.items()}
+        },
         "summary_stats": {
             "total_trajectories": total_trajectories,
             "trajectories_with_physiological_data": trajectories_with_physio,

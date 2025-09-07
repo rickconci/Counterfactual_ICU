@@ -1313,7 +1313,7 @@ class Hybrid_SDE(LightningModule):
             dim=1,
         )
 
-        # y now contains: [i_ext (2), expert_latents (14), neural_embedding (4)]
+        # y now contains: [i_ext (SDEnet_out_dims), expert_latents (14), neural_embedding (encoder_SDENN_dims)]
 
         i_ext_SDE_dict = {}
         for i in range(self.SDEnet_out_dims):
