@@ -2556,6 +2556,7 @@ class Hybrid_SDE(LightningModule):
                     result["combined_mask"],
                     result["i_ext_path"],
                     batch_idx,
+                    "",
                     result["z1_for_sde"],
                 )
             except Exception as e:
@@ -2768,8 +2769,8 @@ class Hybrid_SDE(LightningModule):
                 combined_mask,
                 result["i_ext_path"],
                 batch_idx,
-                result["z1_for_sde"],
-                suffix
+                suffix,
+                result["z1_for_sde"]
             )
 
         return_dict = {
@@ -2817,31 +2818,71 @@ class Hybrid_SDE(LightningModule):
             self.theta = checkpoint["theta"]
 
     def on_test_epoch_end(self):
-        """Log final test metrics to wandb"""
+        """Log final test metrics to wandb with proper handling of multiple test datasets"""
         if self.log_wandb:
-            # Get the logged metrics
-            test_results = {
-                'final_test_loss': self.trainer.callback_metrics.get('test_total_loss', 0),
-                'final_test_mse': self.trainer.callback_metrics.get('test_mse', 0),
-                'final_test_mae': self.trainer.callback_metrics.get('test_mae', 0),
-                'final_test_nll': self.trainer.callback_metrics.get('test_NLL', 0),
-                'final_test_kl': self.trainer.callback_metrics.get('test_KL', 0)
+            # Extract metrics using the correct key format with dataloader_idx suffixes
+            all_metrics = {
+                'total_loss': float(self.trainer.callback_metrics.get('test_total_loss_all/dataloader_idx_0', 0)),
+                'main_loss': float(self.trainer.callback_metrics.get('test_main_loss_all/dataloader_idx_0', 0)),
+                'mse': float(self.trainer.callback_metrics.get('test_mse_all/dataloader_idx_0', 0)),
+                'mae': float(self.trainer.callback_metrics.get('test_mae_all/dataloader_idx_0', 0)),
+                'nll': float(self.trainer.callback_metrics.get('test_NLL_all/dataloader_idx_0', 0)),
+                'kl': float(self.trainer.callback_metrics.get('test_KL_all/dataloader_idx_0', 0)),
+                'ic_consistency': float(
+                    self.trainer.callback_metrics.get('test_ic_consistency_loss_all/dataloader_idx_0', 0)),
+                'zenker_mse': float(self.trainer.callback_metrics.get('test_zenker_mse_all/dataloader_idx_0', 0)),
+                'zenker_mae': float(self.trainer.callback_metrics.get('test_zenker_mae_all/dataloader_idx_0', 0))
             }
 
-            # Log final summary
-            wandb.log(test_results)
+            filtered_metrics = {
+                'total_loss': float(self.trainer.callback_metrics.get('test_total_loss_filtered/dataloader_idx_1', 0)),
+                'main_loss': float(self.trainer.callback_metrics.get('test_main_loss_filtered/dataloader_idx_1', 0)),
+                'mse': float(self.trainer.callback_metrics.get('test_mse_filtered/dataloader_idx_1', 0)),
+                'mae': float(self.trainer.callback_metrics.get('test_mae_filtered/dataloader_idx_1', 0)),
+                'nll': float(self.trainer.callback_metrics.get('test_NLL_filtered/dataloader_idx_1', 0)),
+                'kl': float(self.trainer.callback_metrics.get('test_KL_filtered/dataloader_idx_1', 0)),
+                'ic_consistency': float(
+                    self.trainer.callback_metrics.get('test_ic_consistency_loss_filtered/dataloader_idx_1', 0)),
+                'zenker_mse': float(self.trainer.callback_metrics.get('test_zenker_mse_filtered/dataloader_idx_1', 0)),
+                'zenker_mae': float(self.trainer.callback_metrics.get('test_zenker_mae_filtered/dataloader_idx_1', 0))
+            }
 
-            # Create a summary table
-            test_summary = [
-                ['Metric', 'Value'],
-                ['Total Loss', f"{test_results['final_test_loss']:.4f}"],
-                ['MSE', f"{test_results['final_test_mse']:.4f}"],
-                ['MAE', f"{test_results['final_test_mae']:.4f}"],
-                ['NLL', f"{test_results['final_test_nll']:.4f}"],
-                ['KL Divergence', f"{test_results['final_test_kl']:.4f}"]
+            # Create comparison table
+            comparison_data = [
+                ['Metric', 'All Trajectories', 'Filtered Trajectories', 'Difference (All - Filtered)'],
+                ['MSE', f"{all_metrics['mse']:.4f}", f"{filtered_metrics['mse']:.4f}",
+                 f"{all_metrics['mse'] - filtered_metrics['mse']:.4f}"],
+                ['MAE', f"{all_metrics['mae']:.4f}", f"{filtered_metrics['mae']:.4f}",
+                 f"{all_metrics['mae'] - filtered_metrics['mae']:.4f}"],
+                ['Total Loss', f"{all_metrics['total_loss']:.4f}", f"{filtered_metrics['total_loss']:.4f}",
+                 f"{all_metrics['total_loss'] - filtered_metrics['total_loss']:.4f}"],
+                ['Main Loss', f"{all_metrics['main_loss']:.4f}", f"{filtered_metrics['main_loss']:.4f}",
+                 f"{all_metrics['main_loss'] - filtered_metrics['main_loss']:.4f}"],
+                ['NLL', f"{all_metrics['nll']:.4f}", f"{filtered_metrics['nll']:.4f}",
+                 f"{all_metrics['nll'] - filtered_metrics['nll']:.4f}"],
+                ['KL Divergence', f"{all_metrics['kl']:.4f}", f"{filtered_metrics['kl']:.4f}",
+                 f"{all_metrics['kl'] - filtered_metrics['kl']:.4f}"],
+                ['IC Consistency', f"{all_metrics['ic_consistency']:.4f}", f"{filtered_metrics['ic_consistency']:.4f}",
+                 f"{all_metrics['ic_consistency'] - filtered_metrics['ic_consistency']:.4f}"],
+                ['Zenker MSE', f"{all_metrics['zenker_mse']:.4f}", f"{filtered_metrics['zenker_mse']:.4f}",
+                 f"{all_metrics['zenker_mse'] - filtered_metrics['zenker_mse']:.4f}"],
+                ['Zenker MAE', f"{all_metrics['zenker_mae']:.4f}", f"{filtered_metrics['zenker_mae']:.4f}",
+                 f"{all_metrics['zenker_mae'] - filtered_metrics['zenker_mae']:.4f}"]
             ]
 
-            wandb.log({"test_summary_table": wandb.Table(data=test_summary[1:], columns=test_summary[0])})
+            wandb.log({"test_results_comparison": wandb.Table(data=comparison_data[1:], columns=comparison_data[0])})
+
+            # Print summary to console as well
+            print("\n" + "=" * 60)
+            print("TEST RESULTS SUMMARY")
+            print("=" * 60)
+            for row in comparison_data:
+                if row == comparison_data[0]:  # Header
+                    print(f"{row[0]:<15} {row[1]:<18} {row[2]:<18} {row[3]}")
+                    print("-" * 60)
+                else:
+                    print(f"{row[0]:<15} {row[1]:<18} {row[2]:<18} {row[3]}")
+            print("=" * 60)
 
     def _setup_plot_style(self):
         """Shared plotting style configuration"""
@@ -3018,7 +3059,7 @@ class Hybrid_SDE(LightningModule):
         combined_mask,
         i_ext_path,
         batch_idx,
-        suffix,
+        suffix = "",
         z1_for_sde=None,
     ):
         """Plot BP + controls with detailed control analysis (Zenker baseline removed)."""
