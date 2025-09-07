@@ -731,7 +731,7 @@ class NODE(LightningModule):
         if valid_count > 0:
             ic_consistency_loss = mse_loss.sum() / valid_count
         else:
-            ic_consistency_loss = torch.tensor(0.0, device=predicted_ode_latents.device)
+            ic_consistency_loss = torch.tensor(0.0, device=predicted_ode_latents_sigmoid.device)
 
         if self.debug:
             print(

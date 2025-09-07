@@ -984,7 +984,9 @@ class NSDE(LightningModule):
                 med_trajectory_values,
                 med_trajectory_mask,
                 med_trajectory_time,
-                med_context,
+                med_tensors,
+                hadm_ids,
+                traj_ids,
             ) = batch
         else:
             raise NotImplementedError(
@@ -1076,7 +1078,7 @@ class NSDE(LightningModule):
         valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
 
         # Attach precomputed med_context for fast per-step indexing
-        self.current_med_tensors = med_context if med_context is not None else None
+        self.current_med_tensors = med_tensors if med_tensors is not None else None
 
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
@@ -1313,6 +1315,16 @@ class NSDE(LightningModule):
 
     def on_test_epoch_end(self):
         """Log final test metrics to wandb with proper handling of multiple test datasets"""
+        print("🔍 DEBUGGING NSDE TEST METRICS")
+        print("=" * 80)
+        print("ALL available callback metrics:")
+        for key, value in self.trainer.callback_metrics.items():
+            print(f"  {key}: {value}")
+
+        print("\nTest-related metrics only:")
+        test_metrics = {k: v for k, v in self.trainer.callback_metrics.items() if 'test' in k.lower()}
+        for key, value in test_metrics.items():
+            print(f"  {key}: {value}")
         if self.log_wandb:
             # Extract metrics using the correct key format with dataloader_idx suffixes
             all_metrics = {

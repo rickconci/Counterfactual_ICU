@@ -182,6 +182,8 @@ def main(args):
             num_workers=num_workers,
             random_state=args.seed,
             max_samples=args.max_samples,
+            use_raindrop_context=True,
+            expert_latent_dim=14,
             filter_flat_trajectories=args.filter_flat_trajectories,
             test_both_filtered_and_unfiltered=args.test_both_filtered_and_unfiltered
         )
