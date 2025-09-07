@@ -203,7 +203,8 @@ def main(args):
             max_samples=args.max_samples,
             use_raindrop_context=True,
             expert_latent_dim=14,
-            filter_flat_trajectories=args.filter_flat_trajectories
+            filter_flat_trajectories=args.filter_flat_trajectories,
+            test_both_filtered_and_unfiltered=args.test_both_filtered_and_unfiltered  # Add this line
         )
         data_module.setup()
         unique_dir_name = f"MIMIC_DATA_seed={args.seed}"  # Simplified name for now
@@ -381,7 +382,37 @@ def main(args):
     if args.run_eval:
         print("Running evaluation on test set...")
         test_results = trainer.test(ckpt_path="best", dataloaders=data_module)
-        print(f"Test results: {test_results}")
+
+        if args.test_both_filtered_and_unfiltered:
+            print(f"Test results (All trajectories): {test_results[0]}")
+            print(f"Test results (Filtered trajectories): {test_results[1]}")
+
+            # Log results to wandb if enabled
+            if args.log_wandb and wandb_logger is not None:
+                # Log metrics from all trajectories dataset
+                for key, value in test_results[0].items():
+                    wandb_logger.experiment.log({f"test_all/{key}": value})
+
+                # Log metrics from filtered trajectories dataset
+                for key, value in test_results[1].items():
+                    wandb_logger.experiment.log({f"test_filtered/{key}": value})
+
+                # Also log summary comparison metrics
+                if "test_mse" in test_results[0] and "test_mse" in test_results[1]:
+                    wandb_logger.experiment.log({
+                        "test_comparison/mse_all_vs_filtered": test_results[0]["test_mse"] - test_results[1]["test_mse"]
+                    })
+                if "test_mae" in test_results[0] and "test_mae" in test_results[1]:
+                    wandb_logger.experiment.log({
+                        "test_comparison/mae_all_vs_filtered": test_results[0]["test_mae"] - test_results[1]["test_mae"]
+                    })
+        else:
+            print(f"Test results: {test_results}")
+
+            if args.log_wandb and wandb_logger is not None:
+                for key, value in test_results[0].items():
+                    wandb_logger.experiment.log({f"test/{key}": value})
+
 
     # test_results_IID = trainer.test(ckpt_path='last', dataloaders = cv_data_module_IID.test_dataloader())
     # test_results_OOD = trainer.test(ckpt_path='last', dataloaders = cv_data_module_OOD.test_dataloader())
@@ -924,6 +955,14 @@ if __name__ == "__main__":
         type=int,
         default=3,
         help="How many batch elements to print during audit",
+    )
+    parser.add_argument(
+        "--test_both_filtered_and_unfiltered",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Test on both all trajectories and filtered (non-flat) trajectories",
     )
 
     args = parser.parse_args()

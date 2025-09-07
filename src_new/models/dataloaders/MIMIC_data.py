@@ -356,7 +356,8 @@ class MIMICDataModule(L.LightningDataModule):
         self,
         data_root,
         icu_stays_path,
-        filter_flat_trajectories = False,
+        filter_flat_trajectories=False,
+        test_both_filtered_and_unfiltered=False,
         batch_size=32,
         num_workers=1,
         random_state=42,
@@ -381,6 +382,7 @@ class MIMICDataModule(L.LightningDataModule):
         # Store nominal interval seconds if present in metadata (fallback to 10)
         self.interval_seconds: int = 10
         self.filter_flat_trajectories = filter_flat_trajectories
+        self.test_both_filtered_and_unfiltered = test_both_filtered_and_unfiltered
 
     def _resolve_num_workers(self) -> int:
         """Choose efficient default workers: 6-8 on non-macOS, 1 on macOS."""
@@ -468,14 +470,32 @@ class MIMICDataModule(L.LightningDataModule):
                     self.encoder_input_dim = int(sample0["rd_src"].shape[-1] // 2)
 
         if stage == "test" or stage is None:
-            self.test_dataset = MIMICDataset(
-                self.data_root,
-                self.icu_stays_path,
-                split="test",
-                random_state=self.random_state,
-                max_samples=self.max_samples,
-                filter_flat_trajectories=self.filter_flat_trajectories
-            )
+            if self.test_both_filtered_and_unfiltered:
+                self.test_dataset_all = MIMICDataset(
+                    self.data_root,
+                    self.icu_stays_path,
+                    split="test",
+                    random_state=self.random_state,
+                    max_samples=self.max_samples,
+                    filter_flat_trajectories=False  # All data
+                )
+                self.test_dataset_filtered = MIMICDataset(
+                    self.data_root,
+                    self.icu_stays_path,
+                    split="test",
+                    random_state=self.random_state,
+                    max_samples=self.max_samples,
+                    filter_flat_trajectories=True  # Filtered data only
+                )
+            else:
+                # Single test dataset using the original filter setting
+                self.test_dataset = MIMICDataset(
+                    self.data_root,
+                    self.icu_stays_path,
+                    split="test",
+                    random_state=self.random_state,
+                    max_samples=self.max_samples,
+                    filter_flat_trajectories=self.filter_flat_trajectories)
             if len(self.test_dataset) > 0 and self.encoder_input_dim is None:
                 sample0 = self.test_dataset[0]
                 if self.use_raindrop_context and "rd_src" in sample0:
@@ -516,12 +536,30 @@ class MIMICDataModule(L.LightningDataModule):
 
     def test_dataloader(self):
         kwargs = self._loader_common_kwargs()
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.batch_size,
-            collate_fn=self.collate_fn,
-            **{k: v for k, v in kwargs.items() if v is not None},
-        )
+        if self.test_both_filtered_and_unfiltered:
+            # Return list of dataloaders - Lightning will test on both
+            return [
+                DataLoader(
+                    self.test_dataset_all,
+                    batch_size=self.batch_size,
+                    collate_fn=self.collate_fn,
+                    **{k: v for k, v in kwargs.items() if v is not None},
+                ),
+                DataLoader(
+                    self.test_dataset_filtered,
+                    batch_size=self.batch_size,
+                    collate_fn=self.collate_fn,
+                    **{k: v for k, v in kwargs.items() if v is not None},
+                )
+            ]
+        else:
+            # Single test dataloader
+            return DataLoader(
+                self.test_dataset,
+                batch_size=self.batch_size,
+                collate_fn=self.collate_fn,
+                **{k: v for k, v in kwargs.items() if v is not None},
+            )
 
     def collate_fn(self, batch):
         # Dynamic lengths
