@@ -736,7 +736,7 @@ if __name__ == "__main__":
         type=str2bool,
         nargs="?",
         const=True,
-        default=True,
+        default=False,
         help="Whether to only train and test on flat trajectories",
     )
     parser.add_argument(
