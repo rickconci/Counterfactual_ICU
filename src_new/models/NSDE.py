@@ -9,6 +9,7 @@ from raindrop import Raindrop_v2
 from torch import distributions, nn
 import torchsde
 import numpy as np
+import torch.utils.checkpoint as checkpoint
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "utils"))
 from utils_beta import (
@@ -70,6 +71,7 @@ class NSDE(LightningModule):
         plot_every,
         dataset,
         KL_weighting_SDE,
+        med_embed_dim,
         debug=False,  # <<< Add debug flag >>>
     ):
         super().__init__()
@@ -81,7 +83,7 @@ class NSDE(LightningModule):
 
         if self.debug:
             print(
-                f"[DEBUG] ODE __init__: Initializing... adjoint={adjoint}, use_encoder={use_encoder}, normalise_for_ODENN={normalise_for_ODENN}"
+                f"[DEBUG] ODE __init__: Initializing... adjoint={adjoint}, use_encoder={use_encoder}"
             )
 
         ### ADMIN
@@ -190,15 +192,18 @@ class NSDE(LightningModule):
 
         net_input_dims = self.encoder_output_dim
         net_input_dims = net_input_dims + 2 if include_time else net_input_dims
+        self.med_embed_dim = med_embed_dim
+        # Use LazyLinear to infer input dim on first forward while keeping params registered
+        self.med_proj = nn.LazyLinear(self.med_embed_dim)
 
         if self.use_encoder != "none":
             self.ic_consistency_weight = 10
             # each medication has rate and last administration info
-            net_input_dims = net_input_dims + n_medications * 2
+            net_input_dims = net_input_dims + self.med_embed_dim
         else:
             self.ic_consistency_weight = 0
             # each medication has rate and last administration info
-            net_input_dims = self.expert_latent_dims + n_medications * 2
+            net_input_dims = self.expert_latent_dims + self.med_embed_dim
             net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "none": None}
@@ -509,19 +514,16 @@ class NSDE(LightningModule):
 
     def f(self, t, y):
         """SDE drift: predict pressure derivatives using full Zenker context"""
-        batch_size = y.shape[0]  # This is actually batch*samples
+        batch_size = y.shape[0]
 
-        # y is just [p_a, p_v] - the only evolving variables: [batch*samples, 2]
         current_pressures = y
-
-        # Normalize only the evolving pressures
         normalized_pressures = self.normalize_pressures_only(current_pressures)
 
-        # Combine with pre-normalized static Zenker context (already flattened)
+        # Combine with pre-normalized static Zenker context
         normalized_full_zenker = torch.cat([
-            normalized_pressures,  # [batch*samples, 2]
-            self.normalized_static_zenker  # [batch*samples, 12]
-        ], dim=-1)  # [batch*samples, 14]
+            normalized_pressures,  # [batch, 2] - newly normalized
+            self.normalized_static_zenker  # [batch, 12] - pre-normalized
+        ], dim=-1)  # [batch, 14]
 
         # Build network input: normalized Zenker + neural embedding
         if self.static_neural_embedding is not None:
@@ -529,18 +531,49 @@ class NSDE(LightningModule):
         else:
             nn_input = normalized_full_zenker
 
-        # Add time encoding if enabled
         if self.include_time:
-            time_encoding = torch.stack([torch.sin(t), torch.cos(t)]).repeat(batch_size, 1)
+            time_encoding = torch.stack([torch.sin(t), torch.cos(t)]).repeat(
+                batch_size, 1
+            )
             nn_input = torch.cat([nn_input, time_encoding], dim=-1)
 
-        # Add medication context (need to expand for samples)
-        med_context = self.get_medication_context(t, batch_size)
-        med_context = (med_context - 0.5) * 4.0
-        nn_input = torch.cat([nn_input, med_context], dim=-1)
+        # Index precomputed med context by time step
+        if not hasattr(self, "_t0"):
+            self._t0 = torch.tensor(0.0, device=self.device)
+        if not hasattr(self, "_dt_grid"):
+            self._dt_grid = torch.tensor(
+                float(self.integration_step_size), device=self.device
+            )
+        t_idx = torch.floor_divide((t.to(self._t0) - self._t0), 10).to(
+            torch.long
+        )
+        t_idx = torch.clamp(t_idx, 0, self.current_med_tensors.shape[1] - 1)
 
-        # Get pressure derivatives from network
-        pressure_derivatives = self.SDEnet(nn_input)  # [batch*samples, 2]
+        med_tensor = self.current_med_tensors[:, t_idx, :]
+        # expand over samples if needed
+        samples_per_batch = batch_size // med_tensor.shape[0]
+        med_tensor = med_tensor.repeat_interleave(samples_per_batch, dim=0)
+
+        # med_safe = torch.sign(med_tensor) * torch.log1p(torch.abs(med_tensor))
+        # med_safe = torch.nan_to_num(med_safe, nan=0.0, posinf=3.0, neginf=-3.0)  # Clean NaN/Inf first
+        # med_safe = torch.clamp(med_safe, min=-3.0, max=3.0)
+        # Project to fixed-size med embedding (LazyLinear infers input dim on first call)
+        def med_forward(med_input):
+            return torch.tanh(self.med_proj(med_input))
+
+        if self.training:
+            med_embed = checkpoint.checkpoint(med_forward, med_tensor)
+        else:
+            med_embed = torch.tanh(self.med_proj(med_tensor))
+        nn_input = torch.cat([nn_input, med_embed], dim=-1)
+
+        def sde_forward(nn_input):
+            return self.SDEnet(nn_input)
+
+        if self.training:
+            pressure_derivatives = checkpoint.checkpoint(sde_forward, nn_input)
+        else:
+            pressure_derivatives = self.SDEnet(nn_input)
 
         return pressure_derivatives
 
@@ -966,10 +999,6 @@ class NSDE(LightningModule):
                 src = rd_src.permute(1, 0, 2)
                 times = rd_times.permute(1, 0)
                 lengths = rd_length
-                temporal_embedding, _, _ = self.temporal_encoder(
-                    src=src, static=None, times=times, lengths=lengths
-                )
-                logqp0 = 0
             else:
                 raise NotImplementedError(
                     "Only raindrop encoder supported in MIMIC pipeline"
@@ -977,27 +1006,60 @@ class NSDE(LightningModule):
 
             if self.debug:
                 print(f"Static features shape: {static_features.shape}")
-            static_embedding = self.static_encoder(static_features)
-            fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
-            fused_rep = self.fusion_mlp(fused_embedding)
 
-            predicted_ode_latents_sigmoid = (
-                self.ode_latent_head(fused_rep)
-                .unsqueeze(1)
-                .repeat(1, self.num_samples, 1)
-            )
+            def encoder_forward(src, times, lengths):
+                return self.temporal_encoder(src=src, static=None, times=times, lengths=lengths)
+
+            if self.training:
+                temporal_embedding, _, _ = checkpoint.checkpoint(encoder_forward, src, times, lengths)
+            else:
+                temporal_embedding, _, _ = self.temporal_encoder(src=src, static=None, times=times, lengths=lengths)
+
+            # Static encoder with checkpointing
+            def static_encoder_forward(static_feats):
+                return self.static_encoder(static_feats)
+
+            if self.training:
+                static_embedding = checkpoint.checkpoint(static_encoder_forward, static_features)
+            else:
+                static_embedding = self.static_encoder(static_features)
+
+            fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
+
+            def fusion_forward(fused_emb):
+                return self.fusion_mlp(fused_emb)
+
+            if self.training:
+                fused_rep = checkpoint.checkpoint(fusion_forward, fused_embedding)
+            else:
+                fused_rep = self.fusion_mlp(fused_embedding)
+
+            # Prediction heads with checkpointing
+            def ode_head_forward(fused_input):
+                return self.ode_latent_head(fused_input)
+
+            def neural_head_forward(fused_input):
+                return self.neural_embedding_head(fused_input)
+
+            if self.training:
+                predicted_ode_latents_sigmoid = checkpoint.checkpoint(ode_head_forward, fused_rep).unsqueeze(
+                    1).repeat(1, self.num_samples, 1)
+                neural_embedding = checkpoint.checkpoint(neural_head_forward, fused_rep).unsqueeze(1).repeat(1,
+                                                                                                             self.num_samples,
+                                                                                                             1)
+            else:
+                predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1,
+                                                                                                    self.num_samples,
+                                                                                                    1)
+                neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+
             predicted_ode_latents = self.transform_sigmoid_to_physiological_ranges(
                 predicted_ode_latents_sigmoid
-            )
-            neural_embedding = (
-                self.neural_embedding_head(fused_rep)
-                .unsqueeze(1)
-                .repeat(1, self.num_samples, 1)
             )
             z1_for_sde = self._prepare_sde_initial_state(
                 predicted_ode_latents, neural_embedding, init_states, ic_mask
             )
-
+            logqp0 = 0
             ic_consistency_loss = self.compute_ic_consistency_loss(
                 predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
                 init_states=init_states,
@@ -1014,7 +1076,7 @@ class NSDE(LightningModule):
         valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
 
         # Attach precomputed med_context for fast per-step indexing
-        self.current_med_context = med_context if med_context is not None else None
+        self.current_med_tensors = med_context if med_context is not None else None
 
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
@@ -1197,7 +1259,7 @@ class NSDE(LightningModule):
             "mask": result["combined_mask"],
         }
 
-    def test_step(self, batch, batch_idx):
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
         if self.debug and batch_idx == 0:
             print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
 
@@ -1207,38 +1269,15 @@ class NSDE(LightningModule):
         loss = result["loss"]
         nll = result["nll"]
         kl_div = result["kl_div"]
+        suffix = "_all" if dataloader_idx == 0 else "_filtered"
 
-        # Log the individual components
-        self.log(
-            "test_total_loss",
-            total_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_main_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_ic_consistency_loss",
-            result["ic_consistency_loss"],
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_NLL", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
-        self.log(
-            "test_KL", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
+        # Log with dataset-specific names
+        self.log(f"test_total_loss{suffix}", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_main_loss{suffix}", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_ic_consistency_loss{suffix}", result["ic_consistency_loss"], on_step=False, on_epoch=True,
+                 prog_bar=True, logger=True)
+        self.log(f"test_NLL{suffix}", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_KL{suffix}", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         # Compute additional test metrics
         decoded_traj = result["decoded_traj"]
@@ -1252,27 +1291,12 @@ class NSDE(LightningModule):
             valid_elements = combined_mask.sum()
             valid_mse = mse_per_sample.sum() / valid_elements
             valid_mae = mae_per_sample.sum() / valid_elements
-
-            self.log(
-                "test_mse",
-                valid_mse,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-            self.log(
-                "test_mae",
-                valid_mae,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
+            self.log(f"test_mse{suffix}", valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"test_mae{suffix}", valid_mae, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         if batch_idx < 3:
             self.plot_nature_style_with_uncertainty(
-                decoded_traj, Y, combined_mask, batch_idx
+                decoded_traj, Y, combined_mask, batch_idx, suffix
             )
 
         return_dict = {
@@ -1287,46 +1311,67 @@ class NSDE(LightningModule):
         }
         return return_dict
 
-
-
-
     def on_test_epoch_end(self):
-        """Log final test metrics to wandb"""
+        """Log final test metrics to wandb with proper handling of multiple test datasets"""
         if self.log_wandb:
-            # Get the logged metrics
-            test_results = {
-                "final_test_loss": self.trainer.callback_metrics.get(
-                    "test_total_loss", 0
-                ),
-                "final_test_mse": self.trainer.callback_metrics.get("test_mse", 0),
-                "final_test_mae": self.trainer.callback_metrics.get("test_mae", 0),
-                "final_test_nll": self.trainer.callback_metrics.get("test_NLL", 0),
-                "final_test_kl": self.trainer.callback_metrics.get("test_KL", 0),
+            # Extract metrics using the correct key format with dataloader_idx suffixes
+            all_metrics = {
+                'total_loss': float(self.trainer.callback_metrics.get('test_total_loss_all/dataloader_idx_0', 0)),
+                'main_loss': float(self.trainer.callback_metrics.get('test_main_loss_all/dataloader_idx_0', 0)),
+                'mse': float(self.trainer.callback_metrics.get('test_mse_all/dataloader_idx_0', 0)),
+                'mae': float(self.trainer.callback_metrics.get('test_mae_all/dataloader_idx_0', 0)),
+                'nll': float(self.trainer.callback_metrics.get('test_NLL_all/dataloader_idx_0', 0)),
+                'kl': float(self.trainer.callback_metrics.get('test_KL_all/dataloader_idx_0', 0)),
+                'ic_consistency': float(
+                    self.trainer.callback_metrics.get('test_ic_consistency_loss_all/dataloader_idx_0', 0))
             }
 
-            # Log final summary
-            wandb.log(test_results)
+            filtered_metrics = {
+                'total_loss': float(self.trainer.callback_metrics.get('test_total_loss_filtered/dataloader_idx_1', 0)),
+                'main_loss': float(self.trainer.callback_metrics.get('test_main_loss_filtered/dataloader_idx_1', 0)),
+                'mse': float(self.trainer.callback_metrics.get('test_mse_filtered/dataloader_idx_1', 0)),
+                'mae': float(self.trainer.callback_metrics.get('test_mae_filtered/dataloader_idx_1', 0)),
+                'nll': float(self.trainer.callback_metrics.get('test_NLL_filtered/dataloader_idx_1', 0)),
+                'kl': float(self.trainer.callback_metrics.get('test_KL_filtered/dataloader_idx_1', 0)),
+                'ic_consistency': float(
+                    self.trainer.callback_metrics.get('test_ic_consistency_loss_filtered/dataloader_idx_1', 0))
+            }
 
-            # Create a summary table
-            test_summary = [
-                ["Metric", "Value"],
-                ["Total Loss", f"{test_results['final_test_loss']:.4f}"],
-                ["MSE", f"{test_results['final_test_mse']:.4f}"],
-                ["MAE", f"{test_results['final_test_mae']:.4f}"],
-                ["NLL", f"{test_results['final_test_nll']:.4f}"],
-                ["KL Divergence", f"{test_results['final_test_kl']:.4f}"],
+            # Create comparison table
+            comparison_data = [
+                ['Metric', 'All Trajectories', 'Filtered Trajectories', 'Difference (All - Filtered)'],
+                ['MSE', f"{all_metrics['mse']:.4f}", f"{filtered_metrics['mse']:.4f}",
+                 f"{all_metrics['mse'] - filtered_metrics['mse']:.4f}"],
+                ['MAE', f"{all_metrics['mae']:.4f}", f"{filtered_metrics['mae']:.4f}",
+                 f"{all_metrics['mae'] - filtered_metrics['mae']:.4f}"],
+                ['Total Loss', f"{all_metrics['total_loss']:.4f}", f"{filtered_metrics['total_loss']:.4f}",
+                 f"{all_metrics['total_loss'] - filtered_metrics['total_loss']:.4f}"],
+                ['Main Loss', f"{all_metrics['main_loss']:.4f}", f"{filtered_metrics['main_loss']:.4f}",
+                 f"{all_metrics['main_loss'] - filtered_metrics['main_loss']:.4f}"],
+                ['NLL', f"{all_metrics['nll']:.4f}", f"{filtered_metrics['nll']:.4f}",
+                 f"{all_metrics['nll'] - filtered_metrics['nll']:.4f}"],
+                ['KL Divergence', f"{all_metrics['kl']:.4f}", f"{filtered_metrics['kl']:.4f}",
+                 f"{all_metrics['kl'] - filtered_metrics['kl']:.4f}"],
+                ['IC Consistency', f"{all_metrics['ic_consistency']:.4f}", f"{filtered_metrics['ic_consistency']:.4f}",
+                 f"{all_metrics['ic_consistency'] - filtered_metrics['ic_consistency']:.4f}"]
             ]
 
-            wandb.log(
-                {
-                    "test_summary_table": wandb.Table(
-                        data=test_summary[1:], columns=test_summary[0]
-                    )
-                }
-            )
+            wandb.log({"test_results_comparison": wandb.Table(data=comparison_data[1:], columns=comparison_data[0])})
+
+            # Print summary to console as well
+            print("\n" + "=" * 60)
+            print("TEST RESULTS SUMMARY")
+            print("=" * 60)
+            for row in comparison_data:
+                if row == comparison_data[0]:  # Header
+                    print(f"{row[0]:<15} {row[1]:<18} {row[2]:<18} {row[3]}")
+                    print("-" * 60)
+                else:
+                    print(f"{row[0]:<15} {row[1]:<18} {row[2]:<18} {row[3]}")
+            print("=" * 60)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-4)
 
         scheduler = {
             "monitor": "train_total_loss",
@@ -1365,7 +1410,7 @@ class NSDE(LightningModule):
         return colors
 
     def plot_nature_style_with_uncertainty(
-            self, predictions_full, targets, combined_mask, batch_idx
+            self, predictions_full, targets, combined_mask, batch_idx, suffix
     ):
         """Nature-style plots with uncertainty bands around predictions"""
         import os
@@ -1382,10 +1427,10 @@ class NSDE(LightningModule):
         os.makedirs(os.path.join(self.train_dir, "nature_plots"), exist_ok=True)
 
         pred_mean = predictions_full.mean(1).detach()
-        pred_std = predictions_full.std(1).detach()
+        pred_std = predictions_full.std(1, unbiased=False).detach()
         targets = targets.detach() if targets.requires_grad else targets
 
-        for patient_idx in range(min(3, predictions_full.shape[0])):
+        for patient_idx in range(min(8, predictions_full.shape[0])):
             patient_mask = combined_mask[patient_idx]
             time_seconds = (torch.arange(patient_mask.shape[0]).cpu().numpy()) * 10
             pred_mean_patient = pred_mean[patient_idx].detach().cpu().numpy()
@@ -1485,15 +1530,21 @@ class NSDE(LightningModule):
             if self.log_wandb:
                 wandb.log(
                     {
-                        f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}": wandb.Image(
+                        f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}{suffix}": wandb.Image(
                             plt
                         )
                     }
                 )
             else:
+                try:
+                    last_hadm = int(getattr(self, "_last_hadm_ids", [None])[patient_idx])
+                    last_traj = int(getattr(self, "_last_traj_ids", [None])[patient_idx])
+                    id_suffix = f"_hadm{last_hadm}_traj{last_traj}" if last_hadm is not None and last_traj is not None else ""
+                except Exception:
+                    id_suffix = ""
                 out_path = os.path.join(
                     self.train_dir,
-                    f"nature_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}_uncertainty.png",
+                    f"nature_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}{suffix}_uncertainty.png",
                 )
                 plt.savefig(out_path, dpi=300, bbox_inches="tight")
                 print(f"[PLOT] Saved: {out_path}")

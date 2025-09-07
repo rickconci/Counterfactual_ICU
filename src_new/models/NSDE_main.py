@@ -16,6 +16,19 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
 from NSDE import NSDE
 
+def str2bool(v):
+    """Parse flexible boolean values from CLI."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    if s in ("yes", "true", "t", "y", "1"):
+        return True
+    if s in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected (true/false)")
+
 
 def set_seed(seed):
     seed_everything(seed, workers=True)
@@ -164,6 +177,10 @@ def main(args):
             num_workers=num_workers,
             random_state=args.seed,
             max_samples=args.max_samples,
+            use_raindrop_context=True,
+            expert_latent_dim=14,
+            filter_flat_trajectories=args.filter_flat_trajectories,
+            test_both_filtered_and_unfiltered=args.test_both_filtered_and_unfiltered
         )
         data_module.setup()
         unique_dir_name = f"MIMIC_DATA_seed={args.seed}"  # Simplified name for now
@@ -210,6 +227,7 @@ def main(args):
         SDEnet_depth=args.SDEnet_depth,
         use_batch_norm=args.use_batch_norm,
         final_activation=args.final_activation,
+        med_embed_dim=args.med_embed_dim,
         # decoder params
         decoder_output_dims=[0, 1],
         normalised_data=dataset_params["normalize"],
@@ -281,7 +299,36 @@ def main(args):
     if args.run_eval:
         print("Running evaluation on test set...")
         test_results = trainer.test(ckpt_path="best", dataloaders=data_module)
-        print(f"Test results: {test_results}")
+
+        if args.test_both_filtered_and_unfiltered:
+            print(f"Test results (All trajectories): {test_results[0]}")
+            print(f"Test results (Filtered trajectories): {test_results[1]}")
+
+            # Log results to wandb if enabled
+            if args.log_wandb and wandb_logger is not None:
+                # Log metrics from all trajectories dataset
+                for key, value in test_results[0].items():
+                    wandb_logger.experiment.log({f"test_all/{key}": value})
+
+                # Log metrics from filtered trajectories dataset
+                for key, value in test_results[1].items():
+                    wandb_logger.experiment.log({f"test_filtered/{key}": value})
+
+                # Also log summary comparison metrics
+                if "test_mse" in test_results[0] and "test_mse" in test_results[1]:
+                    wandb_logger.experiment.log({
+                        "test_comparison/mse_all_vs_filtered": test_results[0]["test_mse"] - test_results[1]["test_mse"]
+                    })
+                if "test_mae" in test_results[0] and "test_mae" in test_results[1]:
+                    wandb_logger.experiment.log({
+                        "test_comparison/mae_all_vs_filtered": test_results[0]["test_mae"] - test_results[1]["test_mae"]
+                    })
+        else:
+            print(f"Test results: {test_results}")
+
+            if args.log_wandb and wandb_logger is not None:
+                for key, value in test_results[0].items():
+                    wandb_logger.experiment.log({f"test/{key}": value})
 
     # test_results_IID = trainer.test(ckpt_path='last', dataloaders = cv_data_module_IID.test_dataloader())
     # test_results_OOD = trainer.test(ckpt_path='last', dataloaders = cv_data_module_OOD.test_dataloader())
@@ -296,10 +343,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--debug", action="store_true", help="Enable debug print statements"
     )
-    # Logging specific args
-    parser.add_argument(
-        "--HPC_work", type=bool, default=False, help="Where to save if HPC"
-    )
     parser.add_argument(
         "--seed", type=int, default=96, help="Random seed for initialization"
     )
@@ -310,18 +353,29 @@ if __name__ == "__main__":
         help="Wandb project name",
     )
     parser.add_argument(
-        "--log_wandb",
-        type=bool,
+        "--HPC_work",
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=False,
-        help="Whether to log to Weights & Biases",
+        help="Where to save if HPC"
+    )
+
+    parser.add_argument(
+        "--log_wandb",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Whether to log to Weights & Biases"
     )
     parser.add_argument(
-        "--early_stopping", type=bool, default=False, help="Enable early stopping"
+        "--early_stopping", type=bool, default=True, help="Enable early stopping"
     )
     parser.add_argument(
         "--model_checkpoint",
         type=bool,
-        default=False,
+        default=True,
         help="Enable model checkpointing",
     )
     parser.add_argument(
@@ -351,13 +405,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--static_hidden_dim",
         type=int,
-        default=16,
+        default=64,
         help="Hidden dimension for the static encoder MLP.",
     )
     parser.add_argument(
         "--fusion_hidden_dim",
         type=int,
-        default=32,
+        default=128,
         help="Hidden dimension for the fusion MLP.",
     )
     parser.add_argument(
@@ -407,7 +461,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--SDEnet_hidden_dim", type=int, default=300, help="Hidden dim for SDE NN  "
+        "--SDEnet_hidden_dim", type=int, default=512, help="Hidden dim for SDE NN  "
     )
     parser.add_argument(
         "--SDEnet_depth", type=int, default=6, help="Num layers for SDE NN  "
@@ -490,7 +544,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--encoder_hidden_dim",
         type=int,
-        default=64,
+        default=128,
         help="Output of the encoder into a latent space. This needs to match the total SDE input dims ",
     )
     parser.add_argument(
@@ -565,6 +619,28 @@ if __name__ == "__main__":
         help="Defines the weighting to the KL loss for the SDE",
     )
     parser.add_argument("--adjoint", type=bool, default=False, const=True, nargs="?")
+    parser.add_argument(
+        "--test_both_filtered_and_unfiltered",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Test on both all trajectories and filtered (non-flat) trajectories",
+    )
+    parser.add_argument(
+        "--med_embed_dim",
+        type=int,
+        default=32,
+        help="Num output dims for med embedding"
+    )
+    parser.add_argument(
+        "--filter_flat_trajectories",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Whether to only train and test on flat trajectories",
+    )
 
     args = parser.parse_args()
     main(args)
