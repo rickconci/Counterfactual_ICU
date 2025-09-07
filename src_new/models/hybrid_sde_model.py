@@ -1932,11 +1932,6 @@ class Hybrid_SDE(LightningModule):
                 f"[DEBUG] Hybrid_SDE forward_dec: decoded_mean_shape={output_traj.shape}"
             )
 
-        for patient_idx in range(min(3, pa.shape[0])):
-            p_a_clamped = pa[patient_idx, 0, 0].item()
-            p_v_clamped = pv[patient_idx, 0, 0].item()
-            print(f"Patient {patient_idx} CLAMPED at t=0: p_a={p_a_clamped:.3f}, p_v={p_v_clamped:.3f}")
-
         print("=" * 50 + "\n")
         return output_traj
 
@@ -2673,7 +2668,7 @@ class Hybrid_SDE(LightningModule):
             "mask": result["combined_mask"],
         }
 
-    def test_step(self, batch, batch_idx):
+    def test_step(self, batch, batch_idx, dataloader_idx = 0):
         if self.debug and batch_idx == 0:
             print(f"[DEBUG] Hybrid_SDE validation_step: batch_idx={batch_idx}")
 
@@ -2683,38 +2678,16 @@ class Hybrid_SDE(LightningModule):
         loss = result["loss"]
         nll = result["nll"]
         kl_div = result["kl_div"]
+        suffix = "_all" if dataloader_idx == 0 else "_filtered"
 
-        # Log the individual components
-        self.log(
-            "test_total_loss",
-            total_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_main_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_ic_consistency_loss",
-            result["ic_consistency_loss"],
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_NLL", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
-        self.log(
-            "test_KL", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True
-        )
+        # Log with dataset-specific names
+        self.log(f"test_total_loss{suffix}", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_main_loss{suffix}", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_ic_consistency_loss{suffix}", result["ic_consistency_loss"], on_step=False, on_epoch=True,
+                 prog_bar=True, logger=True)
+        self.log(f"test_NLL{suffix}", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_KL{suffix}", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
 
         # Compute additional test metrics
         decoded_traj = result["decoded_traj"]
@@ -2728,23 +2701,8 @@ class Hybrid_SDE(LightningModule):
             valid_elements = combined_mask.sum()
             valid_mse = mse_per_sample.sum() / valid_elements
             valid_mae = mae_per_sample.sum() / valid_elements
-
-            self.log(
-                "test_mse",
-                valid_mse,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-            self.log(
-                "test_mae",
-                valid_mae,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
+            self.log(f"test_mse{suffix}", valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"test_mae{suffix}", valid_mae, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
             if self.test_zenker:
                 zenker_predictions = torch.zeros_like(Y)
@@ -2796,26 +2754,13 @@ class Hybrid_SDE(LightningModule):
                 zenker_mse = zenker_mse_per_sample.sum() / valid_elements
                 zenker_mae = zenker_mae_per_sample.sum() / valid_elements
 
-                self.log(
-                    "test_zenker_mse",
-                    zenker_mse,
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=True,
-                    logger=True,
-                )
-                self.log(
-                    "test_zenker_mae",
-                    zenker_mae,
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=True,
-                    logger=True,
-                )
-
+                self.log(f"test_zenker_mse{suffix}", zenker_mse, on_step=False, on_epoch=True, prog_bar=True,
+                         logger=True)
+                self.log(f"test_zenker_mae{suffix}", zenker_mae, on_step=False, on_epoch=True, prog_bar=True,
+                         logger=True)
         if batch_idx < 3:
             self.plot_nature_style_with_uncertainty(
-                decoded_traj, Y, combined_mask, batch_idx
+                decoded_traj, Y, combined_mask, batch_idx, suffix
             )
             self.plot_nature_with_controls(
                 decoded_traj,
@@ -2824,6 +2769,7 @@ class Hybrid_SDE(LightningModule):
                 result["i_ext_path"],
                 batch_idx,
                 result["z1_for_sde"],
+                suffix
             )
 
         return_dict = {
@@ -2926,7 +2872,7 @@ class Hybrid_SDE(LightningModule):
         return colors
 
     def plot_nature_style_with_uncertainty(
-        self, predictions_full, targets, combined_mask, batch_idx
+        self, predictions_full, targets, combined_mask, batch_idx, suffix
     ):
         """Nature-style plots with uncertainty bands around predictions"""
         import os
@@ -3045,7 +2991,7 @@ class Hybrid_SDE(LightningModule):
             if self.log_wandb:
                 wandb.log(
                     {
-                        f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}": wandb.Image(
+                        f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}{suffix}": wandb.Image(
                             plt
                         )
                     }
@@ -3059,7 +3005,7 @@ class Hybrid_SDE(LightningModule):
                     id_suffix = ""
                 out_path = os.path.join(
                     self.train_dir,
-                    f"nature_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}_uncertainty.png",
+                    f"nature_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}{suffix}_uncertainty.png",
                 )
                 plt.savefig(out_path, dpi=300, bbox_inches="tight")
                 print(f"[PLOT] Saved: {out_path}")
@@ -3072,6 +3018,7 @@ class Hybrid_SDE(LightningModule):
         combined_mask,
         i_ext_path,
         batch_idx,
+        suffix,
         z1_for_sde=None,
     ):
         """Plot BP + controls with detailed control analysis (Zenker baseline removed)."""
@@ -3425,7 +3372,7 @@ class Hybrid_SDE(LightningModule):
             if self.log_wandb:
                 wandb.log(
                     {
-                        f"enhanced_control_plot_batch_{batch_idx}_patient_{patient_idx}": wandb.Image(
+                        f"enhanced_control_plot_batch_{batch_idx}_patient_{patient_idx}{suffix}": wandb.Image(
                             plt
                         )
                     }
@@ -3439,7 +3386,7 @@ class Hybrid_SDE(LightningModule):
                     id_suffix = ""
                 out_path = os.path.join(
                     self.train_dir,
-                    f"control_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}_controls.png",
+                    f"control_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}{suffix}_controls.png",
                 )
                 plt.savefig(out_path, dpi=300, bbox_inches="tight")
                 print(f"[PLOT] Saved: {out_path}")
