@@ -30,7 +30,7 @@ include_time: true # Whether to include encoded time in the SDE network inputs.
 sde_burn_in_period: 45.0 # Duration (seconds) at trajectory start to run pure ODE dynamics before enabling the SDE controller.
 force_no_controls: true # Force the SDE to not use any controls (for ablation/debugging).
 adjoint: false # Whether to use the adjoint method for backpropagation (memory efficient).
-prior_tx_sigma: 0.1
+prior_tx_sigma: 1
 
 # --- SDE Network (SDEnet) ---
 SDEnet_hidden_dim: 512 # Hidden dimension for the SDE network.

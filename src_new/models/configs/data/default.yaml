@@ -1,0 +1,30 @@
+# --- MIMIC Data Settings ---
+dataset_type: "mimic" # Which dataset to use. Choices: ["synthetic", "mimic"]
+
+# Paths
+data_root: "/n/netscratch/mzitnik_lab/Lab/rconci/BIOMM/processed_data_3" # Root directory for MIMIC preprocessed data.
+icu_stays_path: "/n/netscratch/mzitnik_lab/Lab/rconci/BIOMM/input_data/ICUSTAYS.csv" # Path to icustays.csv file.
+
+# Dataloader params
+batch_size: 64 # Training batch size.
+num_workers: 8 # Number of workers for the dataloader.
+max_samples: null # Max dataset length (set to an integer for debugging, null for production).
+
+# Splitting and Filtering
+split_mode: "random" # Data split mode. Choices: 'random', 'in_distribution_meds_combo', 'ood_meds_combo'
+ood_holdout_ratio: 0.1 # Percentage of medication combos to hold out for OOD test set.
+filter_flat_trajectories: false # Whether to only train and test on non-flat trajectories.
+test_both_filtered_and_unfiltered: false # If true, test on both all trajectories and filtered (non-flat) trajectories.
+
+# --- Model-related Data Settings ---
+use_raindrop_context: true # Whether to use the pre-processed Raindrop context tensors.
+expert_latent_dim: 14 # The dimensionality of the expert-defined ODE latents. Should match the ODE model.
+
+# --- Synthetic Data Settings (only used if dataset_type is 'synthetic') ---
+gamma: 6 # Defines how confounded the data is. Higher = less overlap, lower = more overlap.
+confounder_type: "partial_hard" # Type of confounding. Choices: ["visible", "partial", "partial_hard", "invisible"].
+normalise: false # Whether to normalise the data. Recommended ONLY if using an Encoder.
+noise_std: 0.0 # Standard deviation of noise to add to the synthetic data.
+non_confounded_effect: false # Add a non-confounded unseen effect on the treatment.
+fixed_tx: true # Whether all patients receive the same treatment.
+include_all_inputs: true # Whether to create data with all variables in X as input.

@@ -1168,17 +1168,22 @@ class NSDE(LightningModule):
     # 5. Fixed g method:
     def g(self, t, y):
         """
-        Neural SDE diffusion function
+        Neural SDE diffusion function with different sigmas per variable
         Args:
             t: current time
-            y: current state [batch*samples, 2]
+            y: current state [batch*samples, 2] representing [p_a, p_v]
         Returns:
             diffusion [batch*samples, 2]
         """
         batch_size = y.shape[0]
 
-        # Simple diagonal diffusion for both pressure variables
-        diffusion = torch.full((batch_size, 2), self.noise_scale, device=y.device)
+        # Different noise for each pressure variable
+        sigma_arterial = self.noise_scale  # Full sigma for p_a
+        sigma_venous = self.noise_scale / 5.0  # Reduced sigma for p_v
+
+        diffusion = torch.zeros(batch_size, 2, device=y.device)
+        diffusion[:, 0] = sigma_arterial  # Arterial pressure noise
+        diffusion[:, 1] = sigma_venous  # Venous pressure noise (smaller)
 
         return diffusion
 
