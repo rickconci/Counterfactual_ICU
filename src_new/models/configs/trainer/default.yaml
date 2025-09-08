@@ -18,7 +18,7 @@ log_every_n_steps: 10 # Lightning logging frequency in steps.
 check_val_every_n_epoch: 1 # Run validation every N epochs.
 disable_model_checkpoint: false # Set to true to disable saving model checkpoints.
 disable_early_stopping: false # Set to true to disable early stopping.
-early_stopping_patience: 5 # Number of epochs with no improvement before stopping.
+early_stopping_patience: 10 # Number of epochs with no improvement before stopping.
 
 # Reproducibility & Debugging
 deterministic: false # Ensures reproducibility.

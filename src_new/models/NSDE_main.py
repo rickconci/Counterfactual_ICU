@@ -2,6 +2,8 @@ import argparse
 import os
 import random
 import tempfile
+import sys
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -10,14 +12,37 @@ import torch
 DEBUG = False
 
 from dataloaders.MIMIC_data import MIMICDataModule
+from NSDE import NSDE
+from synthetic_data import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
 from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
-from NSDE import NSDE
+
+import lightning as L
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
+from lightning.pytorch.loggers import WandbLogger
+import wandb
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
+# Helper to suppress annoying pandas future warnings
+import warnings
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+
+# def _parse_args():
+#     parser = argparse.ArgumentParser(description="Train and evaluate the Hybrid SDE model.")
+#     # Add all previous argparse arguments here...
+#     return parser.parse_args()
 
 def str2bool(v):
-    """Parse flexible boolean values from CLI."""
+    """Parse flexible boolean values from CLI.
+
+    Accepts: true/false, yes/no, y/n, 1/0 (case-insensitive). If provided without a value,
+    it evaluates to True when used with nargs='?'.
+    """
     if isinstance(v, bool):
         return v
     if v is None:
@@ -42,253 +67,219 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def main(args):
-    # <<< Update global DEBUG based on args >>>
-    global DEBUG
-    DEBUG = args.debug
-    if DEBUG:
-        print(f"[DEBUG] main_beta.py: Starting main function with args: {args}")
+@hydra.main(version_base=None, config_path="configs", config_name="nsde_config")
+def main(cfg: DictConfig) -> None:
+    # Set seed for reproducibility
+    set_seed(cfg.seed)
 
-    print("CUDA GPUs present?", torch.cuda.is_available())
-    if args.HPC_work:
-        torch.set_float32_matmul_precision(
-            "medium"
-        )  # Faster computations with less precision
+    # Print the full configuration
+    print("--- Configuration ---")
+    print(OmegaConf.to_yaml(cfg))
+    print("-----------------------")
 
-    saving_dir = "../../results/NODE/"
-    os.environ["TMPDIR"] = os.path.join(os.getcwd(), "../../results/Tempdir")
-    os.makedirs(os.environ["TMPDIR"], exist_ok=True)
-    if DEBUG:
-        print(f"[DEBUG] main_beta.py: Saving directory set to: {saving_dir}")
-    print("Temporary directory set to:", tempfile.gettempdir())
-    os.environ["WANDB_DIR"] = os.path.join(os.getcwd(), "../../results/Wandbdir")
-    os.makedirs(os.environ["WANDB_DIR"], exist_ok=True)
-    if DEBUG:
-        print(f"[DEBUG] main_beta.py: WANDB_DIR set to: {os.environ['WANDB_DIR']}")
-    print("Setting WANDB_DIR to:", os.environ["WANDB_DIR"])
+    # Initialize DataModule
+    print("Initializing DataModule...")
+    data_module = MIMICDataModule(
+        data_root=cfg.data.data_root,
+        icu_stays_path=cfg.data.icu_stays_path,
+        batch_size=cfg.data.batch_size,
+        num_workers=cfg.data.num_workers,
+        max_samples=cfg.data.max_samples,
+        split_mode=cfg.data.split_mode,
+        ood_holdout_ratio=cfg.data.ood_holdout_ratio,
+        filter_flat_trajectories=cfg.data.filter_flat_trajectories,
+        test_both_filtered_and_unfiltered=cfg.data.test_both_filtered_and_unfiltered,
+        use_raindrop_context=cfg.data.use_raindrop_context,
+        expert_latent_dim=cfg.data.expert_latent_dim,
+        random_state=cfg.seed
+    )
+    print("Setting up data...")
+    data_module.setup()
 
-    set_seed(args.seed)
-    if DEBUG:
-        print(f"[DEBUG] main_beta.py: Seed set to {args.seed}")
+    # Calculate scheduler iterations based on total training steps
+    try:
+        num_batches_per_epoch = len(data_module.train_dataloader())
+        total_training_steps = cfg.trainer.max_epochs * num_batches_per_epoch
+        warmup_steps = int(total_training_steps * cfg.model.warmup_fraction)
+        print(f"Total training steps: {total_training_steps}. LR scheduler warmup over {warmup_steps} steps.")
+    except Exception as e:
+        print(f"[WARN] Could not determine train dataloader length to calculate scheduler steps: {e}")
+        print("[WARN] Falling back to default steps.")
+        total_training_steps = 10000
+        warmup_steps = 1000
 
-    if args.log_wandb:
-        wandb_logger = WandbLogger(
-            project=args.project_name,
-            log_model=False,
-            save_dir=os.path.join(saving_dir, "model_logs"),
-        )
-        wandb_logger.log_hyperparams(args)
-        if DEBUG:
-            print("[DEBUG] main_beta.py: Wandb logger initialized.")
+    # Calculate annealing iterations based on total training steps
+    if cfg.model.log_lik_scale_mode == 'annealing':
+        anneal_iters = int(total_training_steps * cfg.model.anneal_fraction)
+        print(f"Annealing NLL scale over {anneal_iters} steps ({cfg.model.anneal_fraction * 100:.1f}% of training).")
     else:
-        wandb_logger = None
-        if DEBUG:
-            print("[DEBUG] main_beta.py: Wandb logger not used.")
+        anneal_iters = 2000  # Default value, will not be used by the model in other modes
 
-    if args.dataset_type == "synthetic":
-        dataset_params = {
-            "fixed_tx": args.fixed_tx,
-            "include_all_inputs": args.include_all_inputs,
-            "gamma": args.gamma,
-            "sigma_tx": 0.01,
-            "confounder_type": args.confounder_type,
-            "non_confounded_effect": False,
-            "noise_std": 0.0,
-            "t_span": 60,
-            "t_treatment": 45,
-            "t_cutoff": 40,
-            "seed": args.seed,
-            "pre_treatment_dims": [0, 1],
-            "post_treatment_dims": [0],
-            "normalize": False,
-            "N": 1280,
-            "debug": args.debug,  # <<< Pass debug flag >>>
-        }
-        if DEBUG:
-            print(f"[DEBUG] main_beta.py: Dataset params created: {dataset_params}")
+    # Hydra handles the output directory automatically
+    train_dir_final = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    print(f"All outputs will be saved to: {train_dir_final}")
 
-        unique_dir_name = "_".join(
-            [
-                f"sd={args.seed}",
-                f"gm={args.gamma}",
-                f"ftx={args.fixed_tx}",
-                f"allin={args.include_all_inputs}" f"cnf={args.confounder_type}",
-                f"enc={args.use_encoder}",
-                f"txsig={args.prior_tx_sigma}",
-                f"revert={args.self_reverting_prior_control}",
-                f"klw={args.KL_weighting_SDE}",
-                f"SDEhd={args.SDEnet_hidden_dim}",
-            ]
-        )
-
-        print("dataset_params", dataset_params)
-        data_path = os.path.join(saving_dir, "data_created")
-        if DEBUG:
-            print(f"[DEBUG] main_beta.py: Data path set to: {data_path}")
-
-        dataset_params["r_tpr_mod"] = -0.5
-        if DEBUG:
-            print(
-                "[DEBUG] main_beta.py: Calling create_load_save_data for train/val data."
-            )
-        train_val_data = create_load_save_data(dataset_params, data_path)
-        if DEBUG:
-            print(
-                f"[DEBUG] main_beta.py: train_val_data loaded. Type: {type(train_val_data)}"
-            )
-        dataset_params["r_tpr_mod"] = +0.2
-        if DEBUG:
-            print("[DEBUG] main_beta.py: Calling create_load_save_data for test data.")
-        test_data = create_load_save_data(dataset_params, data_path)
-        if DEBUG:
-            print(f"[DEBUG] main_beta.py: test_data loaded. Type: {type(test_data)}")
-
-        if DEBUG:
-            print("[DEBUG] main_beta.py: Initializing CVDataModule_IID.")
-        cv_data_module_IID = CVDataModule_IID(
-            train_val_data=train_val_data,
-            batch_size=args.batch_size,
-            num_workers=0,
-            debug=args.debug,
-        )  # <<< Pass debug flag >>>
-        if DEBUG:
-            print("[DEBUG] main_beta.py: CVDataModule_IID initialized.")
-        if DEBUG:
-            print("[DEBUG] main_beta.py: Initializing CVDataModule_OOD.")
-        cv_data_module_OOD = CVDataModule_OOD(
-            OOD_test_data=test_data,
-            batch_size=args.batch_size,
-            num_workers=0,
-            debug=args.debug,
-        )  # <<< Pass debug flag >>>
-        if DEBUG:
-            print("[DEBUG] main_beta.py: CVDataModule_OOD initialized.")
-        data_module = cv_data_module_IID
-        data_module.setup()  # Need to call this to get dims
-
-    elif args.dataset_type == "mimic":
-        num_workers = 0
-        if args.HPC_work:
-            num_workers = 4
-        data_module = MIMICDataModule(
-            data_root=args.data_root,
-            icu_stays_path=args.icu_stays_path,
-            batch_size=args.batch_size,
-            num_workers=num_workers,
-            random_state=args.seed,
-            max_samples=args.max_samples,
-            use_raindrop_context=True,
-            expert_latent_dim=14,
-            filter_flat_trajectories=args.filter_flat_trajectories,
-            test_both_filtered_and_unfiltered=args.test_both_filtered_and_unfiltered
-        )
-        data_module.setup()
-        unique_dir_name = f"MIMIC_DATA_seed={args.seed}"  # Simplified name for now
-
-        dataset_params = dict()
-        # predict MAP and CVP
-        dataset_params["post_treatment_dims"] = 2
-        dataset_params["normalize"] = True
-    else:
-        raise ValueError(
-            "Invalid dataset_type specified. Choose 'synthetic' or 'mimic'."
-        )
-
-    if DEBUG:
-        print("[DEBUG] main_beta.py: Initializing Hybrid_VAE_SDE model.")
     model = NSDE(
-        use_encoder=args.use_encoder,
-        start_dec_at_treatment=args.start_dec_at_treatment,
+        use_encoder=cfg.model.use_encoder,
+        start_dec_at_treatment=cfg.model.start_dec_at_treatment,
+        variational_sampling=cfg.model.variational_sampling,
         # Encoder
-        encoder_input_dim=data_module.encoder_input_dim,
-        encoder_hidden_dim=args.encoder_hidden_dim,
-        expert_latent_dims=14,  # Fixed by the ODE model #todo check that
-        encoder_SDENN_dims=0 if args.use_encoder == "none" else args.encoder_SDENN_dims,
-        n_medications=22,
+        context_input_dim=data_module.context_input_dim,
+        chartevents_input_dim=data_module.chartevents_input_dim,
+        encoder_hidden_dim=cfg.model.encoder_hidden_dim,
+        expert_latent_dims=14,  # Fixed by the ODE model
+        encoder_SDENN_dims=0 if cfg.model.use_encoder == "none" else cfg.model.encoder_SDENN_dims,
+        n_medications=data_module.n_medications,
+        med_embed_dim=cfg.model.med_embed_dim,
         encoder_context_len=data_module.context_max_len,
-        encoder_num_layers=args.encoder_num_layers,
-        encoder_w_time=args.encoder_w_time,
-        encoder_reverse_time=args.encoder_reverse_time,
-        integration_step_size=args.integration_step_size,
-        integration_method=args.integration_method,
-        atol=args.integration_atol,
-        rtol=args.integration_rtol,
-        integration_adaptive=args.integration_adaptive,
-        # New static fusion params
+        use_2_5std_encoder_minmax=cfg.model.use_2_5std_encoder_minmax,
+        encoder_num_layers=cfg.model.encoder_num_layers,
+        variational_encoder=cfg.model.variational_encoder,
+        encoder_w_time=cfg.model.encoder_w_time,
+        encoder_reverse_time=cfg.model.encoder_reverse_time,
+        # Integration
+        integration_step_size=cfg.model.integration_step_size,
+        integration_method=cfg.model.integration_method,
+        atol=cfg.model.integration_atol,
+        rtol=cfg.model.integration_rtol,
+        integration_adaptive=cfg.model.integration_adaptive,
+        # Static Fusion
         static_input_dim=data_module.static_input_dim,
-        static_hidden_dim=args.static_hidden_dim,
-        fusion_hidden_dim=args.fusion_hidden_dim,
+        static_hidden_dim=cfg.model.static_hidden_dim,
+        fusion_hidden_dim=cfg.model.fusion_hidden_dim,
         # SDE params
-        num_samples=args.num_samples,
-        prior_tx_sigma=args.prior_tx_sigma,
-        prior_tx_mu=args.prior_tx_mu,
-        include_time=args.include_time,
-        SDEnet_hidden_dim=args.SDEnet_hidden_dim,
-        SDEnet_depth=args.SDEnet_depth,
-        use_batch_norm=args.use_batch_norm,
-        final_activation=args.final_activation,
-        med_embed_dim=args.med_embed_dim,
+        num_samples=cfg.model.num_samples,
+        normalise_for_SDENN=cfg.model.normalise_for_SDENN,
+        self_reverting_prior_control=cfg.model.self_reverting_prior_control,
+        prior_tx_sigma_per_control=cfg.model.prior_tx_sigma_per_control,
+        prior_tx_sigma=cfg.model.prior_tx_sigma,
+        prior_tx_mu=cfg.model.prior_tx_mu,
+        theta=cfg.model.theta,
+        SDE_control_weighting=cfg.model.SDE_control_weighting,
+        use_control_lowpass=cfg.model.use_control_lowpass,
+        control_lowpass_tau=cfg.model.control_lowpass_tau,
+        use_control_tv_loss=cfg.model.use_control_tv_loss,
+        control_tv_weight=cfg.model.control_tv_weight,
+        override_control_scales=cfg.model.override_control_scales,
+        control_energy_weight=cfg.model.control_energy_weight,
+        # SDE model params
+        SDE_input_state=cfg.model.SDE_input_state,
+        include_time=cfg.model.include_time,
+        SDEnet_hidden_dim=cfg.model.SDEnet_hidden_dim,
+        SDEnet_depth=cfg.model.SDEnet_depth,
+        SDEnet_out_dims=cfg.model.SDEnet_out_dims,
+        use_batch_norm=cfg.model.use_batch_norm,
+        final_activation=cfg.model.final_activation,
         # decoder params
         decoder_output_dims=[0, 1],
-        normalised_data=dataset_params["normalize"],
-        log_lik_output_scale=args.output_scale,
+        normalised_data=False,  # This is handled by the datamodule now
+        log_lik_output_scale=cfg.model.output_scale,
         # admin
-        train_dir=os.path.join(saving_dir, unique_dir_name),
-        learning_rate=args.learning_rate,
-        log_wandb=args.log_wandb,
-        adjoint=args.adjoint,
-        plot_every=args.plot_every,
-        dataset=args.dataset_type,
-        KL_weighting_SDE=args.KL_weighting_SDE,
-        debug=args.debug,  # <<< Pass debug flag >>>
+        train_dir=train_dir_final,
+        KL_weighting_SDE=cfg.model.KL_weighting_SDE,
+        loss_type=cfg.model.loss_type,
+        log_lik_scale_mode=cfg.model.log_lik_scale_mode,
+        anneal_iters=anneal_iters,
+        # Optimizer params
+        use_lr_scheduler=cfg.model.use_lr_scheduler,
+        total_training_steps=total_training_steps,
+        warmup_steps=warmup_steps,
+        min_lr=cfg.model.min_lr,
+        learning_rate=cfg.model.learning_rate,
+        optimizer_name=cfg.model.optimizer_name,
+        log_wandb=not cfg.disable_wandb,
+        adjoint=cfg.model.adjoint,
+        plot_every=cfg.model.plot_every,
+        batch_size=cfg.data.batch_size,
+        dataset=cfg.data.dataset_type,
+        id_to_combo_map=(
+            getattr(data_module.train_dataset, 'id_to_combo_map', None)
+            if hasattr(data_module, 'train_dataset') and data_module.train_dataset is not None
+            else None
+        ),
+        test_zenker=cfg.model.test_zenker,
+        debug=cfg.model.debug_level,
+        force_no_controls=cfg.model.force_no_controls,
+        plot_outputs_train=cfg.model.plot_outputs_train,
+        # Controller selection (MLP vs GAT)
+        controller_type=cfg.model.controller_type,
+        gat_heads=cfg.model.gat_heads,
+        gat_layers=cfg.model.gat_layers,
+        gat_hidden=cfg.model.gat_hidden,
+        gat_dropout=cfg.model.gat_dropout,
+        sde_burn_in_period=cfg.model.sde_burn_in_period,
+        log_train_combo_loss_every_n_steps=cfg.model.log_train_combo_loss_every_n_steps,
+        scale_loss_by_variance=cfg.model.scale_loss_by_variance,
+        ic_consistency_weight=cfg.model.ic_consistency_weight,
+        forward_loss_weight=cfg.model.forward_loss_weight,
+        use_wandb_for_logging=not cfg.disable_wandb,
+        use_checkpointing=cfg.model.use_checkpointing,
+        debug_level=cfg.model.debug_level,
+        force_zenker_defaults=cfg.model.force_zenker_defaults,
+        plot_control_samples=cfg.model.plot_control_samples,
+        plot_include_burn_in=getattr(cfg.model, "plot_include_burn_in", True),
     )
-    os.makedirs(model.train_dir, exist_ok=True)
-    if DEBUG:
-        print("[DEBUG] main_beta.py: Hybrid_VAE_SDE model initialized.")
+
+    # Setup Logging & Callbacks
+    logger = None
+    if not cfg.disable_wandb:
+        run_name = cfg.run_name or f"{cfg.model.use_encoder}_{cfg.data.split_mode}_lr{cfg.model.learning_rate}_seed{cfg.seed}"
+        logger = WandbLogger(
+            project=cfg.experiment_name,
+            name=run_name,
+            notes=cfg.notes,
+            log_model=True,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
 
     callbacks = []
-
-    if args.model_checkpoint:
+    if not cfg.trainer.disable_model_checkpoint:
         checkpoint_callback = ModelCheckpoint(
-            monitor="val_total_loss",  # Ensure this is the exact name used in your logging
-            dirpath=os.path.join(
-                saving_dir, "model_checkpoints", unique_dir_name
-            ),  # Directory to save checkpoints
-            filename="best-{epoch:02d}-{val_loss:.2f}",
+            monitor="val_total_loss",
+            dirpath=os.path.join(train_dir_final, "checkpoints"),
+            filename="best_model-{epoch:02d}-{val_loss:.2f}",
             save_top_k=1,
-            mode="min",  # Minimize the monitored value
-            save_last=True,  # Save the last model to resume training
+            mode="min",
+            save_last=True,
             verbose=True,
         )
         callbacks.append(checkpoint_callback)
 
-    if args.early_stopping:
-        early_stopping = EarlyStopping(
+    if not cfg.trainer.disable_early_stopping:
+        early_stop_callback = EarlyStopping(
+            monitor="val_total_loss",
             min_delta=0.00,
-            monitor="val_total_loss",  # Ensure this is the exact name used in your logging
-            patience=args.early_stopping_patience,  # num epochs with a val loss not improving before it stops
-            mode="min",  # Minimize the monitored value
+            patience=cfg.trainer.early_stopping_patience,
             verbose=True,
+            mode="min",
         )
-        callbacks.append(early_stopping)
-        if DEBUG:
-            print("[DEBUG] main_beta.py: Early stopping callback added.")
+        callbacks.append(early_stop_callback)
 
-    if DEBUG:
-        print("[DEBUG] main_beta.py: Initializing Trainer.")
-    trainer = Trainer(
-        max_epochs=args.max_epochs,
-        accelerator=args.accelerator,
-        logger=wandb_logger,
-        log_every_n_steps=6,
+    progress_bar = TQDMProgressBar(refresh_rate=10)
+    callbacks.append(progress_bar)
+
+    # Initialize Trainer
+    print("Initializing Trainer...")
+    trainer = L.Trainer(
+        max_epochs=cfg.trainer.max_epochs,
+        min_epochs=cfg.trainer.min_epochs,
+        max_steps=cfg.trainer.max_steps,
+        accelerator=cfg.trainer.accelerator,
+        devices=cfg.trainer.devices,
+        strategy=cfg.trainer.strategy,
+        gradient_clip_val=cfg.trainer.gradient_clip_val,
+        gradient_clip_algorithm=cfg.trainer.gradient_clip_algorithm,
+        log_every_n_steps=cfg.trainer.log_every_n_steps,
+        check_val_every_n_epoch=cfg.trainer.check_val_every_n_epoch,
+        deterministic=cfg.trainer.deterministic,
+        precision=cfg.trainer.precision,
+        accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,
+        limit_train_batches=cfg.trainer.limit_train_batches,
+        overfit_batches=cfg.trainer.overfit_batches,
+        logger=logger,
         callbacks=callbacks,
-        gradient_clip_val=1,  # Start with 1.0, adjust if needed
-        gradient_clip_algorithm="norm",
-        # fast_dev_run = True,
-        # overfit_batches = 1
-        # deterministic=True,
-        # check_val_every_n_epoch=1,
-        # profiler="simple"   #this helps to identify bottlenecks
+        num_sanity_val_steps=0 if cfg.trainer.disable_sanity_check else 1,
+        limit_val_batches=0 if cfg.trainer.disable_sanity_check else 1.0,
     )
     if DEBUG:
         print("[DEBUG] main_beta.py: Trainer initialized. Starting fit...")
@@ -296,351 +287,52 @@ def main(args):
     if DEBUG:
         print("[DEBUG] main_beta.py: Trainer fit completed.")
     # At the end of main(), after trainer.fit():
-    if args.run_eval:
+    if cfg.run_eval:
         print("Running evaluation on test set...")
         test_results = trainer.test(ckpt_path="best", dataloaders=data_module)
 
-        if args.test_both_filtered_and_unfiltered:
+        if cfg.data.test_both_filtered_and_unfiltered:
             print(f"Test results (All trajectories): {test_results[0]}")
             print(f"Test results (Filtered trajectories): {test_results[1]}")
 
             # Log results to wandb if enabled
-            if args.log_wandb and wandb_logger is not None:
+            if not cfg.disable_wandb and logger is not None:
                 # Log metrics from all trajectories dataset
                 for key, value in test_results[0].items():
-                    wandb_logger.experiment.log({f"test_all/{key}": value})
+                    logger.experiment.log({f"test_all/{key}": value})
 
                 # Log metrics from filtered trajectories dataset
                 for key, value in test_results[1].items():
-                    wandb_logger.experiment.log({f"test_filtered/{key}": value})
+                    logger.experiment.log({f"test_filtered/{key}": value})
 
                 # Also log summary comparison metrics
                 if "test_mse" in test_results[0] and "test_mse" in test_results[1]:
-                    wandb_logger.experiment.log({
+                    logger.experiment.log({
                         "test_comparison/mse_all_vs_filtered": test_results[0]["test_mse"] - test_results[1]["test_mse"]
                     })
                 if "test_mae" in test_results[0] and "test_mae" in test_results[1]:
-                    wandb_logger.experiment.log({
+                    logger.experiment.log({
                         "test_comparison/mae_all_vs_filtered": test_results[0]["test_mae"] - test_results[1]["test_mae"]
                     })
         else:
             print(f"Test results: {test_results}")
-
-            if args.log_wandb and wandb_logger is not None:
+            if not cfg.disable_wandb and logger is not None:
                 for key, value in test_results[0].items():
-                    wandb_logger.experiment.log({f"test/{key}": value})
+                    logger.experiment.log({f"test/{key}": value})
 
-    # test_results_IID = trainer.test(ckpt_path='last', dataloaders = cv_data_module_IID.test_dataloader())
-    # test_results_OOD = trainer.test(ckpt_path='last', dataloaders = cv_data_module_OOD.test_dataloader())
+    # Train the model
+    print("Starting training...")
+    trainer.fit(model, datamodule=data_module)
+    print("Training finished.")
+
+    # Test the model
+    print("Starting testing...")
+    trainer.test(model, datamodule=data_module)
+    print("Testing finished.")
+
+    if not cfg.disable_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
-    # <<< Comment out or control stdout redirection for DEBUG >>>
-    # sys.stdout = open('Hybrid_SDE_output_beta.txt', 'w')
-
-    parser = argparse.ArgumentParser(description="Train a model on CV dataset")
-    # <<< Add debug argument >>>
-    parser.add_argument(
-        "--debug", action="store_true", help="Enable debug print statements"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=96, help="Random seed for initialization"
-    )
-    parser.add_argument(
-        "--project_name",
-        type=str,
-        default="sdehybrid_partial_hard",
-        help="Wandb project name",
-    )
-    parser.add_argument(
-        "--HPC_work",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=False,
-        help="Where to save if HPC"
-    )
-
-    parser.add_argument(
-        "--log_wandb",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=False,
-        help="Whether to log to Weights & Biases"
-    )
-    parser.add_argument(
-        "--early_stopping", type=bool, default=True, help="Enable early stopping"
-    )
-    parser.add_argument(
-        "--model_checkpoint",
-        type=bool,
-        default=True,
-        help="Enable model checkpointing",
-    )
-    parser.add_argument(
-        "--plot_every", type=int, default=14, help="Plot every how many global steps? "
-    )
-
-    # Data specific args
-    parser.add_argument(
-        "--dataset_type",
-        type=str,
-        default="synthetic",
-        choices=["synthetic", "mimic"],
-        help="Which dataset to use.",
-    )
-    parser.add_argument(
-        "--data_root",
-        type=str,
-        default="../../data/mimic_3_data/processed_data",
-        help="Root directory for MIMIC preprocessed data.",
-    )
-    parser.add_argument(
-        "--icu_stays_path",
-        type=str,
-        default="data/input_data/icustays.csv",
-        help="Path to icustays.csv file.",
-    )
-    parser.add_argument(
-        "--static_hidden_dim",
-        type=int,
-        default=64,
-        help="Hidden dimension for the static encoder MLP.",
-    )
-    parser.add_argument(
-        "--fusion_hidden_dim",
-        type=int,
-        default=128,
-        help="Hidden dimension for the fusion MLP.",
-    )
-    parser.add_argument(
-        "--normalise",
-        type=bool,
-        default=False,
-        help="Whether to normalise the data. Recommended ONLY if using an Encoder",
-    )
-    parser.add_argument(
-        "--noise_std",
-        type=float,
-        default=0.0,
-        help="Noise defines how noisy the data is ",
-    )
-    parser.add_argument(
-        "--non_confounded_effect",
-        type=bool,
-        default=False,
-        help="Whether to add non-confounded unsee effect on the treatment (increases the noise of the prediction)",
-    )
-    parser.add_argument(
-        "--fixed_tx",
-        type=bool,
-        default=True,
-        help="Whether all patients receive the same treatment ",
-    )
-    parser.add_argument(
-        "--include_all_inputs",
-        type=bool,
-        default=True,
-        help="Whether to create data with all variables in the X as input",
-    )
-
-    parser.add_argument(
-        "--confounder_type",
-        type=str,
-        default="partial_hard",
-        choices=["visible", "partial", "partial_hard", "invisible"],
-        help="the type of confounding present",
-    )
-    parser.add_argument(
-        "--use_encoder",
-        type=str,
-        default="none",
-        choices=["full", "partial", "none", "raindrop"],
-        help="what to do with the encoder!",
-    )
-
-    parser.add_argument(
-        "--SDEnet_hidden_dim", type=int, default=512, help="Hidden dim for SDE NN  "
-    )
-    parser.add_argument(
-        "--SDEnet_depth", type=int, default=6, help="Num layers for SDE NN  "
-    )
-    parser.add_argument(
-        "--use_batch_norm",
-        type=bool,
-        default=False,
-        help="Whether to include batch norm within the SDE NN network )",
-    )
-    parser.add_argument(
-        "--include_time",
-        type=bool,
-        default=True,
-        help="Whether to include encoded time in the SDE NN inputs)",
-    )
-
-    parser.add_argument(
-        "--integration_step_size",
-        type=float,
-        default=0.1,
-        help="Parameter dt for SDE integration",
-    )
-    parser.add_argument(
-        "--integration_method", type=str, default="euler", help="SDE integration method"
-    )
-    parser.add_argument(
-        "--integration_rtol", type=float, default=1e-3, help="SDE integration rtol"
-    )
-    parser.add_argument(
-        "--integration_atol", type=float, default=1e-3, help="SDE integration atol"
-    )
-    parser.add_argument(
-        "--integration_adaptive",
-        type=bool,
-        default=False,
-        help="Use adaptive SDE integration?",
-    )
-
-    parser.add_argument(
-        "--prior_tx_sigma",
-        type=float,
-        default=0.1,
-        help="prior_tx_sigma defines our assumed prior noise of the stochastic control ",
-    )
-    parser.add_argument(
-        "--self_reverting_prior_control",
-        type=bool,
-        default=False,
-        help="Whether the control has a self reverting prior to it with a functional prior",
-    )
-    parser.add_argument(
-        "--encoder_SDENN_dims",
-        type=int,
-        default=64,
-        help="Encoder output used by SDENN",
-    )
-
-    # Default args _not be changed_
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=3,
-        help="Number of SDE samples- is affected if sigma >0 ",
-    )
-    parser.add_argument(
-        "--prior_tx_mu",
-        type=float,
-        default=0.01,
-        help="prior_tx_mu defines our assumed prior Dt_iexternal of the stochastic control ",
-    )
-
-    # Model specific args
-    parser.add_argument(
-        "--start_dec_at_treatment",
-        type=bool,
-        default=True,
-        help="Whether to encode the data until treatment and the decode or decode from the beginning!)",
-    )
-    parser.add_argument(
-        "--encoder_hidden_dim",
-        type=int,
-        default=128,
-        help="Output of the encoder into a latent space. This needs to match the total SDE input dims ",
-    )
-    parser.add_argument(
-        "--encoder_num_layers",
-        type=int,
-        default=2,
-        help="Number of layers in encoder GRU",
-    )
-
-    parser.add_argument(
-        "--final_activation",
-        type=str,
-        default="none",
-        choices=["relu", "none", "tanh"],
-        help="Which nonlinearity to add as a final layer to the NN!",
-    )
-    parser.add_argument(
-        "--output_scale",
-        type=float,
-        default=0.1,
-        help="Standard Deviation when computing GaussianNegLL between Y_true and Y_hat",
-    )
-
-    # Training specific args
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=0.001,
-        help="Learning rate for the optimizer",
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=128, help="Training batch size"
-    )
-    parser.add_argument(
-        "--max_epochs", type=int, default=200, help="Maximum number of epochs to train"
-    )
-    parser.add_argument(
-        "--accelerator",
-        type=str,
-        default="auto",
-        choices=["gpu", "mps", "cpu", "auto"],
-        help="Which accelerator to use",
-    )
-    parser.add_argument(
-        "--max_samples",
-        type=str,
-        default=None,
-        help="Max dataset length (None for production)",
-    )
-    parser.add_argument(
-        "--run_eval", action="store_true", help="Run evaluation after training"
-    )
-    parser.add_argument("--early_stopping_patience", type=int, default=20)
-
-    parser.add_argument(
-        "--encoder_w_time",
-        type=bool,
-        default=False,
-        help="Whether encoder includes time in its inputs)",
-    )
-
-    parser.add_argument(
-        "--encoder_reverse_time",
-        type=bool,
-        default=False,
-        help="Whether encoder runs with inputs backwards in time)",
-    )
-    parser.add_argument(
-        "--KL_weighting_SDE",
-        type=float,
-        default=0.0001,
-        help="Defines the weighting to the KL loss for the SDE",
-    )
-    parser.add_argument("--adjoint", type=bool, default=False, const=True, nargs="?")
-    parser.add_argument(
-        "--test_both_filtered_and_unfiltered",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=False,
-        help="Test on both all trajectories and filtered (non-flat) trajectories",
-    )
-    parser.add_argument(
-        "--med_embed_dim",
-        type=int,
-        default=32,
-        help="Num output dims for med embedding"
-    )
-    parser.add_argument(
-        "--filter_flat_trajectories",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=False,
-        help="Whether to only train and test on flat trajectories",
-    )
-
-    args = parser.parse_args()
-    main(args)
+    main()

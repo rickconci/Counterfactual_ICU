@@ -1,0 +1,89 @@
+# --- Model Architecture ---
+use_encoder: "raindrop" # Encoder type. Choices: ["full", "partial", "none", "raindrop"].
+start_dec_at_treatment: true # If true, encode until treatment time and then decode. Otherwise, decode from the beginning.
+variational_sampling: false # If NOT using an encoder, learn a variational q-distribution for unobserved dimensions.
+
+# --- Encoder Specifics ---
+encoder_hidden_dim: 128 # Dimension of the encoder's latent space output.
+encoder_SDENN_dims: 128 # Dimension of the encoder output used by the SDE neural network.
+med_embed_dim: 64 # Embedding dimension for medications.
+use_2_5std_encoder_minmax: false # Pushes encoder outputs into a narrower range.
+encoder_num_layers: 2 # Number of layers in the encoder GRU.
+variational_encoder: false # Whether the encoder is variational (experimental).
+encoder_w_time: false # Whether the encoder includes time in its inputs.
+encoder_reverse_time: false # Whether the encoder processes inputs backwards in time.
+
+# --- Static Feature Fusion ---
+static_hidden_dim: 64 # Hidden dimension for the static feature encoder MLP.
+fusion_hidden_dim: 128 # Hidden dimension for the MLP that fuses temporal and static embeddings.
+
+# --- SDE Dynamics ---
+num_samples: 3 # Number of SDE samples to generate for each trajectory.
+normalise_for_SDENN: true # If true, normalise data before feeding to the SDE network.
+self_reverting_prior_control: false # If true, the SDE control has a self-reverting prior.
+prior_tx_sigma_per_control: [0.0, 0.0, 0.0, 0.0] # Per-control sigmas for SDE noise. List should match SDEnet_out_dims.
+prior_tx_mu: 0.01 # Assumed prior mean for the external component of the stochastic control.
+theta: 0.0001 # Strength of the mean-reverting process correction on the SDE.
+SDE_control_weighting: 1.0 # How much to scale the output of the SDE neural network.
+SDE_input_state: "full" # Which state dimensions to include in the SDE network. Choices: ["full", "partial"].
+include_time: true # Whether to include encoded time in the SDE network inputs.
+sde_burn_in_period: 45.0 # Duration (seconds) at trajectory start to run pure ODE dynamics before enabling the SDE controller.
+force_no_controls: true # Force the SDE to not use any controls (for ablation/debugging).
+adjoint: false # Whether to use the adjoint method for backpropagation (memory efficient).
+prior_tx_sigma: 0.1
+
+# --- SDE Network (SDEnet) ---
+SDEnet_hidden_dim: 512 # Hidden dimension for the SDE network.
+SDEnet_depth: 6 # Number of layers in the SDE network.
+SDEnet_out_dims: 2 # Number of output dimensions for the SDE network (number of controls).
+direct_pressure_controls: true # If true, use 2 direct control heads for dpa_dt and dpv_dt
+use_batch_norm: false # Whether to include batch normalization in the SDE network.
+final_activation: "tanh" # Final activation function for the SDE network. Choices: ["relu", "none", "tanh"].
+
+# --- Controller (Defines the SDE control signal) ---
+controller_type: "mlp" # Controller type. Choices: ["mlp", "gat"].
+# GAT specific (if controller_type is 'gat')
+gat_heads: 4 # Number of attention heads in the GAT controller.
+gat_layers: 2 # Number of layers in the GAT controller.
+gat_hidden: 128 # Hidden size per layer in the GAT controller.
+gat_dropout: 0.0 # Dropout rate in the GAT controller layers.
+# Smoothness & Regularization
+use_control_lowpass: false # Use low-pass filter dynamics for the control signal.
+control_lowpass_tau: 30.0 # Time constant tau (seconds) for the control low-pass filter.
+use_control_tv_loss: false # Add a Total Variation (L2 smoothness) penalty on the control path.
+control_tv_weight: 1.0e-3 # Weight for the control TV/L2 smoothness penalty.
+override_control_scales: "" # Comma-separated per-head control scales to override defaults (e.g., '0.1,0.02').
+control_energy_weight: 1.0e-6 # Weight for the control energy regularizer added to the total loss.
+disable_controls: "" # Comma-separated zero-based indices of control heads to disable (e.g., '0,3').
+
+# --- SDE Integration ---
+integration_step_size: 2.0 # Parameter dt for the SDE integration step.
+integration_method: "euler" # SDE integration method.
+integration_atol: 1.0e-3 # Absolute tolerance for adaptive SDE solvers.
+integration_rtol: 1.0e-3 # Relative tolerance for adaptive SDE solvers.
+integration_adaptive: false # Use an adaptive step size SDE integration method.
+
+# --- Loss & Optimization ---
+learning_rate: 1.0e-5 # Learning rate for the optimizer.
+optimizer_name: "Adam" # Optimizer to use.
+use_lr_scheduler: true # Enable a learning rate scheduler.
+warmup_fraction: 0.1 # Fraction of total training steps for learning rate warmup.
+min_lr: 1.0e-6 # Minimum learning rate for cosine decay scheduler.
+loss_type: "mse" # Reconstruction loss. Choices: ['nll' (probabilistic), 'mse' (deterministic)].
+log_lik_scale_mode: "learnable" # NLL output scale handling. Choices: ['fixed', 'learnable', 'annealing'].
+output_scale: 1.0 # Standard deviation for Gaussian NLL when log_lik_scale_mode is 'fixed'.
+KL_weighting_SDE: 0.0 # Weight for the SDE's KL divergence loss term.
+ic_consistency_weight: 1.0 # Weight for the initial condition consistency loss.
+forward_loss_weight: 1.0 # Weight for the main forward reconstruction loss.
+scale_loss_by_variance: true # Scale the reconstruction loss by the variance of the true signals.
+anneal_fraction: 0.5 # Fraction of training for annealing NLL scale if log_lik_scale_mode is 'annealing'.
+
+# --- Admin & Logging ---
+use_checkpointing: true # Set to true to enable gradient checkpointing for memory saving.
+debug_level: 0 # Debug level (0=off, 1=basic, 2=verbose). Also enables debug print statements if > 0.
+plot_every: 10 # Plot validation batch outputs every N global steps.
+test_zenker: false # Run the pure Zenker ODE baseline as a comparison.
+force_zenker_defaults: false # Force the model to use the default Zenker ODE parameters for debugging.
+plot_outputs_train: true # Plot the outputs of the SDE during training steps.
+plot_control_samples: true # In plots, overlay the control signals for individual samples (if num_samples > 1).
+log_train_combo_loss_every_n_steps: 4 # Frequency to log per-medication combo training loss stats (0 to disable).
