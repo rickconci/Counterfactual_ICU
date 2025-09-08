@@ -264,16 +264,16 @@ class Raindrop_v2(nn.Module):
 
         # Create a boolean mask indicating padding positions in the time dimension  - used to mask out padding tokens in the transformer encoder
         # Get the device of src to ensure consistent device usage
-        print("[MASK DEBUG] Original mask creation:")
-        print(f"  maxlen: {maxlen}, batch_size: {batch_size}")
-        print(f"  lengths: {lengths}")
-        print(f"  lengths shape: {lengths.shape}")
+        #print("[MASK DEBUG] Original mask creation:")
+        #print(f"  maxlen: {maxlen}, batch_size: {batch_size}")
+        #print(f"  lengths: {lengths}")
+        #print(f"  lengths shape: {lengths.shape}")
         mask = torch.arange(maxlen, device=device)[None, :] >= (lengths[:, None])
         mask = mask.squeeze(1)
-        print("[MASK DEBUG] After squeeze:")
-        print(
-            f"  Expected shape for transformer: [batch_size, seq_len] = [{batch_size}, {maxlen}]"
-        )
+        #print("[MASK DEBUG] After squeeze:")
+        #print(
+        #    f"  Expected shape for transformer: [batch_size, seq_len] = [{batch_size}, {maxlen}]"
+        #)
         # Extra runtime checks for mask consistency
         if mask.shape != (batch_size, maxlen):
             print(f"[MASK ERROR] Mask shape mismatch: got {mask.shape}, expected ({batch_size}, {maxlen})")

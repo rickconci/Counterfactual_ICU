@@ -2,6 +2,9 @@
 import os
 import platform
 import pickle
+import random
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import lightning as L
 import numpy as np
@@ -68,7 +71,7 @@ class MIMICDataset(Dataset):
 
         # Load consolidated metadata
         consolidated_metadata_path = os.path.join(
-            data_root, "med_tensors_output/consolidated_trajectory_metadata.pkl"
+            data_root, "consolidated_trajectory_metadata.pkl"
         )
         if not os.path.exists(consolidated_metadata_path):
             raise FileNotFoundError(
@@ -80,6 +83,8 @@ class MIMICDataset(Dataset):
         self.trajectories_metadata = self.metadata["trajectories"]
         self.med_combos_info = self.metadata.get("med_combos", {})
         self.id_to_combo = self.med_combos_info.get("id_to_combo", {})
+        self.combo_to_id = self.med_combos_info.get("combo_to_id", {})
+        self.combo_df = pd.DataFrame(self.med_combos_info.get("combo_df", []))
 
         self.med_feature_names = med_metadata.get("med_feature_names", [
             "rate_hr_weight_norm",
@@ -88,6 +93,28 @@ class MIMICDataset(Dataset):
             "post_stop_effect",
             "trigger_flag",
         ])
+
+        # Post-process id_to_combo to create a more useful representation
+        self.formatted_id_to_combo = {}
+        # This loop correctly processes the `id_to_combo` mapping.
+        # It iterates through the medication names within each combo tuple.
+        # Since rate information is not available in the consolidated metadata, 
+        # it creates a simple string representation and a list of medication details.
+        for combo_id, combo_tuple in self.id_to_combo.items():
+            # Ensure combo_tuple is iterable (handles single-med combos)
+            if not isinstance(combo_tuple, (list, tuple)):
+                combo_tuple = (combo_tuple,)
+            
+            # Sort for consistent representation
+            sorted_combo = sorted(combo_tuple)
+
+            combo_str = ", ".join(map(str, sorted_combo))
+            med_details = [{"med_name": name} for name in sorted_combo]
+            
+            self.formatted_id_to_combo[int(combo_id)] = {
+                "str": combo_str,
+                "details": med_details
+            }
 
         # Each trajectory from the IC metadata is a sample
         # First, collect all trajectories
@@ -156,7 +183,8 @@ class MIMICDataset(Dataset):
                 print(f"Filtered out {len(all_trajectories)-len(filtered_trajectories)} flat trajectories")
                 all_trajectories = filtered_trajectories
             else:
-                print("Flat trajectory filtering is disabled")
+                #print("Flat trajectory filtering is disabled")
+                pass
 
         # Split by subject_id instead of hadm_id to prevent data leakage
         subject_trajectory_counts = {}
@@ -192,6 +220,11 @@ class MIMICDataset(Dataset):
 
         # Compute normalization stats and load normalized tensors into memory
         #self.med_norm_stats, self.med_tensors_cache = self._compute_and_load_normalized_tensors()
+
+    @property
+    def id_to_combo_map(self) -> t.Dict[int, t.Dict[str, t.Any]]:
+        """Provides a formatted mapping from med_combo_id to medication details."""
+        return self.formatted_id_to_combo
 
     def _random_subject_split(self, trajectories, split, train_ratio, val_ratio, random_state):
         """Original random split by subject ID."""
@@ -316,7 +349,7 @@ class MIMICDataset(Dataset):
         traj_key = sample_info["traj_key"]
         med_combo_id = sample_info["med_combo_id"]
 
-        # Load Raindrop-ready context (required)
+        # Load Raindrop-ready context (60-min physio)
         rd_context_dir = os.path.join(self.context_tensors_dir, "raindrop_context")
         rd_context_path = os.path.join(rd_context_dir, f"rd_context_{traj_key}.pt")
 
@@ -325,9 +358,28 @@ class MIMICDataset(Dataset):
                 f"Raindrop context not found for {traj_key}: {rd_context_path}"
             )
         rd_src, rd_times, rd_length = torch.load(rd_context_path)
+
+        # Load Raindrop-ready chartevents context (24h)
+        traj_info = self.trajectories_metadata[traj_key]
+        chartevents_context_path = traj_info.get("chartevents_context_path")
+
+        if chartevents_context_path and os.path.exists(chartevents_context_path):
+            ce_rd_src, ce_rd_times, ce_rd_length = torch.load(chartevents_context_path)
+        else:
+            print(f"Warning: Chartevents context tensor not found for trajectory {traj_key}. Searched at '{chartevents_context_path}'. Using zero tensor as fallback.")
+            # Default values assume 24h context, 1h interval, 100 features
+            ce_rd_src = torch.zeros((24, 2 * 100), dtype=torch.float32)
+            ce_rd_times = torch.zeros((24,), dtype=torch.float32)
+            ce_rd_length = torch.tensor(0, dtype=torch.long)
+
         rd_src = rd_src.to(torch.float32)
         rd_times = rd_times.to(torch.float32)
         rd_length = torch.tensor(int(rd_length), dtype=torch.long)
+        
+        ce_rd_src = ce_rd_src.to(torch.float32)
+        ce_rd_times = ce_rd_times.to(torch.float32)
+        ce_rd_length = torch.tensor(int(ce_rd_length), dtype=torch.long)
+        
         # Build X/X_mask/t_X from raindrop context
         d_inp = rd_src.shape[-1] // 2
         p_in_values = rd_src[:, :d_inp]
@@ -390,10 +442,14 @@ class MIMICDataset(Dataset):
 
 
         return {
-            # Raindrop-ready context
-            "rd_src": rd_src,  # [T_ctx, 2*d_inp]
-            "rd_times": rd_times,  # [T_ctx]
-            "rd_length": rd_length,  # scalar length
+            # Raindrop-ready context (60min)
+            "rd_src": rd_src,
+            "rd_times": rd_times,
+            "rd_length": rd_length,
+            # Raindrop-ready chartevents context (24h)
+            "ce_rd_src": ce_rd_src,
+            "ce_rd_times": ce_rd_times,
+            "ce_rd_length": ce_rd_length,
             # Static and ICs at t0
             "static": static_feats,  # [d_static]
             "init_state": ic_tensor,  # [d_ic]
@@ -406,7 +462,7 @@ class MIMICDataset(Dataset):
             "med_values": med_traj_values,  # [T_fwd, M]
             "med_mask": med_traj_mask,  # [T_fwd, M]
             "med_time": med_traj_time_sec,  # [T_fwd]
-            # Precomputed med context per time [T_fwd, 2*M]
+            # Precomputed med context per time [T_fwd, 5*M] (rate, pre_on, cumulative, decay, trigger per med)
             "med_tensors": med_tensors,
             # IDs for traceability
             "hadm_id": torch.tensor(int(hadm_id), dtype=torch.long),
@@ -465,7 +521,9 @@ class MIMICDataModule(L.LightningDataModule):
         self.icu_stays_path = icu_stays_path
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.encoder_input_dim = None
+        self.context_input_dim = None
+        self.chartevents_input_dim = None
+        self.n_medications = None
         self.random_state = random_state
         self.static_input_dim = None
         self.max_samples = max_samples
@@ -567,11 +625,12 @@ class MIMICDataModule(L.LightningDataModule):
 
             if len(self.train_dataset) > 0:
                 sample0 = self.train_dataset[0]
-                # If using raindrop context, set d_inp from rd_src (half the last dim)
                 if self.use_raindrop_context and "rd_src" in sample0:
-                    self.encoder_input_dim = int(sample0["rd_src"].shape[-1] // 2)
-                else:
-                    self.encoder_input_dim = int(sample0["rd_src"].shape[-1] // 2)
+                    self.context_input_dim = int(sample0["rd_src"].shape[-1] // 2)
+                    self.chartevents_input_dim = int(sample0["ce_rd_src"].shape[-1] // 2)
+                
+                if "med_values" in sample0 and sample0["med_values"] is not None:
+                    self.n_medications = sample0["med_values"].shape[-1]
 
         if stage == "test" or stage is None:
             if self.test_both_filtered_and_unfiltered:
@@ -591,12 +650,14 @@ class MIMICDataModule(L.LightningDataModule):
                     max_samples=self.max_samples,
                     filter_flat_trajectories=True  # Filtered data only
                 )
-                if len(self.test_dataset_all) > 0 and self.encoder_input_dim is None:
-                    sample0 = self.test_dataset[0]
+                if len(self.test_dataset_all) > 0 and self.context_input_dim is None:
+                    sample0 = self.test_dataset_all[0]
                     if self.use_raindrop_context and "rd_src" in sample0:
-                        self.encoder_input_dim = int(sample0["rd_src"].shape[-1] // 2)
-                    else:
-                        self.encoder_input_dim = sample0["X"].shape[-1]
+                        self.context_input_dim = int(sample0["rd_src"].shape[-1] // 2)
+                        self.chartevents_input_dim = int(sample0["ce_rd_src"].shape[-1] // 2)
+                    
+                    if "med_values" in sample0 and sample0["med_values"] is not None:
+                        self.n_medications = sample0["med_values"].shape[-1]
             else:
                 # Single test dataset using the original filter setting
                 self.test_dataset = MIMICDataset(
@@ -607,12 +668,15 @@ class MIMICDataModule(L.LightningDataModule):
                     max_samples=self.max_samples,
                 ood_holdout_ratio=self.ood_holdout_ratio,
                     filter_flat_trajectories=self.filter_flat_trajectories)
-                if len(self.test_dataset) > 0 and self.encoder_input_dim is None:
+                if len(self.test_dataset) > 0 and self.context_input_dim is None:
                     sample0 = self.test_dataset[0]
                     if self.use_raindrop_context and "rd_src" in sample0:
-                        self.encoder_input_dim = int(sample0["rd_src"].shape[-1] // 2)
-                    else:
-                        self.encoder_input_dim = sample0["X"].shape[-1]
+                        self.context_input_dim = int(sample0["rd_src"].shape[-1] // 2)
+                        self.chartevents_input_dim = int(sample0["ce_rd_src"].shape[-1] // 2)
+
+                    if "med_values" in sample0 and sample0["med_values"] is not None:
+                        self.n_medications = sample0["med_values"].shape[-1]
+
                     # Also set static dim if not set
             if self.static_input_dim is None:
                 baseline_metadata_path = os.path.join(
@@ -693,11 +757,12 @@ class MIMICDataModule(L.LightningDataModule):
 
         # Raindrop-specific padding keys (built from context tensors)
         rd_pad_keys = ["rd_src", "rd_times"]
+        ce_pad_keys = ["ce_rd_src", "ce_rd_times"]
 
         # No fixed-size legacy context tensors to stack
         stack_keys = []
 
-        no_pad_keys = ["init_state", "ic_mask", "static", "rd_length", "hadm_id", "traj_id", "med_combo_id"]
+        no_pad_keys = ["init_state", "ic_mask", "static", "rd_length", "ce_rd_length", "hadm_id", "traj_id", "med_combo_id"]
 
         collated = {}
 
@@ -724,6 +789,9 @@ class MIMICDataModule(L.LightningDataModule):
         # No legacy context sequences to pad
         rd_lengths = [int(item["rd_length"]) for item in batch]
         rd_max_len = max(rd_lengths) if len(rd_lengths) > 0 else 0
+        
+        ce_lengths = [int(item["ce_rd_length"]) for item in batch]
+        ce_max_len = max(ce_lengths) if len(ce_lengths) > 0 else 0
 
         # Pad forward sequences to batch max or configured forward length
         y_max_len = max(valid_lengths) if len(valid_lengths) > 0 else 0
@@ -803,6 +871,26 @@ class MIMICDataModule(L.LightningDataModule):
                 padded_sequences.append(padded_seq)
             collated[key] = torch.stack(padded_sequences)
 
+        # Pad Chartevents Raindrop-specific sequences
+        for key in ce_pad_keys:
+            sequences = [item[key] for item in batch]
+            padded_sequences = []
+            for seq in sequences:
+                if seq.dim() == 1:
+                    if seq.shape[0] < ce_max_len:
+                        padding = torch.zeros((ce_max_len - seq.shape[0],), dtype=seq.dtype)
+                        padded_seq = torch.cat([seq, padding], dim=0)
+                    else:
+                        padded_seq = seq[:ce_max_len]
+                else:
+                    if seq.shape[0] < ce_max_len:
+                        padding = torch.zeros((ce_max_len - seq.shape[0],) + tuple(seq.shape[1:]), dtype=seq.dtype)
+                        padded_seq = torch.cat([seq, padding], dim=0)
+                    else:
+                        padded_seq = seq[:ce_max_len]
+                padded_sequences.append(padded_seq)
+            collated[key] = torch.stack(padded_sequences)
+
         # No legacy fixed-size context tensors to stack
 
         # Stack tensors that don't need padding
@@ -814,6 +902,9 @@ class MIMICDataModule(L.LightningDataModule):
             collated["rd_src"],  # [B, T_ctx, 2*d_inp]
             collated["rd_times"],  # [B, T_ctx]
             collated["rd_length"],  # [B]
+            collated["ce_rd_src"],
+            collated["ce_rd_times"],
+            collated["ce_rd_length"],
             collated["static"],  # [B, d_static]
             collated["init_state"],  # [B, d_ic]
             collated["ic_mask"],  # [B, d_ic]

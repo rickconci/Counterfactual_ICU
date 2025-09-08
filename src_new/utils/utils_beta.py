@@ -212,7 +212,13 @@ class MLPSimple(nn.Module):
                 f"[DEBUG] MLPSimple __init__: input_dim={input_dim}, output_dim={output_dim}, hidden_dim={hidden_dim}, depth={depth}, use_batch_norm={use_batch_norm}"
             )
 
-        self.input_layer = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
+        # Avoid LazyLinear for DDP compatibility: require explicit input_dim
+        if input_dim is None:
+            raise ValueError("MLPSimple requires explicit input_dim to avoid LazyLinear with DDP.")
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+        )
 
         # Define the output layer with an optional final activation
         if final_activation is not None:

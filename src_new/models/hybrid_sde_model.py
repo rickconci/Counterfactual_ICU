@@ -1,5 +1,8 @@
 import os
 import sys
+import math
+from collections import defaultdict
+import typing as t
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -219,7 +222,8 @@ class Hybrid_SDE(LightningModule):
         start_dec_at_treatment,
         variational_sampling,
         # Encoder
-        encoder_input_dim,
+        context_input_dim,
+        chartevents_input_dim,
         encoder_hidden_dim,
         encoder_SDENN_dims,
         expert_latent_dims,
@@ -236,86 +240,201 @@ class Hybrid_SDE(LightningModule):
         static_hidden_dim,
         fusion_hidden_dim,
         # SDE params
+        num_samples,
         normalise_for_SDENN,
-        prior_tx_sigma,
-        prior_tx_mu,
         self_reverting_prior_control,
-        SDE_input_state,
-        include_time,
+        prior_tx_sigma_per_control: t.List[float],
+        prior_tx_mu,
         theta,
         SDE_control_weighting,
-        # Control smoothness/inductive-bias flags
         use_control_lowpass,
         control_lowpass_tau,
         use_control_tv_loss,
         control_tv_weight,
         override_control_scales,
+        control_energy_weight,
         # SDE model params
-        num_samples,
+        SDE_input_state,
+        include_time,
         SDEnet_hidden_dim,
         SDEnet_depth,
         SDEnet_out_dims,
-        final_activation,
         use_batch_norm,
+        final_activation,
+        # SDE Integration
         integration_step_size,
         integration_method,
-        rtol,
         atol,
+        rtol,
         integration_adaptive,
         # decoder params
         decoder_output_dims,
-        log_lik_output_scale,
         normalised_data,
-        # loss
-        KL_weighting_SDE,
+        log_lik_output_scale,
         # admin
         train_dir,
+        KL_weighting_SDE,
+        loss_type,
+        log_lik_scale_mode,
+        anneal_iters,
+        # Optimizer params
+        use_lr_scheduler,
+        total_training_steps,
+        warmup_steps,
+        min_lr,
         learning_rate,
+        optimizer_name,
         log_wandb,
         adjoint,
         plot_every,
         batch_size,
         dataset,
         test_zenker,
-        debug=False,  # <<< Add debug flag >>>
-        # Diagnostics
-        force_zenker_defaults=False,
-        force_no_controls=False,
-        # Plotting
-        plot_outputs_train=True,
-        # plotting behavior (overlays auto-enabled for num_samples>1)
-        plot_control_samples=False,
-        # regularization
-        control_energy_weight: float = 1e-4,
-        # controller selection
-        controller_type: str = "mlp",  # or "gat"
-        gat_heads: int = 4,
-        gat_layers: int = 2,
-        gat_hidden: int = 128,
-        gat_dropout: float = 0.0,
+        debug,
+        force_no_controls,
+        plot_outputs_train,
+        # Controller selection (MLP vs GAT)
+        controller_type,
+        gat_heads,
+        gat_layers,
+        gat_hidden,
+        gat_dropout,
+        sde_burn_in_period,
+        log_train_combo_loss_every_n_steps,
+        scale_loss_by_variance,
+        ic_consistency_weight,
+        forward_loss_weight,
+        use_wandb_for_logging,
+        use_checkpointing,
+        debug_level,
+        force_zenker_defaults,
+        plot_control_samples,
+        plot_include_burn_in=True,
+        id_to_combo_map=None,
+        **kwargs,
     ):
         super().__init__()
-        self.debug = debug  # <<< Store debug flag >>>
-        global DEBUG
-        DEBUG = (
-            self.debug
-        )  # <<< Update module-level DEBUG if needed, primarily use self.debug >>>
+        self.save_hyperparameters()
 
-        if self.debug:
-            print(
-                f"[DEBUG] Hybrid_SDE __init__: Initializing... adjoint={adjoint}, use_encoder={use_encoder}, normalise_for_SDENN={normalise_for_SDENN}"
-            )
-        print("Using convergence rate!")
+        # Store all hyperparameters
+        self.use_encoder = use_encoder
+        self.start_dec_at_treatment = start_dec_at_treatment
+        self.variational_sampling = variational_sampling
+        self.context_input_dim = context_input_dim
+        self.chartevents_input_dim = chartevents_input_dim
+        self.encoder_hidden_dim = encoder_hidden_dim
+        self.encoder_SDENN_dims = encoder_SDENN_dims
+        self.expert_latent_dims = expert_latent_dims
+        self.encoder_num_layers = encoder_num_layers
+        self.variational_encoder = variational_encoder
+        self.encoder_w_time = encoder_w_time
+        self.encoder_reverse_time = encoder_reverse_time
+        self.use_2_5std_encoder_minmax = use_2_5std_encoder_minmax
+        self.n_medications = n_medications
+        self.med_embed_dim = med_embed_dim
+        self.encoder_context_len = encoder_context_len
+        self.static_input_dim = static_input_dim
+        self.static_hidden_dim = static_hidden_dim
+        self.fusion_hidden_dim = fusion_hidden_dim
+        self.num_samples = num_samples
+        self.normalise_for_SDENN = normalise_for_SDENN
+        self.self_reverting_prior_control = self_reverting_prior_control
+        self.prior_tx_sigma_per_control = prior_tx_sigma_per_control
+        self.prior_tx_mu = prior_tx_mu
+        self.theta = theta
+        self.SDE_control_weighting = SDE_control_weighting
+        self.use_control_lowpass = use_control_lowpass
+        self.control_lowpass_tau = control_lowpass_tau
+        self.use_control_tv_loss = use_control_tv_loss
+        self.control_tv_weight = control_tv_weight
+        self.override_control_scales = override_control_scales
+        self.control_energy_weight = control_energy_weight
+        self.SDE_input_state = SDE_input_state
+        self.include_time = include_time
+        self.SDEnet_hidden_dim = SDEnet_hidden_dim
+        self.SDEnet_depth = SDEnet_depth
+        # Flag: use direct pressure controls (C1->dpa_dt, C2->dpv_dt)
+        self.direct_pressure_controls = bool(kwargs.get("direct_pressure_controls", False))
+        # Determine control head count based on flag
+        self.SDEnet_out_dims = 2 if self.direct_pressure_controls else SDEnet_out_dims
+        self.use_batch_norm = use_batch_norm
+        self.final_activation = final_activation
+        self.integration_step_size = integration_step_size
+        self.integration_method = integration_method
+        self.atol = atol
+        self.rtol = rtol
+        self.integration_adaptive = integration_adaptive
+        self.decoder_output_dims = decoder_output_dims
+        self.normalised_data = normalised_data
+        self.log_lik_output_scale = log_lik_output_scale
+        self.train_dir = train_dir
+        self.KL_weighting_SDE = KL_weighting_SDE
+        self.loss_type = loss_type
+        self.log_lik_scale_mode = log_lik_scale_mode
+        self.anneal_iters = anneal_iters
+        self.use_lr_scheduler = use_lr_scheduler
+        self.total_training_steps = total_training_steps
+        self.warmup_steps = warmup_steps
+        self.min_lr = min_lr
+        self.learning_rate = learning_rate
+        self.optimizer_name = optimizer_name
+        self.log_wandb = log_wandb
+        self.adjoint = adjoint
+        self.plot_every = plot_every
+        self.batch_size = batch_size
+        self.dataset = dataset
+        self.test_zenker = test_zenker
+        self.debug = debug
+        self.force_no_controls = force_no_controls
+        self.plot_outputs_train = plot_outputs_train
+        self.controller_type = controller_type
+        self.gat_heads = gat_heads
+        self.gat_layers = gat_layers
+        self.gat_hidden = gat_hidden
+        self.gat_dropout = gat_dropout
+        self.sde_burn_in_period = sde_burn_in_period
+        self.log_train_combo_loss_every_n_steps = log_train_combo_loss_every_n_steps
+        self.scale_loss_by_variance = scale_loss_by_variance
+        self.ic_consistency_weight = ic_consistency_weight
+        self.forward_loss_weight = forward_loss_weight
+        self.use_wandb_for_logging = use_wandb_for_logging
+        self.use_checkpointing = use_checkpointing
+        self.debug_level = debug_level
+        self.force_zenker_defaults = force_zenker_defaults
+        self.plot_control_samples = plot_control_samples
+        self.plot_include_burn_in = bool(plot_include_burn_in)
 
         self.noise_type = "diagonal"  # required
         self.sde_type = "ito"  # required
-        self.sdeint_fn = torchsde.sdeint_adjoint if adjoint else torchsde.sdeint
+        self.sdeint_fn = torchsde.sdeint_adjoint if self.hparams.adjoint else torchsde.sdeint
 
         ### ADMIN
         self.train_dir = train_dir
         self.learning_rate = learning_rate
         self.log_wandb = log_wandb
         self.plot_every = plot_every
+        self.sde_burn_in_period = sde_burn_in_period
+
+        # Store the med combo map from the dataset or explicit argument
+        self.id_to_combo_map = {}
+        try:
+            if id_to_combo_map:
+                self.id_to_combo_map = id_to_combo_map
+            elif hasattr(dataset, 'id_to_combo_map') and getattr(dataset, 'id_to_combo_map'):
+                self.id_to_combo_map = dataset.id_to_combo_map
+            elif hasattr(dataset, 'id_to_combo') and getattr(dataset, 'id_to_combo'):
+                raw_map = dataset.id_to_combo
+                formatted = {}
+                for k, combo in raw_map.items():
+                    meds = combo if isinstance(combo, (list, tuple)) else (combo,)
+                    meds_sorted = sorted(list(meds))
+                    formatted[int(k)] = {
+                        "str": ", ".join(map(str, meds_sorted)),
+                        "details": [{"med_name": str(name)} for name in meds_sorted],
+                    }
+                self.id_to_combo_map = formatted
+        except Exception:
+            self.id_to_combo_map = {}
 
         ### Bifurcation options
         self.use_encoder = use_encoder
@@ -335,30 +454,53 @@ class Hybrid_SDE(LightningModule):
         temporal_embedding_dim = 0  # To store the output dim of the temporal encoder
 
         if use_encoder == "raindrop":
-            # For Raindrop, d_model is its internal feature size.
-            # Its output before projection will be d_model + d_pe if sensor_wise_mask is False
-            # TODO not quite sure if this is still right
-            d_ob = max(int(encoder_hidden_dim / encoder_input_dim), 2)
-            temporal_embedding_dim = encoder_input_dim * d_ob + 16  # d_model + d_pe
             max_len_ctx = (
                 120 if encoder_context_len is None else int(encoder_context_len)
             )
-            self.temporal_encoder = Raindrop_v2(
-                d_inp=encoder_input_dim,
+            # Encoder for 60-minute physiological context
+            self.context_encoder_60m = Raindrop_v2(
+                d_inp=context_input_dim,
                 d_model=encoder_hidden_dim,
-                output_dim=temporal_embedding_dim,  # Not used since we commented out final layer
+                output_dim=encoder_hidden_dim,
                 nhead=4,
                 nhid=128,
                 max_len=max_len_ctx,
-                global_structure=torch.ones(
-                    encoder_input_dim, encoder_input_dim
-                ),  # pass a complete adj matrix
+                global_structure=torch.ones(context_input_dim, context_input_dim),
                 nlayers=encoder_num_layers,
                 static=False,
                 debug=self.debug,
             )
+            # Encoder for 24-hour chartevents context
+            self.context_encoder_24h = Raindrop_v2(
+                d_inp=chartevents_input_dim,
+                d_model=encoder_hidden_dim,
+                output_dim=encoder_hidden_dim,
+                nhead=4,
+                nhid=128,
+                max_len=24, # 24 hours, 1h interval
+                global_structure=torch.ones(chartevents_input_dim, chartevents_input_dim),
+                nlayers=encoder_num_layers,
+                static=False,
+                debug=self.debug,
+            )
+            # Compute actual encoder output dims from Raindrop internals
+            def _rd_out_dim(enc):
+                if enc is None:
+                    return 0
+                # Raindrop returns [B, d_inp*d_ob + 16] when sensor_wise_mask=False
+                # and [B, d_inp*(d_ob+16)] when sensor_wise_mask=True
+                if getattr(enc, 'sensor_wise_mask', False):
+                    return int(enc.d_inp) * int(enc.d_ob + 16)
+                return int(enc.d_inp) * int(enc.d_ob) + 16
+
+            rd24_dim = _rd_out_dim(self.context_encoder_24h)
+            rd60_dim = _rd_out_dim(self.context_encoder_60m)
+            temporal_embedding_dim = rd24_dim + rd60_dim
+            self.fused_expected_dim = temporal_embedding_dim + static_hidden_dim
         else:
-            self.temporal_encoder = None
+            self.context_encoder_60m = None
+            self.context_encoder_24h = None
+            self.fused_expected_dim = static_hidden_dim
 
         # --- New Static Encoder and Fusion Heads ---
         if use_encoder != "none":
@@ -370,23 +512,18 @@ class Hybrid_SDE(LightningModule):
                 activations=[nn.ReLU(), nn.ReLU()],
                 debug=self.debug,
             )
-            # This MLP fuses the temporal and static embeddings
+            # This MLP fuses the temporal and static embeddings to produce the neural_embedding
             self.fusion_mlp = MLPSimple(
-                input_dim=temporal_embedding_dim + static_hidden_dim,
-                output_dim=fusion_hidden_dim,
-                hidden_dim=(temporal_embedding_dim + static_hidden_dim) // 2,
+                input_dim=self.fused_expected_dim,
+                output_dim=encoder_SDENN_dims, # Directly outputs the neural embedding
+                hidden_dim=max(64, self.fused_expected_dim // 2),
                 depth=2,
                 activations=[nn.ReLU(), nn.ReLU()],
                 debug=self.debug,
             )
-            # Head 1: Predicts the initial state for all 14 expert ODE variables
-            self.ode_latent_head = nn.Sequential(
-                nn.Linear(fusion_hidden_dim, expert_latent_dims), nn.Sigmoid()
-            )
-            # Head 2: Predicts the separate embedding for the neural SDE component
-            self.neural_embedding_head = nn.Linear(
-                fusion_hidden_dim, encoder_SDENN_dims
-            )
+            # DEPRECATED: Heads for predicting initial conditions are removed
+            self.ode_latent_head = None
+            self.neural_embedding_head = None
         else:
             self.static_encoder = None
             self.fusion_mlp = None
@@ -396,14 +533,22 @@ class Hybrid_SDE(LightningModule):
 
         ### PRIOR PARAMS
         self.self_reverting_prior_control = self_reverting_prior_control
-        self.prior_tx_sigma = prior_tx_sigma
+        if prior_tx_sigma_per_control is None:
+            # Defaults based on 10% of original control scales
+            self.prior_tx_sigma_per_control = torch.tensor([0.01, 0.002, 0.001, 0.001], dtype=torch.float32)
+        else:
+            self.prior_tx_sigma_per_control = torch.tensor(prior_tx_sigma_per_control, dtype=torch.float32)
+
+        if self.prior_tx_sigma_per_control.shape[0] != SDEnet_out_dims:
+            raise ValueError(f"Length of prior_tx_sigma_per_control ({self.prior_tx_sigma_per_control.shape[0]}) must match SDEnet_out_dims ({SDEnet_out_dims})")
+            
         self.prior_tx_mu = prior_tx_mu
 
         # sigma_values = torch.tensor(list(CV_params_prior_sigma.values())).float()
         # sigma_values = sigma_values[:expert_latent_dims].view(1, -1)
         # self.register_buffer('sigma', sigma_values.clone())
         self.sigma = (
-            torch.tensor(self.prior_tx_sigma, dtype=torch.float32)
+            torch.tensor(self.prior_tx_sigma_per_control, dtype=torch.float32)
             .to(self.device)
             .unsqueeze(0)
         )
@@ -446,7 +591,9 @@ class Hybrid_SDE(LightningModule):
 
         self.SDEnet_hidden_dim = SDEnet_hidden_dim
         self.SDEnet_depth = SDEnet_depth
-        self.SDEnet_out_dims = SDEnet_out_dims
+        # Do NOT overwrite the earlier direct-control override
+        if not getattr(self, "direct_pressure_controls", False):
+            self.SDEnet_out_dims = SDEnet_out_dims
         self.SDE_control_weighting = SDE_control_weighting
         # Smoothness flags
         self.use_control_lowpass = bool(use_control_lowpass)
@@ -457,6 +604,16 @@ class Hybrid_SDE(LightningModule):
         # Blend between pure low-pass derivative and raw control derivative
         # 1.0 -> pure low-pass du=(u_hat-u)/tau; 0.0 -> raw du=u_hat (interpreted as direct derivative)
         self.control_lowpass_blend = 0.1
+        # Ratio cap for diffusion vs. drift scaling on controls (sigma <= ratio * weight)
+        try:
+            self.control_sigma_ratio = float(kwargs.get("control_sigma_ratio", 0.1))
+        except Exception:
+            self.control_sigma_ratio = 0.1
+        # Limit number of patients plotted per call to reduce I/O spam in DDP
+        try:
+            self.max_plotted_patients = int(kwargs.get("max_plotted_patients", 4))
+        except Exception:
+            self.max_plotted_patients = 4
 
         net_input_dims = (
             self.encoder_output_dim
@@ -468,8 +625,13 @@ class Hybrid_SDE(LightningModule):
         # Medication embedding config (project variable med context dims -> fixed size)
         self.n_medications = int(n_medications)
         self.med_embed_dim = med_embed_dim
-        # Use LazyLinear to infer input dim on first forward while keeping params registered
-        self.med_proj = nn.LazyLinear(self.med_embed_dim)
+        # Initialize explicitly to avoid Lazy params (DDP requires materialized weights)
+        # Input dimension equals the number of medication features per time step (per-med features = 5 -> rate, pre_on, cumulative, decay, trigger)
+        # So total input dim is 5 * M
+        if int(self.n_medications) > 0:
+            self.med_proj = nn.Linear(int(self.n_medications) * 5, int(self.med_embed_dim), bias=True)
+        else:
+            self.med_proj = None
 
         if self.use_encoder != "none":
             self.ic_consistency_weight = 10
@@ -477,8 +639,8 @@ class Hybrid_SDE(LightningModule):
             net_input_dims = net_input_dims + self.med_embed_dim
         else:
             self.ic_consistency_weight = 0
-            # expert latents + fixed med embedding dims
-            net_input_dims = self.expert_latent_dims + self.med_embed_dim
+            # expert latents + fixed med embedding dims + neural embedding
+            net_input_dims = self.expert_latent_dims + self.med_embed_dim + encoder_SDENN_dims
             net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         # Append physics-derived feature count (ΔP, r_tpr, f_hr, F, dpa_base, dpv_base, sigma, s_dot)
@@ -493,7 +655,7 @@ class Hybrid_SDE(LightningModule):
 
         self.SDEnet = MLPSimple(
             input_dim=net_input_dims,
-            output_dim=SDEnet_out_dims,
+            output_dim=self.SDEnet_out_dims,
             hidden_dim=SDEnet_hidden_dim,
             depth=SDEnet_depth,
             activations=[nn.Tanh() for _ in range(SDEnet_depth)],
@@ -513,20 +675,20 @@ class Hybrid_SDE(LightningModule):
         # Head 2 (dt_ca): ~0.01 units per time step
         # Head 3 (dt_r_tpr_mod): ~0.01 units per time step
         default_scales = torch.tensor([0.1, 0.02, 0.01, 0.01], dtype=torch.float32)
-        if SDEnet_out_dims != len(default_scales):
+        if self.SDEnet_out_dims != len(default_scales):
             # Fallback: repeat or truncate to match dims
-            repeats = (SDEnet_out_dims + len(default_scales) - 1) // len(default_scales)
-            default_scales = default_scales.repeat(repeats)[:SDEnet_out_dims]
+            repeats = (self.SDEnet_out_dims + len(default_scales) - 1) // len(default_scales)
+            default_scales = default_scales.repeat(repeats)[: self.SDEnet_out_dims]
         # Allow override via CLI
         if isinstance(override_scales, str) and override_scales.strip() != "":
             try:
                 pieces = [float(x) for x in override_scales.split(",")]
                 ov = torch.tensor(pieces, dtype=torch.float32)
-                if ov.numel() < SDEnet_out_dims:
-                    reps = (SDEnet_out_dims + ov.numel() - 1) // ov.numel()
-                    ov = ov.repeat(reps)[:SDEnet_out_dims]
+                if ov.numel() < self.SDEnet_out_dims:
+                    reps = (self.SDEnet_out_dims + ov.numel() - 1) // ov.numel()
+                    ov = ov.repeat(reps)[: self.SDEnet_out_dims]
                 else:
-                    ov = ov[:SDEnet_out_dims]
+                    ov = ov[: self.SDEnet_out_dims]
                 default_scales = ov
                 if self.debug:
                     print(
@@ -568,14 +730,52 @@ class Hybrid_SDE(LightningModule):
         self.gat_layers = int(gat_layers)
         self.gat_hidden = int(gat_hidden)
         self.gat_dropout = float(gat_dropout)
+        self.sde_burn_in_period = float(sde_burn_in_period)
+        self.log_train_combo_loss_every_n_steps = int(log_train_combo_loss_every_n_steps)
+        self.scale_loss_by_variance = scale_loss_by_variance
+
+        # For per-med combo loss tracking
+        self.train_combo_loss_accumulator = defaultdict(lambda: {'loss': 0.0, 'loss_sq': 0.0, 'count': 0})
+        self.val_combo_losses = []
+        self.test_combo_losses = []
+
+        # Store optimizer params
+        self.use_lr_scheduler = use_lr_scheduler
+        self.total_training_steps = total_training_steps
+        self.warmup_steps = warmup_steps
+        self.min_lr = min_lr
 
         # Debug helper state
         self._forward_hook_handles = []
         self._last_sdnet_io_stats = None
 
         ### LOSS
+        self.loss_type = loss_type
+        self.log_lik_scale_mode = log_lik_scale_mode
         self.MSE_loss = nn.MSELoss(reduction="none")
-        self.log_lik_output_scale = log_lik_output_scale
+
+        # if self.log_lik_scale_mode == 'learnable':
+        #     # We learn log(scale) for stability. Initialize with log of the provided value.
+        #     initial_log_scale = torch.log(torch.tensor(log_lik_output_scale, dtype=torch.float32))
+        #     # Create a learnable parameter for each output dimension
+        #     self.log_scale_param = nn.Parameter(
+        #         torch.full((self.decoder_output_dims,), initial_log_scale)
+        #     )
+        #     # The original log_lik_output_scale is now just a config value, not used directly in loss
+        #     self.initial_log_lik_output_scale = log_lik_output_scale
+        # elif self.log_lik_scale_mode == 'annealing':
+        #     # Can be parameterized later if needed
+        #     anneal_start_val = 10.0  # Start with high uncertainty
+        #     anneal_end_val = log_lik_output_scale  # End at the provided value
+        #     self.scale_scheduler = LinearScheduler(iters=anneal_iters, startval=anneal_start_val, endval=anneal_end_val, start=0)
+        #     self.log_lik_output_scale = anneal_start_val # Store the initial value for clarity, but scheduler.val is used
+        # else: # fixed
+        #     self.log_lik_output_scale = log_lik_output_scale
+
+        ### ADMIN
+        self.train_dir = train_dir
+        self.KL_weighting_SDE = KL_weighting_SDE
+
         self.KL_weighting_SDE = KL_weighting_SDE
         self.kl_scheduler = LinearScheduler(
             start=70, iters=600, startval=1.0, endval=0.01
@@ -723,6 +923,33 @@ class Hybrid_SDE(LightningModule):
         else:
             self.gat_controller = None
 
+        # Log-likelihood scale configuration
+        if self.hparams.log_lik_scale_mode == "learnable":
+            # Learn per-output log-scale; initialize from provided scale
+            initial_log_scale = torch.log(
+                torch.as_tensor(self.hparams.log_lik_output_scale, dtype=torch.float32)
+            )
+            # Determine number of output channels
+            if isinstance(self.hparams.decoder_output_dims, (list, tuple)):
+                num_outputs = int(sum(self.hparams.decoder_output_dims))
+            else:
+                num_outputs = int(self.hparams.decoder_output_dims)
+            self.log_scale_param = nn.Parameter(
+                torch.full((num_outputs,), initial_log_scale, dtype=torch.float32)
+            )
+            # Keep a scalar for debug logging purposes
+            self.log_lik_output_scale = float(self.hparams.log_lik_output_scale)
+        elif self.hparams.log_lik_scale_mode == "annealing":
+            anneal_start_val = 10.0
+            anneal_end_val = float(self.hparams.log_lik_output_scale)
+            self.scale_scheduler = LinearScheduler(
+                iters=self.hparams.anneal_iters, startval=anneal_start_val, endval=anneal_end_val, start=0
+            )
+            self.log_lik_output_scale = anneal_start_val
+        else:
+            # fixed
+            self.log_lik_output_scale = float(self.hparams.log_lik_output_scale)
+
     def transform_sigmoid_to_physiological_ranges(self, sigmoid_values):
         # TODO check this again in encoder setting
         """Simplified version using pre-computed ranges"""
@@ -834,13 +1061,44 @@ class Hybrid_SDE(LightningModule):
 
     def get_adaptive_control_scales(self, current_step):
         """Gradually increase control authority as training progresses"""
-        base_scales = torch.tensor([0.1, 0.02, 0.01, 0.01], dtype=torch.float32)
+        base_scales = torch.tensor([1, 1, 0.1, 0.1], dtype=torch.float32)
 
         # Start with 1% control authority, ramp up to 100% over 1000 steps
-        ramp_progress = min(current_step / 1000.0, 1.0)
+        ramp_progress = min(current_step / 50.0, 1.0)
         scale_multiplier = 0.01 + 0.99 * ramp_progress
 
         return base_scales * scale_multiplier
+
+    def get_current_per_control_weights(self):
+        """
+        Compute per-control weights applied to controller outputs at the current training step.
+        Returns a tensor of shape [SDEnet_out_dims].
+        """
+        adaptive = self.get_adaptive_control_scales(self.global_step)
+        if adaptive.numel() != self.SDEnet_out_dims:
+            repeats = (self.SDEnet_out_dims + adaptive.numel() - 1) // adaptive.numel()
+            adaptive = adaptive.repeat(repeats)[: self.SDEnet_out_dims]
+        return adaptive.to(self.device) * float(self.SDE_control_weighting)
+
+    def get_current_per_control_sigmas(self):
+        """
+        Compute per-control diffusion sigmas constrained to be a small ratio of the
+        current effective control weights to avoid diffusion dominating early training.
+
+        Rule: sigma_i <= control_sigma_ratio * weight_i, applied elementwise.
+        Falls back to base prior sigmas if they are already below the cap.
+        """
+        # Base per-control sigma from prior (vector length SDEnet_out_dims)
+        base_sigma = self.prior_tx_sigma_per_control.to(self.device)
+        # Current effective control weights (already includes global weighting)
+        weights = self.get_current_per_control_weights()
+        # Cap per-control sigma as a fraction of current weights
+        max_sigma = float(self.control_sigma_ratio) * torch.clamp(weights, min=1e-12)
+        # Use the tighter (smaller) of base_sigma and cap
+        sigma = torch.minimum(base_sigma, max_sigma)
+        # Ensure strictly positive to avoid degenerate diffusion
+        sigma = torch.clamp(sigma, min=1e-12)
+        return sigma
 
     def apply_SDE_fun(self, t, y):
         """
@@ -1023,8 +1281,8 @@ class Hybrid_SDE(LightningModule):
         def med_forward(med_input):
             return torch.tanh(self.med_proj(med_input))
 
-        if self.training:
-            med_embed = checkpoint.checkpoint(med_forward, med_tensor)
+        if self.training and self.use_checkpointing and getattr(med_tensor, 'requires_grad', False):
+            med_embed = checkpoint.checkpoint(med_forward, med_tensor, use_reentrant=False)
         else:
             med_embed = torch.tanh(self.med_proj(med_tensor))
        
@@ -1086,10 +1344,12 @@ class Hybrid_SDE(LightningModule):
             if self.force_no_controls:
                 scaled_output = torch.zeros_like(u_raw)
             else:
-                # Apply per-head scales and global weighting
-                scaled_output = (
-                    u_raw #* self.control_scales.to(u_raw.device)
-                ) * self.SDE_control_weighting
+                # Apply adaptive per-head scales and global weighting
+                current_scales = self.get_current_per_control_weights().to(u_raw.device)
+                if current_scales.numel() != u_raw.shape[-1]:
+                    repeats = (u_raw.shape[-1] + current_scales.numel() - 1) // current_scales.numel()
+                    current_scales = current_scales.repeat(repeats)[: u_raw.shape[-1]]
+                scaled_output = u_raw * current_scales.unsqueeze(0)
             # Check for NaN/Inf in scaled output - FAIL FAST, NO SANITIZATION
             check_for_nan_inf(scaled_output, "GAT_scaled_output", "apply_SDE_fun", self, raise_error=True)
             
@@ -1165,8 +1425,8 @@ class Hybrid_SDE(LightningModule):
             #normalized_input = self.input_layer_norm(sde_input)  # Include in checkpoint
             return self.SDEnet(sde_input)
 
-        if self.training:
-            SDE_NN_output_latents = checkpoint.checkpoint(control_forward, SDE_NN_input)
+        if self.training and self.use_checkpointing and getattr(SDE_NN_input, 'requires_grad', False):
+            SDE_NN_output_latents = checkpoint.checkpoint(control_forward, SDE_NN_input, use_reentrant=False)
         else:
             #normalized_input = self.input_layer_norm(SDE_NN_input)
             SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
@@ -1178,8 +1438,8 @@ class Hybrid_SDE(LightningModule):
             scaled_output = torch.zeros_like(SDE_NN_output_latents)
         else:
             # Apply per-head scales and global weighting
-            current_scales = self.get_adaptive_control_scales(self.global_step)
-            scaled_output = (SDE_NN_output_latents) * self.SDE_control_weighting #* current_scales.to(SDE_NN_output_latents.device)
+            current_scales = self.get_current_per_control_weights().to(SDE_NN_output_latents.device)
+            scaled_output = SDE_NN_output_latents * current_scales.unsqueeze(0)
         if torch.isnan(scaled_output).any() or torch.isinf(scaled_output).any():
             activate_auto_debug_mode(self, "apply_SDE_fun (MLP path)", "scaled_output", scaled_output)
             raise RuntimeError("Non-finite values in scaled_output. Auto-debug mode activated.")
@@ -1321,16 +1581,25 @@ class Hybrid_SDE(LightningModule):
 
         # Use tensor-safe comparison for time gating (no .item())
         t_tensor = t if torch.is_tensor(t) else torch.tensor(t, device=self.device)
-        if (t_tensor >= time_to_treatment).all():
+        
+        # Burn-in logic
+        if t_tensor < self.sde_burn_in_period:
+            # During burn-in, no neural control is applied.
+            dt_i_ext_SDE = torch.zeros(
+                batch_size, self.SDEnet_out_dims, device=self.device
+            )
+        elif (t_tensor >= time_to_treatment).all():
             # this will always be the case when working with mimic data as time to treatment is 0
             dt_i_ext_SDE = self.apply_SDE_fun(t, y_clamped)
-            dt_i_ext_SDE_dict = {}
-            for i in range(self.SDEnet_out_dims):
-                dt_i_ext_SDE_dict[f"dt_i_ext_SDE_{i+1}"] = dt_i_ext_SDE[:, i].unsqueeze(
-                    1
-                )
+            
         else:
             raise ValueError("Time to treatment should always be <= current time t")
+
+        dt_i_ext_SDE_dict = {}
+        for i in range(self.SDEnet_out_dims):
+            dt_i_ext_SDE_dict[f"dt_i_ext_SDE_{i+1}"] = dt_i_ext_SDE[:, i].unsqueeze(
+                1
+            )
 
         # Neural embedding derivatives (zeros - they evolve stochastically)
         dt_neural_embedding = torch.zeros([batch_size, self.encoder_SDENN_dims]).to(
@@ -1381,10 +1650,15 @@ class Hybrid_SDE(LightningModule):
                     pass
 
         # apply model-specific transformations on Zenker model output using control DERIVATIVES
-        dpv_dt = dpv_dt + dt_i_ext_SDE_dict["dt_i_ext_SDE_1"]
-        dsv_dt = dsv_dt + dt_i_ext_SDE_dict["dt_i_ext_SDE_2"]
-        dt_ca = dt_ca + dt_i_ext_SDE_dict["dt_i_ext_SDE_3"]
-        dt_r_tpr_mod = dt_r_tpr_mod + dt_i_ext_SDE_dict["dt_i_ext_SDE_4"]
+        if self.direct_pressure_controls:
+            # Use two direct control heads: C1->dpa_dt, C2->dpv_dt
+            dpa_dt = dpa_dt + dt_i_ext_SDE_dict["dt_i_ext_SDE_1"]
+            dpv_dt = dpv_dt + dt_i_ext_SDE_dict["dt_i_ext_SDE_2"]
+        else:
+            dpv_dt = dpv_dt + dt_i_ext_SDE_dict["dt_i_ext_SDE_1"]
+            dsv_dt = dsv_dt + dt_i_ext_SDE_dict["dt_i_ext_SDE_2"]
+            dt_ca = dt_ca + dt_i_ext_SDE_dict["dt_i_ext_SDE_3"]
+            dt_r_tpr_mod = dt_r_tpr_mod + dt_i_ext_SDE_dict["dt_i_ext_SDE_4"]
 
         if self.debug:
             t_idx = torch.round((t.to(self._t0) - self._t0) / self._dt_grid).to(
@@ -1470,7 +1744,12 @@ class Hybrid_SDE(LightningModule):
             u2_sum = None
             for ctrl_idx in range(self.SDEnet_out_dims):
                 y_ctrl = i_ext[:, ctrl_idx].unsqueeze(1)
-                g_ctrl, h_ctrl = self.g(t, y_ctrl), self.h(t, y_ctrl)
+
+                # Use dynamic per-control sigma (tied to current weights) for KL computation
+                sigma_val = self.get_current_per_control_sigmas()[ctrl_idx].to(y.device)
+                g_ctrl = sigma_val.repeat(y_ctrl.size(0), 1)
+
+                h_ctrl = self.h(t, y_ctrl)
                 f_ctrl = f_res[:, ctrl_idx].unsqueeze(1)
                 u = _stable_division(f_ctrl - h_ctrl, g_ctrl)  # normalized drift diff
                 term = 0.5 * (u**2)  # [batch, 1]
@@ -1562,18 +1841,11 @@ class Hybrid_SDE(LightningModule):
 
         batch_size = y.shape[0]
 
-        # Handle different shapes of self.sigma
-        if self.sigma.dim() == 1:
-            if self.sigma.shape[0] > 1:
-                sigma_val = self.sigma[0].item()
-            else:
-                sigma_val = self.sigma.item()
-        elif self.sigma.dim() == 2:
-            sigma_val = self.sigma[0, 0].item()
-        else:
-            sigma_val = self.sigma.item()
-
-        # Return as a tensor with shape [batch_size, 1]
+        # Use dynamic per-control sigmas tied to current control weights
+        sigmas = self.get_current_per_control_sigmas()  # [D]
+        # Return as tensor with shape [batch_size, 1]; this g() is used for OU prior on a single dim
+        # Take the first control's sigma for this scalar dimension
+        sigma_val = float(sigmas[0].item())
         g_out = torch.full((batch_size, 1), sigma_val, device=y.device)
         
         # Check for NaN/Inf in output - FAIL FAST, NO SANITIZATION
@@ -1588,39 +1860,17 @@ class Hybrid_SDE(LightningModule):
 
         batch_size = y.shape[0]
 
-        # Diffusion only on control states (first 4); zeros elsewhere
-        i_ext_1 = y[:, 0].unsqueeze(1)
-        g_i_ext_1 = self.g(t, i_ext_1)
-        i_ext_2 = y[:, 1].unsqueeze(1)
-        g_i_ext_2 = self.g(t, i_ext_2)
-        i_ext_3 = y[:, 2].unsqueeze(1)
-        g_i_ext_3 = self.g(t, i_ext_3)
-        i_ext_4 = y[:, 3].unsqueeze(1)
-        g_i_ext_4 = self.g(t, i_ext_4)
+        # Diffusion only on control states (first SDEnet_out_dims) using dynamic per-control sigmas
+        g_controls = self.get_current_per_control_sigmas().to(y.device).repeat(batch_size, 1)
 
-        g_expert_dims = torch.zeros([batch_size, self.expert_latent_dims]).to(y.device)
-        g_neural_dims = torch.zeros([batch_size, self.encoder_SDENN_dims]).to(y.device)
-        g_logqp = torch.zeros([batch_size, 1]).to(y.device)
-        g_tx = torch.zeros([batch_size, 1]).to(y.device)
-        g_time_to_tx = torch.zeros([batch_size, 1]).to(y.device)
+        # Zeros for all other state dimensions
+        num_other_dims = y.shape[1] - self.SDEnet_out_dims
+        g_zeros = torch.zeros(batch_size, num_other_dims, device=y.device)
 
-        g_out = torch.cat(
-            [
-                g_i_ext_1,
-                g_i_ext_2,
-                g_i_ext_3,
-                g_i_ext_4,
-                g_expert_dims,
-                g_neural_dims,
-                g_logqp,
-                g_tx,
-                g_time_to_tx,
-            ],
-            dim=1,
-        )
-
-        # concise only
-
+        g_out = torch.cat([g_controls, g_zeros], dim=1)
+        
+        check_for_nan_inf(g_out, "g_aug_output", "g_diffusion", self, raise_error=True)
+        
         return g_out
 
     def _prepare_no_encoder_initial_state(self, init_states, ic_mask):
@@ -1713,6 +1963,7 @@ class Hybrid_SDE(LightningModule):
         ts,
         Tx,
         time_to_tx,
+        neural_embedding,
         valid_lengths=None,
         med_traj_values=None,
         med_traj_mask=None,
@@ -1734,6 +1985,7 @@ class Hybrid_SDE(LightningModule):
         self.current_med_values = med_traj_values  # (batch, time, n_meds)
         self.current_med_mask = med_traj_mask  # (batch, time, n_meds)
         self.current_med_time = med_traj_time  # (batch, time)
+        self.current_neural_embedding = neural_embedding # [B, S, D_neural]
 
         if self.debug:
             print(
@@ -1896,7 +2148,7 @@ class Hybrid_SDE(LightningModule):
         logqp_path = aug_ys[:, :, -1, -3]
 
         if self.debug:
-            print(f"Latent out: {latent_out.shape}. Expect [23 x 7 x 17 x 14]")
+            print(f"Latent out: {latent_out.shape}. Expect [B x S x T x {self.expert_latent_dims}]")
 
         return latent_out, logqp_path, i_ext_path
 
@@ -2012,101 +2264,104 @@ class Hybrid_SDE(LightningModule):
             print(
                 f"[DEBUG] Hybrid_SDE compute_factual_loss: Shapes: predicted_traj={predicted_traj.shape}, true_traj={true_traj.shape}"
             )
-        # Compute log probability
-        logpy = distributions.Normal(
-            loc=predicted_traj, scale=self.log_lik_output_scale
-        ).log_prob(true_traj_expanded)
-        if self.debug:
-            print(f"Logpy: {logpy[0]}")
-            print(f"True traj expanded: {true_traj_expanded[0]}")
-            print(f"Predicted traj: {predicted_traj[0]}")
-            print(
-                f"Mask shape: {mask.shape if mask is not None else None} (expected [B, T, C])"
-            )
+        if self.loss_type == "nll":
+            # Determine the scale based on the mode
+            if self.log_lik_scale_mode == 'learnable':
+                # Clamp the log_scale parameter to prevent collapse or explosion, then exponentiate.
+                # Range corresponds to a scale of approx. 0.1 to 55 mmHg.
+                clamped_log_scale = torch.clamp(self.log_scale_param, min=-2.3, max=4.0)
+                current_scale = torch.exp(clamped_log_scale)
+            elif self.log_lik_scale_mode == 'annealing':
+                current_scale = self.scale_scheduler.val
+            else: # 'fixed'
+                current_scale = self.log_lik_output_scale
 
-            # Additional diagnostics: per-channel masked MSE/MAE on predicted mean
-            pred_mean = predicted_traj.mean(dim=1)  # [B,T,C]
+            # NLL Loss (probabilistic)
+            logpy = distributions.Normal(
+                loc=predicted_traj, scale=current_scale
+            ).log_prob(true_traj_expanded)
+            
+            # Per-sample loss calculation
             if mask is not None:
-                mask_f = mask.to(dtype=pred_mean.dtype, device=pred_mean.device)
-                denom = torch.clamp(mask_f.sum(dim=(0, 1)), min=1.0)  # [C]
-                se = ((pred_mean - true_traj) ** 2) * mask_f  # [B,T,C]
-                ae = (pred_mean - true_traj).abs() * mask_f
-                mse_ch = se.sum(dim=(0, 1)) / denom
-                mae_ch = ae.sum(dim=(0, 1)) / denom
-                print(f"[DEBUG] MSE per channel: {mse_ch.detach().cpu().tolist()}")
-                print(f"[DEBUG] MAE per channel: {mae_ch.detach().cpu().tolist()}")
-                # Saturation stats (0 and high clip ~220 if present)
-                zeros_frac = ((pred_mean == 0.0) * mask_f.bool()).sum(
-                    dim=(0, 1)
-                ) / torch.clamp(mask_f.sum(dim=(0, 1)), min=1.0)
-                high_frac = ((pred_mean >= 210.0) * mask_f.bool()).sum(
-                    dim=(0, 1)
-                ) / torch.clamp(mask_f.sum(dim=(0, 1)), min=1.0)
-                print(
-                    f"[DEBUG] Saturation frac@0 per channel: {zeros_frac.detach().cpu().tolist()}"
-                )
-                print(
-                    f"[DEBUG] Saturation frac@>=210 per channel: {high_frac.detach().cpu().tolist()}"
-                )
-                # Mask coverage
-                cov = mask_f.mean(dim=(0, 1))
-                print(
-                    f"[DEBUG] Mask coverage per channel: {cov.detach().cpu().tolist()}"
-                )
-                # Per-channel NLL (mean over B,T,S)
-                mask_expanded_dbg = mask_f.unsqueeze(1).expand(
-                    -1, predicted_traj.shape[1], -1, -1
-                )
-                logpy_masked = logpy * mask_expanded_dbg
-                denom_ch = torch.clamp(mask_f.sum(dim=(0, 1)), min=1.0)
-                # Sum over batch, samples, and time to get per-channel NLL
-                nll_ch = -logpy_masked.sum(dim=(0, 1, 2)) / denom_ch  # [C]
-                nll_ch_mean = nll_ch
-                print(
-                    f"[DEBUG] NLL per channel (avg over samples): {nll_ch_mean.detach().cpu().tolist() if nll_ch_mean.numel()>1 else float(nll_ch_mean.detach().cpu())}"
-                )
-                # Small diff snippet first 5 timesteps
-                Tsnip = min(pred_mean.shape[1], 5)
-                diff_snip = (
-                    (pred_mean[:1, :Tsnip, :] - true_traj[:1, :Tsnip, :]).detach().cpu()
-                )
-                print(
-                    f"[DEBUG] y_pred - y_true (first sample, first {Tsnip} steps):\n{diff_snip}"
-                )
+                mask = mask.to(device=logpy.device, dtype=logpy.dtype)
+                mask_expanded = mask.unsqueeze(1).expand_as(logpy)
+                logpy = logpy * mask_expanded
+                
+                # Sum over time and features, then average over samples
+                per_sample_logpy = logpy.sum(dim=(2, 3)).mean(dim=1) # [B]
+                valid_count_per_sample = torch.clamp(mask.sum(dim=(1,2)), min=1.0) # [B]
+                per_sample_loss = -per_sample_logpy / valid_count_per_sample
+                
+                # Overall loss for backward pass
+                valid_count_total = torch.clamp(mask.sum(), min=1.0)
+                recon_loss = -logpy.sum() / valid_count_total
             else:
-                print("[DEBUG] No mask provided; MSE/MAE coverage skipped.")
+                per_sample_loss = -logpy.sum(dim=(2, 3)).mean(dim=(1,0)) # [B]
+                recon_loss = per_sample_loss.mean()
 
-        # FIXED: Correct normalization
-        if mask is not None:
-            # Ensure mask dtype/device compatibility
-            mask = mask.to(device=logpy.device, dtype=logpy.dtype)
-            mask_expanded = mask.unsqueeze(1).expand(
-                -1, predicted_traj.shape[1], -1, -1
-            )
-            logpy = logpy * mask_expanded
-
-            # Sum over time and features
-            logpy_sum = logpy.sum(dim=(2, 3))  # [batch, samples]
-
-            # Count total valid elements per sample (time * features)
-            valid_count = mask.sum(dim=(1, 2))  # [batch] - total valid elements
-            # Avoid division by zero
-            valid_count = torch.clamp(valid_count, min=1.0)
-
-            # Normalize correctly
-            logpy = logpy_sum / valid_count.unsqueeze(
-                1
-            )  # [batch, samples] / [batch, 1]
-            logpy = logpy.mean(dim=1)  # Average over samples
+        elif self.loss_type == "mse":
+            # MSE Loss (deterministic on mean prediction)
+            pred_mean = predicted_traj.mean(dim=1)  # [B, T, C]
+            sq_error = (pred_mean - true_traj) ** 2
+            
+            # Per-sample loss calculation
+            if mask is not None:
+                mask = mask.to(device=sq_error.device, dtype=sq_error.dtype)
+                sq_error_masked = sq_error * mask
+                
+                per_sample_sq_error = sq_error_masked.sum(dim=(1,2)) # [B]
+                valid_count_per_sample = torch.clamp(mask.sum(dim=(1,2)), min=1.0) # [B]
+                per_sample_loss = per_sample_sq_error / valid_count_per_sample
+                
+                # Overall loss for backward pass
+                valid_count_total = torch.clamp(mask.sum(), min=1.0)
+                recon_loss = sq_error_masked.sum() / valid_count_total
+            else:
+                per_sample_loss = sq_error.mean(dim=(1,2)) # [B]
+                recon_loss = per_sample_loss.mean()
         else:
-            logpy = logpy.sum(dim=(2, 3)).mean(dim=1)
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+        # Compute final reconstruction loss, optionally scaling by variance
+        if self.scale_loss_by_variance:
+            with torch.no_grad():
+                if mask is not None:
+                    mask_f = mask.to(dtype=true_traj.dtype)
+                    valid_counts_per_channel = torch.clamp(mask_f.sum(dim=1), min=1.0) # [B, C]
+                    masked_traj = true_traj * mask_f
+                    mean_per_channel = masked_traj.sum(dim=1) / valid_counts_per_channel # [B, C]
+                    variance_per_channel = (masked_traj**2).sum(dim=1) / valid_counts_per_channel - mean_per_channel**2 # [B, C]
+                else: # No mask
+                    variance_per_channel = torch.var(true_traj, dim=1, unbiased=False) # [B, C]
+
+                total_variance_per_sample = variance_per_channel.sum(dim=1) # [B]
+                variance_scale_factor = torch.log1p(total_variance_per_sample)
+                
+                # Normalize across batch to prevent changing the overall loss magnitude
+                if variance_scale_factor.mean() > 1e-6:
+                    variance_scale_factor = variance_scale_factor / variance_scale_factor.mean()
+                else:
+                    variance_scale_factor = torch.ones_like(variance_scale_factor)
+            
+            # Log the mean scale factor during training
+            if self.training:
+                self.log("train/variance_scale_factor_mean", variance_scale_factor.mean().item(), on_step=True, on_epoch=False, prog_bar=False, logger=True)
+            
+            # Apply scaling to get the final reconstruction loss for the backward pass
+            recon_loss = (per_sample_loss * variance_scale_factor).mean()
+        else:
+            # Default behavior: simple mean of per-sample losses
+            recon_loss = per_sample_loss.mean()
+
+        if self.log_lik_scale_mode == 'annealing':
+            self.scale_scheduler.step()
 
         current_kl_weight = self.kl_scheduler.val
         self.kl_scheduler.step()
 
-        loss = -logpy.mean() + self.KL_weighting_SDE * current_kl_weight * logqp.mean()
+        loss = recon_loss + self.KL_weighting_SDE * current_kl_weight * logqp.mean()
 
-        return loss, -logpy.mean(), logqp.mean()
+        return loss, recon_loss, logqp.mean(), per_sample_loss.detach()
 
     def on_after_backward(self) -> None:
         # Fail-fast on non-finite gradients (always on)
@@ -2266,6 +2521,9 @@ class Hybrid_SDE(LightningModule):
                 rd_src,
                 rd_times,
                 rd_length,
+                ce_rd_src,
+                ce_rd_times,
+                ce_rd_length,
                 static_features,
                 init_states,
                 ic_mask,
@@ -2278,6 +2536,7 @@ class Hybrid_SDE(LightningModule):
                 med_tensors,
                 hadm_ids,
                 traj_ids,
+                med_combo_ids
             ) = batch
         else:
             raise NotImplementedError(
@@ -2289,37 +2548,38 @@ class Hybrid_SDE(LightningModule):
 
         if self.use_encoder != "none":
             if self.use_encoder == "raindrop":
+                # Process 24h chartevents context
+                ce_src = ce_rd_src.permute(1, 0, 2)
+                ce_times = ce_rd_times.permute(1, 0)
+                ce_lengths = ce_rd_length
+                
+                # Process 60min physio context
                 src = rd_src.permute(1, 0, 2)
                 times = rd_times.permute(1, 0)
                 lengths = rd_length
 
-                def encoder_forward(src, times, lengths):
-                    return self.temporal_encoder(src=src, static=None, times=times, lengths=lengths)
-
-                if self.training:
-                    temporal_embedding, _, _ = checkpoint.checkpoint(encoder_forward, src, times, lengths)
+                if self.training and self.use_checkpointing:
+                    chartevents_embedding, _, _ = checkpoint.checkpoint(self.context_encoder_24h, ce_src, None, ce_times, ce_lengths, use_reentrant=False)
+                    context_embedding, _, _ = checkpoint.checkpoint(self.context_encoder_60m, src, None, times, lengths, use_reentrant=False)
+                    static_embedding = checkpoint.checkpoint(self.static_encoder, static_features, use_reentrant=False)
                 else:
-                    temporal_embedding, _, _ = self.temporal_encoder(src=src, static=None, times=times, lengths=lengths)
-
-                # Continue with static encoder and fusion (might need checkpointing too)
-                def static_encoder_forward(static_feats):
-                    return self.static_encoder(static_feats)
-
-                if self.training:
-                    static_embedding = checkpoint.checkpoint(static_encoder_forward, static_features)
-                else:
+                    chartevents_embedding, _, _ = self.context_encoder_24h(src=ce_src, static=None, times=ce_times, lengths=ce_lengths)
+                    context_embedding, _, _ = self.context_encoder_60m(src=src, static=None, times=times, lengths=lengths)
                     static_embedding = self.static_encoder(static_features)
 
-                fused_embedding = torch.cat([temporal_embedding, static_embedding], dim=-1)
+                # Ensure concat matches the expected fusion input dim
+                fused_embedding = torch.cat([chartevents_embedding, context_embedding, static_embedding], dim=-1)
+                if fused_embedding.shape[-1] != self.fused_expected_dim:
+                    # Fall back to computing expected size from actual tensors to avoid shape mismatch
+                    self.fused_expected_dim = fused_embedding.shape[-1]
+                    if self.debug:
+                        print(f"[DEBUG] Adjusted fused_expected_dim to {self.fused_expected_dim}")
 
-                # Checkpoint the fusion MLP too if needed
-                def fusion_forward(fused_emb):
-                    return self.fusion_mlp(fused_emb)
-
-                if self.training:
-                    fused_rep = checkpoint.checkpoint(fusion_forward, fused_embedding)
+                if self.training and self.use_checkpointing:
+                    neural_embedding = checkpoint.checkpoint(self.fusion_mlp, fused_embedding, use_reentrant=False)
                 else:
-                    fused_rep = self.fusion_mlp(fused_embedding)
+                    neural_embedding = self.fusion_mlp(fused_embedding)
+                
                 logqp0 = 0
             else:
                 raise NotImplementedError(
@@ -2328,93 +2588,64 @@ class Hybrid_SDE(LightningModule):
 
             if self.debug:
                 print(f"Static features shape: {static_features.shape}")
+                print(f"Fused embedding shape for SDE: {neural_embedding.shape}")
+            
+            # === ARCHITECTURE CHANGE: START ===
+            # The new architecture uses the fused embedding to directly generate a `neural_embedding` 
+            # that conditions the SDE, instead of predicting the initial ODE latents.
+            
+            # --- Legacy Path (Commented Out) ---
+            # fused_rep = self.fusion_mlp(fused_embedding)
+            # predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            # neural_embedding_from_head = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
+            # predicted_ode_latents = self.transform_sigmoid_to_physiological_ranges(predicted_ode_latents_sigmoid)
+            # z1_for_sde = self._prepare_sde_initial_state(predicted_ode_latents, neural_embedding_from_head, init_states, ic_mask)
+            # ic_consistency_loss = self.compute_ic_consistency_loss(
+            #     predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
+            #     init_states=init_states,
+            #     ic_mask=ic_mask,
+            # )
+            # --- End Legacy Path ---
 
-            # In common_step, after computing fused_rep:
-            def ode_head_forward(fused_input):
-                return self.ode_latent_head(fused_input)
-
-            def neural_head_forward(fused_input):
-                return self.neural_embedding_head(fused_input)
-
-            if self.training:
-                predicted_ode_latents_sigmoid = checkpoint.checkpoint(ode_head_forward, fused_rep).unsqueeze(1).repeat(
-                    1, self.num_samples, 1)
-                neural_embedding = checkpoint.checkpoint(neural_head_forward, fused_rep).unsqueeze(1).repeat(1,
-                                                                                                             self.num_samples,
-                                                                                                             1)
-            else:
-                predicted_ode_latents_sigmoid = self.ode_latent_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples,
-                                                                                                    1)
-                neural_embedding = self.neural_embedding_head(fused_rep).unsqueeze(1).repeat(1, self.num_samples, 1)
-
-            predicted_ode_latents = self.transform_sigmoid_to_physiological_ranges(
-                predicted_ode_latents_sigmoid
-            )
-            if self.debug:
-                try:
-                    pred_mean_ic = predicted_ode_latents.mean(dim=1)  # [B,14]
-                    pred_min_ic, _ = predicted_ode_latents.min(dim=1)
-                    pred_max_ic, _ = predicted_ode_latents.max(dim=1)
-                    def _dims_str(t: torch.Tensor) -> str:
-                        vals = t.detach().mean(dim=0)
-                        return (
-                            f"pa={vals[0].item():.2f}, pv={vals[1].item():.2f}, s={vals[2].item():.3f}, sv={vals[3].item():.2f}, r_tpr_mod={vals[4].item():.3f}, ca={vals[9].item():.2f}, cv={vals[10].item():.2f}"
-                        )
-                    print("[DEBUG] Encoder IC@t0 (pred) batch-mean:", _dims_str(pred_mean_ic))
-                    print("[DEBUG] Encoder IC@t0 (pred) batch-min:", _dims_str(pred_min_ic))
-                    print("[DEBUG] Encoder IC@t0 (pred) batch-max:", _dims_str(pred_max_ic))
-                    # Compare to provided init_states on available dims
-                    num_ic_vars = init_states.shape[-1]
-                    pred_ic_used = pred_mean_ic[:, :num_ic_vars]
-                    gt_ic = init_states
-                    mask_ic = ic_mask
-                    valid = mask_ic > 0
-                    if valid.any():
-                        diff = (pred_ic_used - gt_ic).abs() * valid
-                        denom = torch.clamp(valid.sum(dim=0), min=1)
-                        mae_per_dim = diff.sum(dim=0) / denom
-                        print(
-                            f"[DEBUG] Encoder IC vs data (masked MAE per-dim up to {num_ic_vars}): {mae_per_dim.detach().cpu().tolist()}"
-                        )
-                        overall_mae = (diff.sum() / torch.clamp(valid.sum(), min=1)).item()
-                        print(
-                            f"[DEBUG] Encoder IC overall MAE on provided dims: {overall_mae:.3f}"
-                        )
-                    else:
-                        print("[DEBUG] No IC mask provided; IC similarity skipped.")
-                    print(
-                        "[DEBUG] Using encoder-predicted ICs at t0 (with observed dims overwritten by data via ic_mask) to initialise SDE latents feeding the decoder."
-                    )
-                except Exception as e:
-                    print(f"[WARN] IC debug stats failed: {e}")
-
-            z1_for_sde = self._prepare_sde_initial_state(
-                predicted_ode_latents, neural_embedding, init_states, ic_mask
-            )
-
-            ic_consistency_loss = self.compute_ic_consistency_loss(
-                predicted_ode_latents_sigmoid=predicted_ode_latents_sigmoid,
-                init_states=init_states,
-                ic_mask=ic_mask,
-            )
-        else:
+            # --- New Path ---
+            # The initial state for the SDE includes expert variables and the neural embedding.
             initial_condition = self._prepare_no_encoder_initial_state(
                 init_states, ic_mask
-            )
-            z1_for_sde = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)
+            )  # [B, expert_latent_dims]
+            neural_embedding_expanded = neural_embedding.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, D_neural]
+            expert_init_expanded = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, 14]
+            z1_for_sde = torch.cat([expert_init_expanded, neural_embedding_expanded], dim=-1)  # [B, S, 14 + D_neural]
+
+            # IC consistency loss is no longer applicable in this architecture.
+            ic_consistency_loss = torch.tensor(0.0, device=self.device)
+            # === ARCHITECTURE CHANGE: END ===
+            
+        else: # No encoder path
+            # When no encoder is used, include zeros neural embedding in the initial state for consistency.
+            neural_embedding = torch.zeros(batch_size, self.encoder_SDENN_dims, device=self.device)
+            initial_condition = self._prepare_no_encoder_initial_state(
+                init_states, ic_mask
+            )  # [B, expert_latent_dims]
+            neural_embedding_expanded = neural_embedding.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, D_neural]
+            expert_init_expanded = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, 14]
+            z1_for_sde = torch.cat([expert_init_expanded, neural_embedding_expanded], dim=-1)  # [B, S, 14 + D_neural]
             logqp0 = 0
-            ic_consistency_loss = 0
+            ic_consistency_loss = torch.tensor(0.0, device=self.device)
 
         valid_lengths = (Y_mask.sum(dim=2) > 0).sum(dim=1)
 
         # Attach precomputed med_context for fast per-step indexing
         self.current_med_tensors = med_tensors if med_tensors is not None else None
 
+        # Repeat neural_embedding for each sample
+        neural_embedding_expanded = neural_embedding.unsqueeze(1).repeat(1, self.num_samples, 1)
+
         latent_traj, logqp_path, i_ext_path = self.forward_latent(
             init_latents=z1_for_sde,
             ts=ts,
             Tx=torch.ones(batch_size, device=self.device),
             time_to_tx=torch.zeros(batch_size, device=self.device),
+            neural_embedding=neural_embedding_expanded,
             valid_lengths=valid_lengths,
             med_traj_values=med_trajectory_values,
             med_traj_mask=med_trajectory_mask,
@@ -2445,7 +2676,7 @@ class Hybrid_SDE(LightningModule):
             )
 
         total_logqp = logqp0 + logqp_path
-        loss, nll, kl_div = self.compute_factual_loss(
+        loss, recon_loss, kl_div, per_sample_loss = self.compute_factual_loss(
             predicted_traj=decoded_traj,
             true_traj=Y,
             logqp=total_logqp,
@@ -2477,17 +2708,20 @@ class Hybrid_SDE(LightningModule):
 
         return {
             "loss": loss,
-            "nll": nll,
+            "recon_loss": recon_loss,
             "kl_div": kl_div,
             "total_loss": total_loss,
             "ic_consistency_loss": ic_consistency_loss,
             "decoded_traj": decoded_traj,
+            "latent_traj": latent_traj,
             "Y": Y,
             "combined_mask": combined_mask,
             "i_ext_path": i_ext_path,
             "z1_for_sde": z1_for_sde,
             "hadm_ids": hadm_ids,
             "traj_ids": traj_ids,
+            "per_sample_loss": per_sample_loss,
+            "med_combo_ids": med_combo_ids,
         }
 
     def training_step(self, batch, batch_idx):
@@ -2504,8 +2738,28 @@ class Hybrid_SDE(LightningModule):
         total_loss = result["total_loss"]
         loss = result["loss"]
         ic_consistency_loss = result["ic_consistency_loss"]
-        nll = result["nll"]
+        recon_loss = result["recon_loss"]
         kl_div = result["kl_div"]
+
+        # NOTE: Per-medication group loss separation is performed only during validation.
+        # The following training-time accumulation and periodic logging are disabled to reduce overhead.
+        # per_sample_loss = result["per_sample_loss"]
+        # med_combo_ids = result["med_combo_ids"]
+        # for i in range(len(per_sample_loss)):
+        #     combo_id = med_combo_ids[i].item()
+        #     loss_val = per_sample_loss[i].item()
+        #     self.train_combo_loss_accumulator[combo_id]['loss'] += loss_val
+        #     self.train_combo_loss_accumulator[combo_id]['loss_sq'] += loss_val**2
+        #     self.train_combo_loss_accumulator[combo_id]['count'] += 1
+        # if self.global_step > 0 and self.log_train_combo_loss_every_n_steps > 0 and self.global_step % self.log_train_combo_loss_every_n_steps == 0:
+        #     self._log_train_combo_stats()
+
+        if self.log_lik_scale_mode == 'learnable':
+            scales = torch.exp(self.log_scale_param).detach()
+            for i, scale in enumerate(scales):
+                self.log(f'train_learned_scale_dim_{i}', scale, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        elif self.log_lik_scale_mode == 'annealing':
+            self.log('train_annealed_scale', self.scale_scheduler.val, on_step=True, on_epoch=False, prog_bar=False, logger=True)
 
         # If graph is degenerate (e.g., encoder='none' and force_no_controls=True), attach a zero-sum reg to create a grad path
         if not total_loss.requires_grad:
@@ -2537,7 +2791,24 @@ class Hybrid_SDE(LightningModule):
             control_energy = torch.tensor(0.0, device=total_loss.device)
 
         total_loss = total_loss + self.control_energy_weight * control_energy
-        print(f"Step {self.global_step}: control_energy={control_energy.item():.2e}, weight={self.control_energy_weight:.2e}, contribution={self.control_energy_weight * control_energy.item():.2e}, main_loss={loss.item():.2f}")
+        # Log and print current per-control weights (adaptive ramp * global weighting)
+        current_ctrl_weights = self.get_current_per_control_weights().detach().cpu()
+        # Log via Lightning so it reaches the configured logger (e.g., wandb)
+        for i in range(current_ctrl_weights.numel()):
+            try:
+                self.log(f"train_ctrl_weight_{i}", float(current_ctrl_weights[i].item()), on_step=True, on_epoch=False, prog_bar=False, logger=True)
+            except Exception:
+                pass
+        # Also log dynamic per-control sigmas and weights succinctly
+        current_sigmas = self.get_current_per_control_sigmas().detach().cpu()
+        for i in range(current_sigmas.numel()):
+            try:
+                self.log(f"train_ctrl_sigma_{i}", float(current_sigmas[i].item()), on_step=True, on_epoch=False, prog_bar=False, logger=True)
+            except Exception:
+                pass
+        print(
+            f"Step {self.global_step}: control_energy={control_energy.item():.2e}, weight={self.control_energy_weight:.2e}, contribution={self.control_energy_weight * control_energy.item():.2e}, main_loss={loss.item():.2f}, weights={current_ctrl_weights.tolist()}, sigmas={current_sigmas.tolist()}"
+        )
 
         # Optional training plots (controls only), gated by plot_every
         should_plot_now = False
@@ -2558,6 +2829,8 @@ class Hybrid_SDE(LightningModule):
                     batch_idx,
                     "",
                     result["z1_for_sde"],
+                    result.get("latent_traj"),
+                    result.get("med_combo_ids")
                 )
             except Exception as e:
                 if self.debug:
@@ -2599,11 +2872,33 @@ class Hybrid_SDE(LightningModule):
             logger=True,
         )
         self.log(
-            "train_NLL", nll, on_step=True, on_epoch=True, prog_bar=True, logger=True
+            f"train_{self.loss_type}", recon_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
         )
         self.log(
             "train_KL", kl_div, on_step=True, on_epoch=True, prog_bar=True, logger=True
         )
+
+        # Log optimizer learning rate (first param group) and SDEnet Frobenius norm of weights
+        try:
+            if hasattr(self, "trainer") and self.trainer is not None and self.trainer.optimizers:
+                opt = self.trainer.optimizers[0]
+                if opt and opt.param_groups:
+                    current_lr = float(opt.param_groups[0].get("lr", self.learning_rate))
+                    self.log("train_lr", current_lr, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        except Exception:
+            pass
+
+        try:
+            sum_sq: torch.Tensor = torch.tensor(0.0, device=total_loss.device)
+            for name, param in self.SDEnet.named_parameters():
+                if param is None:
+                    continue
+                if "weight" in name and param.data is not None:
+                    sum_sq = sum_sq + (param.data.float() ** 2).sum()
+            frob_norm = torch.sqrt(sum_sq).detach()
+            self.log("train_sdenet_frobenius", frob_norm, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        except Exception:
+            pass
 
         return total_loss
 
@@ -2644,8 +2939,8 @@ class Hybrid_SDE(LightningModule):
             logger=True,
         )
         self.log(
-            "val_NLL",
-            result["nll"],
+            f"val_{self.loss_type}",
+            result["recon_loss"],
             on_step=False,
             on_epoch=True,
             prog_bar=True,
@@ -2660,13 +2955,21 @@ class Hybrid_SDE(LightningModule):
             logger=True,
         )
 
+        # Store per-combo losses for epoch-end analysis
+        self.val_combo_losses.append({
+            "losses": result["per_sample_loss"],
+            "med_combo_ids": result["med_combo_ids"]
+        })
+
         return {
             "val_loss": result["loss"],
-            "val_nll": result["nll"],
+            "val_recon_loss": result["recon_loss"],
             "val_kl": result["kl_div"],
             "decoded_traj": result["decoded_traj"],
             "true_traj": result["Y"],
             "mask": result["combined_mask"],
+            "per_sample_loss": result["per_sample_loss"],
+            "med_combo_ids": result["med_combo_ids"]
         }
 
     def test_step(self, batch, batch_idx, dataloader_idx = 0):
@@ -2677,7 +2980,7 @@ class Hybrid_SDE(LightningModule):
 
         total_loss = result["total_loss"]
         loss = result["loss"]
-        nll = result["nll"]
+        recon_loss = result["recon_loss"]
         kl_div = result["kl_div"]
         suffix = "_all" if dataloader_idx == 0 else "_filtered"
 
@@ -2686,7 +2989,7 @@ class Hybrid_SDE(LightningModule):
         self.log(f"test_main_loss{suffix}", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log(f"test_ic_consistency_loss{suffix}", result["ic_consistency_loss"], on_step=False, on_epoch=True,
                  prog_bar=True, logger=True)
-        self.log(f"test_NLL{suffix}", nll, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_{self.loss_type}{suffix}", result["recon_loss"], on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log(f"test_KL{suffix}", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
 
@@ -2761,7 +3064,7 @@ class Hybrid_SDE(LightningModule):
                          logger=True)
         if batch_idx < 3:
             self.plot_nature_style_with_uncertainty(
-                decoded_traj, Y, combined_mask, batch_idx, suffix
+                decoded_traj, Y, combined_mask, batch_idx, suffix, result["med_combo_ids"]
             )
             self.plot_nature_with_controls(
                 decoded_traj,
@@ -2770,12 +3073,19 @@ class Hybrid_SDE(LightningModule):
                 result["i_ext_path"],
                 batch_idx,
                 suffix,
-                result["z1_for_sde"]
+                result["z1_for_sde"],
+                result["med_combo_ids"]
             )
+        
+        # Store per-combo losses for epoch-end analysis
+        self.test_combo_losses.append({
+            "losses": result["per_sample_loss"],
+            "med_combo_ids": result["med_combo_ids"]
+        })
 
         return_dict = {
             "test_loss": loss,
-            "test_nll": nll,
+            "test_recon_loss": recon_loss,
             "test_kl": kl_div,
             "test_mse": valid_mse,
             "test_mae": valid_mae,
@@ -2790,13 +3100,33 @@ class Hybrid_SDE(LightningModule):
         return return_dict
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-4)
+        optimizer = torch.optim.Adam(
+            self.parameters(), lr=self.learning_rate, weight_decay=1e-4
+        )
+
+        if not self.use_lr_scheduler:
+            return optimizer
+
+        def lr_lambda(current_step: int):
+            # Linear warmup
+            if current_step < self.warmup_steps:
+                return float(current_step) / float(max(1, self.warmup_steps))
+            # Cosine decay
+            progress = float(current_step - self.warmup_steps) / float(
+                max(1, self.total_training_steps - self.warmup_steps)
+            )
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            # Final learning rate is min_lr
+            scaled_decay = (1.0 - self.min_lr / self.learning_rate) * cosine_decay + (
+                self.min_lr / self.learning_rate
+            )
+            return scaled_decay
 
         scheduler = {
-            "monitor": "train_total_loss",
-            "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer=optimizer, mode="min", factor=0.5, patience=50
-            ),
+            "scheduler": torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda),
+            "interval": "step",
+            "frequency": 1,
+            "name": "learning_rate",
         }
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
@@ -2913,7 +3243,7 @@ class Hybrid_SDE(LightningModule):
         return colors
 
     def plot_nature_style_with_uncertainty(
-        self, predictions_full, targets, combined_mask, batch_idx, suffix
+        self, predictions_full, targets, combined_mask, batch_idx, suffix, med_combo_ids
     ):
         """Nature-style plots with uncertainty bands around predictions"""
         import os
@@ -2928,11 +3258,24 @@ class Hybrid_SDE(LightningModule):
         colors = self._setup_plot_style()
         os.makedirs(os.path.join(self.train_dir, "nature_plots"), exist_ok=True)
 
+        # Optionally skip burn-in period for plotting
+        dt = 10  # Time step in seconds between trajectory points
+        burn_in_steps = int(self.sde_burn_in_period / dt)
+        
+        if (not self.plot_include_burn_in) and targets.shape[1] > burn_in_steps:
+            predictions_full = predictions_full[:, :, burn_in_steps:, :]
+            targets = targets[:, burn_in_steps:, :]
+            combined_mask = combined_mask[:, burn_in_steps:, :]
+
         pred_mean = predictions_full.mean(1).detach()
         pred_std = predictions_full.std(1, unbiased=False).detach()
         targets = targets.detach() if targets.requires_grad else targets
 
-        for patient_idx in range(min(8, predictions_full.shape[0])):
+        # Only allow rank 0 to write plots (avoid DDP duplicates)
+        if getattr(self, 'trainer', None) is not None and not self.trainer.is_global_zero:
+            return
+
+        for patient_idx in range(min(self.max_plotted_patients, predictions_full.shape[0])):
             patient_mask = combined_mask[patient_idx]
             time_seconds = (torch.arange(patient_mask.shape[0]).cpu().numpy()) * 10
             pred_mean_patient = pred_mean[patient_idx].detach().cpu().numpy()
@@ -2959,6 +3302,12 @@ class Hybrid_SDE(LightningModule):
 
             fig, ax = plt.subplots(figsize=(7, 5))
             ax.set_xlim(0, 1200)
+            # Mark t0 after burn-in on main axis
+            if self.plot_include_burn_in and burn_in_steps > 0:
+                try:
+                    ax.axvline(x=burn_in_steps * dt, color="#444", linestyle=":", linewidth=1.0, alpha=0.8)
+                except Exception:
+                    pass
 
             # Use consistent colors and styling
             ax.plot(
@@ -3020,23 +3369,29 @@ class Hybrid_SDE(LightningModule):
             ax.set_xlabel("Time (seconds)", fontweight="bold")
             ax.set_ylabel("Pressure (mmHg)", fontweight="bold")
             epoch_tag = f"epoch{int(getattr(self, 'current_epoch', 0)):03d}_step{int(getattr(self, 'global_step', 0)):06d}"
+            
+            med_info_str = "Unknown Meds"
+            try:
+                combo_id = int(med_combo_ids[patient_idx].item())
+                med_info_str = self.id_to_combo_map.get(combo_id, {}).get("str", f"ID {combo_id}")
+            except (IndexError, AttributeError, ValueError):
+                pass
+            
             ax.set_title(
-                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})",
+                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})\n{med_info_str}",
                 fontweight="bold",
+                fontsize=10
             )
             ax.legend(
                 loc="upper right", fancybox=False, facecolor="white", framealpha=1.0
             )
             ax.grid(True, alpha=0.2)
 
-            if self.log_wandb:
-                wandb.log(
-                    {
-                        f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}{suffix}": wandb.Image(
-                            plt
-                        )
-                    }
-                )
+            if self.log_wandb and getattr(self, 'trainer', None) is not None and self.trainer.is_global_zero and getattr(self, 'logger', None) is not None and hasattr(self.logger, 'experiment'):
+                try:
+                    self.logger.experiment.log({f"uncertainty_plot_batch_{batch_idx}_patient_{patient_idx}{suffix}": wandb.Image(plt)})
+                except Exception:
+                    pass
             else:
                 try:
                     last_hadm = int(getattr(self, "_last_hadm_ids", [None])[patient_idx])
@@ -3061,11 +3416,24 @@ class Hybrid_SDE(LightningModule):
         batch_idx,
         suffix = "",
         z1_for_sde=None,
+        latent_traj=None,
+        med_combo_ids=None
     ):
         """Plot BP + controls with detailed control analysis (Zenker baseline removed)."""
 
         colors = self._setup_plot_style()  # Use same style
         os.makedirs(os.path.join(self.train_dir, "control_plots"), exist_ok=True)
+
+        # Optionally skip burn-in period for plotting
+        dt = 10  # Time step in seconds between trajectory points
+        burn_in_steps = int(self.sde_burn_in_period / dt)
+        
+        if (not self.plot_include_burn_in) and targets.shape[1] > burn_in_steps:
+            predictions_full = predictions_full[:, :, burn_in_steps:, :]
+            targets = targets[:, burn_in_steps:, :]
+            combined_mask = combined_mask[:, burn_in_steps:, :]
+            if i_ext_path is not None:
+                i_ext_path = i_ext_path[:, :, burn_in_steps:, :]
 
         try:
             import matplotlib.pyplot as plt
@@ -3088,7 +3456,16 @@ class Hybrid_SDE(LightningModule):
         else:
             control_drift[:] = 0.0
 
-        for patient_idx in range(min(8, predictions_full.shape[0])):
+        # Determine how many latent panels we'll actually draw (avoid blank subplots)
+        selected_latent_indices = [0, 1, 2, 3, 9, 10, 4]  # p_a, p_v, s, sv, ca, cv, r_tpr_mod
+        selected_latent_names = ["p_a", "p_v", "s", "sv", "ca", "cv", "r_tpr_mod"]
+        num_latent_panels = len(selected_latent_indices) if latent_traj is not None else 0
+
+        # Only allow rank 0 to write plots (avoid DDP duplicates)
+        if getattr(self, 'trainer', None) is not None and not self.trainer.is_global_zero:
+            return
+
+        for patient_idx in range(min(self.max_plotted_patients, predictions_full.shape[0])):
             patient_mask = combined_mask[patient_idx]
             time_seconds = np.arange(patient_mask.shape[0]) * 10
 
@@ -3144,11 +3521,11 @@ class Hybrid_SDE(LightningModule):
             if sde_derivatives.shape[0] > 1:
                 sde_derivatives[0] = sde_derivatives[1]
 
-            # Create 1 + 2*num_controls subplots stacked vertically: state then derivative per control
+            # Create top BP panel + selected expert latents + 2*num_controls derivative/state panels
             num_controls = (
                 control_mean_patient.shape[1] if control_mean_patient.ndim == 2 else 1
             )
-            nrows = 1 + 2 * num_controls
+            nrows = 1 + num_latent_panels + 2 * num_controls
             fig, axes = plt.subplots(
                 nrows, 1, figsize=(8, 2.0 * nrows + 3), sharex=True
             )
@@ -3195,7 +3572,8 @@ class Hybrid_SDE(LightningModule):
                     predictions_full[patient_idx].detach().cpu().numpy()
                 )  # [S,T,C]
                 max_overlays = min(samples_np.shape[0], 6)
-                print(f"[DEBUG] Drawing {max_overlays} arterial sample overlays for patient {patient_idx}")
+                if self.debug_level >= 2:
+                    print(f"[DEBUG] Drawing {max_overlays} arterial sample overlays for patient {patient_idx}")
                 for s_idx in range(max_overlays):
                     sample_line = samples_np[s_idx, :, 0].copy()
                     sample_line[~arterial_mask] = np.nan
@@ -3247,7 +3625,8 @@ class Hybrid_SDE(LightningModule):
                     predictions_full[patient_idx].detach().cpu().numpy()
                 )  # [S,T,C]
                 max_overlays = min(samples_np.shape[0], 6)
-                print(f"[DEBUG] Drawing {max_overlays} venous sample overlays for patient {patient_idx}")
+                if self.debug_level >= 2:
+                    print(f"[DEBUG] Drawing {max_overlays} venous sample overlays for patient {patient_idx}")
                 for s_idx in range(max_overlays):
                     sample_line = samples_np[s_idx, :, 1].copy()
                     sample_line[~venous_mask] = np.nan
@@ -3263,6 +3642,12 @@ class Hybrid_SDE(LightningModule):
 
             ax1.set_xlim(0, 1200)
             ax1.set_ylabel("Pressure (mmHg)", fontweight="bold")
+            # Draw t0 marker (after burn-in) across all subplots when including burn-in
+            if self.plot_include_burn_in and burn_in_steps > 0:
+                try:
+                    ax1.axvline(x=burn_in_steps * dt, color="#444", linestyle=":", linewidth=1.0, alpha=0.8)
+                except Exception:
+                    pass
             ax1.legend(
                 loc="upper right",
                 fancybox=False,
@@ -3272,10 +3657,38 @@ class Hybrid_SDE(LightningModule):
             )
             ax1.grid(True, alpha=0.2)
 
+            # === Expert latent variable panels (selected Zenker state variables) ===
+            if latent_traj is not None and num_latent_panels > 0:
+                try:
+                    latent_mean = latent_traj.mean(1).detach().cpu().numpy()  # [B,T,14]
+                    latent_patient = latent_mean[patient_idx]
+                    for panel_idx, latent_idx in enumerate(selected_latent_indices):
+                        axi = axes[1 + panel_idx]
+                        series = latent_patient[:, latent_idx].copy()
+                        # Use bp availability to blank gaps if desired
+                        series[~bp_available_mask] = np.nan
+                        axi.plot(time_seconds, series, color="#555", linewidth=1.2)
+                        if self.plot_include_burn_in and burn_in_steps > 0:
+                            try:
+                                axi.axvline(x=burn_in_steps * dt, color="#444", linestyle=":", linewidth=1.0, alpha=0.8)
+                            except Exception:
+                                pass
+                        axi.set_ylabel(selected_latent_names[panel_idx])
+                        axi.grid(True, alpha=0.2)
+                except Exception:
+                    pass
+
             # === Controls: one subplot per control dimension ===
             control_cmap = plt.cm.get_cmap("tab10", num_controls)
+            control_short = ["dpv", "sv", "ca", "r_tpr_mod"]
+            control_pretty = [
+                "Venous pressure",
+                "Stroke volume",
+                "Arterial compliance",
+                "TPR modifier",
+            ]
             for control_idx in range(num_controls):
-                axc = axes[1 + 2 * control_idx]
+                axc = axes[1 + num_latent_panels + 2 * control_idx]
                 # Integrated control state and its finite-difference derivative
                 deriv_values = (
                     control_drift[patient_idx, :, control_idx]
@@ -3292,14 +3705,24 @@ class Hybrid_SDE(LightningModule):
 
                 color = control_cmap(control_idx)
 
+                target_suffix = (
+                    f" ({control_short[control_idx]})"
+                    if control_idx < len(control_short)
+                    else ""
+                )
                 axc.plot(
                     time_seconds,
                     control_values,
                     color=color,
                     linewidth=2.0,
                     linestyle="--",
-                    label=f"Control {control_idx + 1}",
+                    label=f"Control {control_idx + 1}{target_suffix}",
                 )
+                if self.plot_include_burn_in and burn_in_steps > 0:
+                    try:
+                        axc.axvline(x=burn_in_steps * dt, color="#444", linestyle=":", linewidth=1.0, alpha=0.8)
+                    except Exception:
+                        pass
                 axc.fill_between(
                     time_seconds,
                     control_values - control_std_values,
@@ -3316,7 +3739,8 @@ class Hybrid_SDE(LightningModule):
                         .numpy()
                     )  # [S, T]
                     max_control_overlays = min(sample_controls.shape[0], 6)
-                    print(f"[DEBUG] Drawing {max_control_overlays} control {control_idx} sample overlays for patient {patient_idx}")
+                    if self.debug_level >= 2:
+                        print(f"[DEBUG] Drawing {max_control_overlays} control {control_idx} sample overlays for patient {patient_idx}")
                     for s_idx in range(max_control_overlays):
                         axc.plot(
                             time_seconds,
@@ -3338,7 +3762,7 @@ class Hybrid_SDE(LightningModule):
                 axc.grid(True, alpha=0.2)
                 axc.axhline(y=0, color="black", linestyle=":", alpha=0.4)
                 # Separate derivative subplot directly under the control state
-                axd = axes[1 + 2 * control_idx + 1]
+                axd = axes[1 + num_latent_panels + 2 * control_idx + 1]
                 # Compute per-sample finite-difference derivatives for uncertainty and overlays
                 samples_for_ctrl = (
                     i_ext_path[patient_idx, :, :, control_idx].detach().cpu().numpy()
@@ -3363,8 +3787,13 @@ class Hybrid_SDE(LightningModule):
                     linewidth=1.2,
                     linestyle="-",
                     alpha=0.9,
-                    label=f"d(Control {control_idx + 1})/dt (mean)",
+                    label=f"d(Control {control_idx + 1}{target_suffix})/dt (mean)",
                 )
+                if self.plot_include_burn_in and burn_in_steps > 0:
+                    try:
+                        axd.axvline(x=burn_in_steps * dt, color="#444", linestyle=":", linewidth=1.0, alpha=0.8)
+                    except Exception:
+                        pass
                 # Std band
                 axd.fill_between(
                     time_seconds,
@@ -3375,7 +3804,8 @@ class Hybrid_SDE(LightningModule):
                 )
                 # Overlay a few sample derivative traces for visibility
                 max_overlays = min(sample_derivs.shape[0], 6)
-                print(f"[DEBUG] Drawing {max_overlays} derivative sample overlays for control {control_idx}, patient {patient_idx}")
+                if self.debug_level >= 2:
+                    print(f"[DEBUG] Drawing {max_overlays} derivative sample overlays for control {control_idx}, patient {patient_idx}")
                 for s_idx in range(max_overlays):
                     axd.plot(
                         time_seconds,
@@ -3385,7 +3815,10 @@ class Hybrid_SDE(LightningModule):
                         linestyle="-",
                         alpha=0.4,
                     )
-                axd.set_ylabel(f"dCtrl {control_idx + 1}/dt")
+                axd.set_ylabel(
+                    f"dCtrl {control_idx + 1}/dt"
+                    + (f" ({control_short[control_idx]})" if control_idx < len(control_short) else "")
+                )
                 axd.grid(True, alpha=0.2)
                 axd.axhline(y=0, color="black", linestyle=":", alpha=0.4)
 
@@ -3404,20 +3837,33 @@ class Hybrid_SDE(LightningModule):
                 )
 
             epoch_tag = f"epoch{int(getattr(self, 'current_epoch', 0)):03d}_step{int(getattr(self, 'global_step', 0)):06d}"
+            
+            med_info_str = "Unknown Meds"
+            if med_combo_ids is not None:
+                try:
+                    combo_id = int(med_combo_ids[patient_idx].item())
+                    med_info_str = self.id_to_combo_map.get(combo_id, {}).get("str", f"ID {combo_id}")
+                except (IndexError, AttributeError, ValueError):
+                    pass
+
+            mapping_line = "Controls: " + ", ".join(
+                [
+                    (f"C{idx+1}→{control_short[idx]}" if idx < len(control_short) else f"C{idx+1}")
+                    for idx in range(num_controls)
+                ]
+            )
             plt.suptitle(
-                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})",
+                f"{epoch_tag} – Patient {patient_idx} (Batch {batch_idx})\n{med_info_str}\n{mapping_line}",
                 fontweight="bold",
+                fontsize=10
             )
             plt.tight_layout()
 
-            if self.log_wandb:
-                wandb.log(
-                    {
-                        f"enhanced_control_plot_batch_{batch_idx}_patient_{patient_idx}{suffix}": wandb.Image(
-                            plt
-                        )
-                    }
-                )
+            if self.log_wandb and getattr(self, 'trainer', None) is not None and self.trainer.is_global_zero and getattr(self, 'logger', None) is not None and hasattr(self.logger, 'experiment'):
+                try:
+                    self.logger.experiment.log({f"enhanced_control_plot_batch_{batch_idx}_patient_{patient_idx}{suffix}": wandb.Image(plt)})
+                except Exception:
+                    pass
             else:
                 try:
                     last_hadm = int(getattr(self, "_last_hadm_ids", [None])[patient_idx])
@@ -3519,3 +3965,138 @@ class Hybrid_SDE(LightningModule):
         except Exception as e:
             if self.debug:
                 print(f"[WARN] Failed to save control CSVs: {e}")
+
+    def on_validation_epoch_end(self):
+        """Log per-medication combo loss statistics at the end of the validation epoch."""
+        self._log_per_combo_stats("val", self.val_combo_losses)
+        self.val_combo_losses.clear()  # Reset for next epoch
+
+    def _log_per_combo_stats(self, prefix, combo_losses_list):
+        """Helper function to compute and log statistics for per-medication combo losses."""
+        if not combo_losses_list:
+            return
+
+        all_losses = torch.cat([d["losses"] for d in combo_losses_list])
+        all_combo_ids = torch.cat([d["med_combo_ids"] for d in combo_losses_list])
+
+        unique_combo_ids = torch.unique(all_combo_ids)
+        
+        stats_data = []
+        for combo_id_tensor in unique_combo_ids:
+            combo_id = combo_id_tensor.item()
+            mask = all_combo_ids == combo_id
+            losses = all_losses[mask]
+            
+            combo_name = self.id_to_combo_map.get(combo_id, {}).get("str", f"Unknown ID {combo_id}")
+            
+            mean_loss = losses.mean().item()
+            std_loss = losses.std(unbiased=False).item() if len(losses) > 1 else 0.0
+            stats_data.append([
+                combo_name,
+                mean_loss,
+                std_loss,
+                len(losses)
+            ])
+            
+        # Sort by mean loss (descending)
+        stats_data.sort(key=lambda x: x[1], reverse=True)
+        
+        # Log to console
+        print(f"\n--- Per-Medication Combo Loss ({prefix}) ---")
+        print(f"{'Medication Combo':<50} | {'Mean Loss':<12} | {'Std Dev':<10} | {'Count':<5}")
+        print("-" * 80)
+        for row in stats_data:
+            print(f"{row[0]:<50} | {row[1]:<12.4f} | {row[2]:<10.4f} | {row[3]:<5}")
+        print("-" * 80)
+        
+        # Log to wandb
+        if self.log_wandb and getattr(self, 'trainer', None) is not None and self.trainer.is_global_zero and getattr(self, 'logger', None) is not None and hasattr(self.logger, 'experiment'):
+            try:
+                columns = ["Medication Combo", "Mean Loss", "Std Dev", "Count"]
+                table = wandb.Table(columns=columns, data=stats_data)
+                self.logger.experiment.log({f"{prefix}_per_combo_loss": table})
+            except Exception:
+                pass
+
+    def on_train_epoch_start(self):
+        """Reset the training loss accumulator at the start of each epoch."""
+        self.train_combo_loss_accumulator.clear()
+
+    def _log_train_combo_stats(self):
+        """Computes and logs statistics from the training loss accumulator."""
+        if not self.train_combo_loss_accumulator:
+            return
+            
+        stats_data = []
+        for combo_id, data in self.train_combo_loss_accumulator.items():
+            if data['count'] > 0:
+                mean_loss = data['loss'] / data['count']
+                mean_loss_sq = data['loss_sq'] / data['count']
+                std_dev = math.sqrt(max(0, mean_loss_sq - mean_loss**2))
+                combo_name = self.id_to_combo_map.get(combo_id, {}).get("str", f"Unknown ID {combo_id}")
+                stats_data.append([
+                    combo_name,
+                    mean_loss,
+                    std_dev,
+                    data['count']
+                ])
+        
+        stats_data.sort(key=lambda x: x[1], reverse=True)
+        
+        # Log to console
+        print(f"\n--- [Step {self.global_step}] Per-Medication Combo Training Loss ---")
+        print(f"{'Medication Combo':<50} | {'Mean Loss':<12} | {'Std Dev':<10} | {'Count':<5}")
+        print("-" * 80)
+        for row in stats_data:
+            print(f"{row[0]:<50} | {row[1]:<12.4f} | {row[2]:<10.4f} | {row[3]:<5}")
+        print("-" * 80)
+        
+        # Log to wandb
+        if self.log_wandb:
+            columns = ["Medication Combo", "Mean Loss", "Std Dev", "Count"]
+            table = wandb.Table(columns=columns, data=stats_data)
+            wandb.log({f"train_per_combo_loss": table})
+
+    def _log_epoch_end_combo_stats(self, prefix, combo_losses_list):
+        """Helper function to compute and log statistics for per-medication combo losses at epoch end."""
+        if not combo_losses_list:
+            return
+
+        all_losses = torch.cat([d["losses"] for d in combo_losses_list])
+        all_combo_ids = torch.cat([d["med_combo_ids"] for d in combo_losses_list])
+
+        unique_combo_ids = torch.unique(all_combo_ids)
+        
+        stats_data = []
+        for combo_id_tensor in unique_combo_ids:
+            combo_id = combo_id_tensor.item()
+            mask = all_combo_ids == combo_id
+            losses = all_losses[mask]
+            
+            combo_name = self.id_to_combo_map.get(combo_id, {}).get("str", f"Unknown ID {combo_id}")
+            
+            mean_loss = losses.mean().item()
+            std_loss = losses.std(unbiased=False).item() if len(losses) > 1 else 0.0
+            stats_data.append([
+                combo_name,
+                mean_loss,
+                std_loss,
+                len(losses)
+            ])
+            
+        # Sort by mean loss (descending)
+        stats_data.sort(key=lambda x: x[1], reverse=True)
+        
+        # Log to console
+        print(f"\n--- Per-Medication Combo Loss ({prefix}) ---")
+        print(f"{'Medication Combo':<50} | {'Mean Loss':<12} | {'Std Dev':<10} | {'Count':<5}")
+        print("-" * 80)
+        for row in stats_data:
+            print(f"{row[0]:<50} | {row[1]:<12.4f} | {row[2]:<10.4f} | {row[3]:<5}")
+        print("-" * 80)
+        
+        # Log to wandb
+        if self.log_wandb:
+            columns = ["Medication Combo", "Mean Loss", "Std Dev", "Count"]
+            table = wandb.Table(columns=columns, data=stats_data)
+            wandb.log({f"{prefix}_per_combo_loss": table})

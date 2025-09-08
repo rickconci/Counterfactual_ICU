@@ -1,0 +1,28 @@
+# Training duration
+max_epochs: 10 # Maximum number of epochs to train.
+min_epochs: 1 # Minimum number of epochs to train.
+max_steps: -1 # Max steps to train for. Set to a positive integer to override max_epochs.
+
+# Hardware
+accelerator: "gpu" # Which accelerator to use ("gpu", "mps", "cpu", "auto").
+devices: 4 # Number of devices to use.
+strategy: "ddp_find_unused_parameters_true" # Distributed training strategy. auto
+accumulate_grad_batches: 2 # Number of gradient accumulation steps.
+
+# Optimization
+gradient_clip_val: 1.0 # The value to clip gradients at.
+gradient_clip_algorithm: "norm" # The gradient clipping algorithm to use.
+
+# Logging and Checkpointing
+log_every_n_steps: 10 # Lightning logging frequency in steps.
+check_val_every_n_epoch: 1 # Run validation every N epochs.
+disable_model_checkpoint: false # Set to true to disable saving model checkpoints.
+disable_early_stopping: false # Set to true to disable early stopping.
+early_stopping_patience: 5 # Number of epochs with no improvement before stopping.
+
+# Reproducibility & Debugging
+deterministic: false # Ensures reproducibility.
+precision: bf16-mixed # Lightning precision ("32-true", "16-mixed", "bf16-mixed").
+limit_train_batches: 1.0 # Can set to small float (e.g., 0.05) for quick trials
+overfit_batches: 0.0 # 0.0=disabled, 1.0=single batch. For debugging quick overfit
+disable_sanity_check: false # Disable sanity validation to start training immediately.

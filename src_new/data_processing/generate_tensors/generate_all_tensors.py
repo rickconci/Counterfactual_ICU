@@ -11,6 +11,7 @@ from create_ic_targets import create_physiological_tensors
 
 # Local imports (modules live in the same directory)
 from create_med_tensors import create_med_tensors_from_parquet
+from generate_chartevents_tensors import create_chartevents_tensors
 from consolidate_trajectory_metadata import consolidate_trajectory_metadata
 
 
@@ -36,6 +37,7 @@ def _configure_logging(verbosity: int) -> None:
 def generate_all_tensors(
     waveforms_parquet_path: str,
     med_parquet_path: str,
+    chartevents_parquet_path: str,
     output_dir: str,
     interval_seconds: int = 10,
     trajectory_duration_minutes: int = 20,
@@ -45,6 +47,7 @@ def generate_all_tensors(
     force_reload: bool = False,
     physio_workers: int = 6,
     context_workers: int = 6,
+    chartevents_workers: int = 6,
     create_consolidated_metadata: bool = True,
 ) -> Dict[str, Any]:
     """Generate medication tensors, physiological IC/target tensors, and context tensors.
@@ -57,6 +60,7 @@ def generate_all_tensors(
         waveforms_parquet_path: Path to the smoothed numerics parquet with physio columns
             (e.g., ABP MEAN, CVP).
         med_parquet_path: Path to the input_mv parquet (e.g., mv_filtered_10min.parquet).
+        chartevents_parquet_path: Path to the normalized chartevents data (parquet).
         output_dir: Base directory to write all outputs under.
         interval_seconds: Temporal resolution in seconds (must be consistent across steps).
         context_duration_minutes: Lookback window length before t0 for context tensors.
@@ -76,28 +80,32 @@ def generate_all_tensors(
         )
     if not os.path.exists(med_parquet_path):
         raise FileNotFoundError(f"Medication parquet not found: {med_parquet_path}")
+    if not os.path.exists(chartevents_parquet_path):
+        raise FileNotFoundError(f"Chartevents parquet not found: {chartevents_parquet_path}")
 
     base_output = Path(output_dir)
     med_out_dir = base_output / "med_tensors_output"
     physio_out_dir = base_output / "physio_tensors_output"
     context_out_dir = base_output / "context_tensors_output"
     baseline_out_dir = base_output / "baseline_tensors_output"
+    chartevents_out_dir = base_output / "chartevents_tensors_output"
 
     med_out_dir.mkdir(parents=True, exist_ok=True)
     physio_out_dir.mkdir(parents=True, exist_ok=True)
     context_out_dir.mkdir(parents=True, exist_ok=True)
     baseline_out_dir.mkdir(parents=True, exist_ok=True)
+    chartevents_out_dir.mkdir(parents=True, exist_ok=True)
 
     med_metadata_path = med_out_dir / "med_tensors_metadata.pkl"
     med_metadata: Dict[str, Any] | None = None
     if med_metadata_path.exists() and not force_reload:
         logging.info(
-            "Step 1/4: Medication tensors already exist. Skipping (use --force-reload to regenerate)."
+            "Step 1/5: Medication tensors already exist. Skipping (use --force-reload to regenerate)."
         )
         with open(med_metadata_path, "rb") as f:
             med_metadata = pickle.load(f)
     else:
-        logging.info("Step 1/4: Generating medication tensors ...")
+        logging.info("Step 1/5: Generating medication tensors ...")
         med_metadata = create_med_tensors_from_parquet(
             parquet_path=med_parquet_path,
             output_dir=str(med_out_dir),
@@ -113,13 +121,13 @@ def generate_all_tensors(
     physio_metadata: Dict[str, Any] | None = None
     if physio_metadata_path.exists() and not force_reload:
         logging.info(
-            "Step 2/4: Physiological tensors already exist. Skipping (use --force-reload to regenerate)."
+            "Step 2/5: Physiological tensors already exist. Skipping (use --force-reload to regenerate)."
         )
         with open(physio_metadata_path, "rb") as f:
             physio_metadata = pickle.load(f)
     else:
         logging.info(
-            "Step 2/4: Generating physiological IC and prediction target tensors ..."
+            "Step 2/5: Generating physiological IC and prediction target tensors ..."
         )
         physio_metadata = create_physiological_tensors(
             waveforms_parquet_path=str(waveforms_parquet_path),
@@ -129,16 +137,34 @@ def generate_all_tensors(
             n_workers=physio_workers,
         )
 
+    # Step 3/5: Generate chartevents tensors (24h context)
+    chartevents_metadata_path = chartevents_out_dir / "chartevents_context_metadata.pkl"
+    chartevents_metadata: Dict[str, Any] | None = None
+    if chartevents_metadata_path.exists() and not force_reload:
+        logging.info(
+            "Step 3/5: Chartevents tensors already exist. Skipping (use --force-reload to regenerate)."
+        )
+        with open(chartevents_metadata_path, "rb") as f:
+            chartevents_metadata = pickle.load(f)
+    else:
+        logging.info("Step 3/5: Generating chartevents tensors (24h context)...")
+        chartevents_metadata = create_chartevents_tensors(
+            chart_events_path=chartevents_parquet_path,
+            med_metadata_path=str(med_metadata_path),
+            output_dir=str(chartevents_out_dir),
+            n_workers=chartevents_workers,
+        )
+
     context_metadata_path = context_out_dir / "context_tensors_metadata.pkl"
     context_metadata: Dict[str, Any] | None = None
     if context_metadata_path.exists() and not force_reload:
         logging.info(
-            "Step 3/4: Context tensors already exist. Skipping (use --force-reload to regenerate)."
+            "Step 4/5: Context tensors already exist. Skipping (use --force-reload to regenerate)."
         )
         with open(context_metadata_path, "rb") as f:
             context_metadata = pickle.load(f)
     else:
-        logging.info("Step 3/4: Generating context tensors (physio + meds) ...")
+        logging.info("Step 4/5: Generating context tensors (physio + meds) ...")
         context_metadata = create_context_tensors(
             waveforms_parquet_path=str(waveforms_parquet_path),
             med_tensors_metadata_path=str(med_metadata_path),
@@ -149,22 +175,22 @@ def generate_all_tensors(
             n_workers=context_workers,
         )
 
-    # Optional Step 4/4: Baseline tensors
+    # Optional Step 5/5: Baseline tensors
     baseline_metadata_obj: Dict[str, Any] | None = None
     baseline_metadata_file = (
         baseline_out_dir / "baseline_tensors" / "baseline_metadata.pkl"
     )
     if hosp_input_dir is None:
         logging.info(
-            "Step 4/4: Baseline tensors skipped (no --hosp-input-dir provided)."
+            "Step 5/5: Baseline tensors skipped (no --hosp-input-dir provided)."
         )
     else:
         if baseline_metadata_file.exists() and not force_reload:
             logging.info(
-                "Step 4/4: Baseline tensors already exist. Skipping (use --force-reload to regenerate)."
+                "Step 5/5: Baseline tensors already exist. Skipping (use --force-reload to regenerate)."
             )
         else:
-            logging.info("Step 4/4: Generating baseline tensors ...")
+            logging.info("Step 5/5: Generating baseline tensors ...")
             create_baseline_tensors(
                 input_dir=hosp_input_dir,
                 output_dir=str(baseline_out_dir),
@@ -196,6 +222,7 @@ def generate_all_tensors(
                 consolidated_metadata_obj = consolidate_trajectory_metadata(
                     med_metadata_path=str(med_metadata_path),
                     physio_metadata_path=str(physio_metadata_path),
+                    chartevents_metadata_path=str(chartevents_metadata_path),
                     med_data_path=med_parquet_path,
                     output_path=str(consolidated_metadata_path),
                 )
@@ -207,6 +234,7 @@ def generate_all_tensors(
         "inputs": {
             "waveforms_parquet_path": str(waveforms_parquet_path),
             "med_parquet_path": str(med_parquet_path),
+            "chartevents_parquet_path": str(chartevents_parquet_path),
             "hosp_input_dir": str(hosp_input_dir)
             if hosp_input_dir is not None
             else None,
@@ -226,11 +254,14 @@ def generate_all_tensors(
             "med_metadata_path": str(med_metadata_path),
             "baseline_output_dir": str(baseline_out_dir),
             "baseline_metadata_path": str(baseline_metadata_file),
+            "chartevents_output_dir": str(chartevents_out_dir),
+            "chartevents_metadata_path": str(chartevents_metadata_path),
         },
         "med_metadata": med_metadata,
         "physio_metadata": physio_metadata,
         "context_metadata": context_metadata,
         "baseline_metadata": baseline_metadata_obj,
+        "chartevents_metadata": chartevents_metadata,
         "consolidated_metadata": consolidated_metadata_obj,
     }
 
@@ -244,6 +275,7 @@ def generate_all_tensors(
     logging.info("- Physiological tensors: %s", physio_out_dir)
     logging.info("- Context tensors: %s", context_out_dir)
     logging.info("- Baseline tensors: %s", baseline_out_dir)
+    logging.info("- Chartevents tensors: %s", chartevents_out_dir)
     logging.info("- Combined metadata: %s", combined_metadata_path)
 
     return combined_metadata
@@ -266,6 +298,11 @@ def _parse_args() -> argparse.Namespace:
         "--med-parquet",
         required=True,
         help="Path to input_mv (e.g., mv_filtered_10min.parquet).",
+    )
+    parser.add_argument(
+        "--chartevents-parquet",
+        required=True,
+        help="Path to normalized chartevents parquet.",
     )
     parser.add_argument(
         "--output-dir",
@@ -311,6 +348,12 @@ def _parse_args() -> argparse.Namespace:
         help="Number of worker processes for physio/IC generation (default: 6).",
     )
     parser.add_argument(
+        "--chartevents-workers",
+        type=int,
+        default=6,
+        help="Number of worker processes for chartevents generation (default: 6).",
+    )
+    parser.add_argument(
         "--mimic-III-input-dir",
         type=str,
         default=None,
@@ -347,6 +390,7 @@ def main() -> None:
     generate_all_tensors(
         waveforms_parquet_path=args.waveforms_parquet,
         med_parquet_path=args.med_parquet,
+        chartevents_parquet_path=args.chartevents_parquet,
         output_dir=args.output_dir,
         interval_seconds=args.interval_seconds,
         trajectory_duration_minutes=args.trajectory_duration_minutes,
@@ -356,6 +400,7 @@ def main() -> None:
         force_reload=args.force_reload,
         physio_workers=args.physio_workers,
         context_workers=args.context_workers,
+        chartevents_workers=args.chartevents_workers,
         create_consolidated_metadata=not args.no_consolidated_metadata,
     )
 

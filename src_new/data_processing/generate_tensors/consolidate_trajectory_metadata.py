@@ -200,17 +200,19 @@ def rank_action_window_combinations(
 def consolidate_trajectory_metadata(
     med_metadata_path: str,
     physio_metadata_path: str,
+    output_path: str,
     med_data_path: Optional[str] = None,
-    output_path: Optional[str] = None,
-) -> Dict[str, Any]:
+    chartevents_metadata_path: Optional[str] = None,
+):
     """
-    Consolidate trajectory metadata from med and physio tensors.
+    Consolidates trajectory metadata from medication and physiological tensors.
     
     Args:
         med_metadata_path: Path to med tensors metadata.pkl
         physio_metadata_path: Path to physio tensors metadata.pkl
-        med_data_path: Path to original medication data (for trigger extraction)
         output_path: Path to save consolidated metadata
+        med_data_path: Path to original medication data (for trigger extraction)
+        chartevents_metadata_path: Path to chartevents context metadata.pkl
         
     Returns:
         Consolidated metadata dictionary
@@ -221,6 +223,16 @@ def consolidate_trajectory_metadata(
     med_metadata = load_metadata(med_metadata_path)
     physio_metadata = load_metadata(physio_metadata_path)
     
+    # Load chartevents context metadata if provided
+    chartevents_tensors_meta = {}
+    if chartevents_metadata_path and os.path.exists(chartevents_metadata_path):
+        print(f"Loading chartevents context metadata from {chartevents_metadata_path}")
+        chartevents_metadata = load_metadata(chartevents_metadata_path)
+        chartevents_tensors_meta = chartevents_metadata.get("tensors", {})
+        print(f"Loaded chartevents metadata with {len(chartevents_tensors_meta)} tensors")
+    else:
+        print("No chartevents metadata path provided. Context paths will be empty.")
+
     print(f"Loaded med metadata with {len(med_metadata['trajectories'])} trajectories")
     print(f"Loaded physio metadata with {len(physio_metadata['ic_tensors'])} IC tensors")
     
@@ -238,7 +250,11 @@ def consolidate_trajectory_metadata(
         # Create a lookup map from (hadm_id, action_cluster_id) to combo
         combo_lookup = cluster_combo_map.set_index(['hadm_id', 'action_cluster_id'])['combo'].to_dict()
         # Create a mapping from combo tuple to a unique integer ID
-        combo_to_id = {combo: i for i, combo in enumerate(combo_df['combo'])}
+        # Stable, deterministic IDs: sort by frequency(desc), then lexicographically by token tuple
+        combos_sorted = (
+            combo_df.sort_values(['count','combo'], ascending=[False, True])['combo'].tolist()
+        )
+        combo_to_id = {combo: i for i, combo in enumerate(combos_sorted)}
     else:
         print("No medication data path provided. Trigger and combo information will be empty.")
         trigger_medications = {traj_key: [] for traj_key in med_metadata["trajectories"].keys()}
@@ -260,7 +276,10 @@ def consolidate_trajectory_metadata(
         action_cluster_id = med_traj_info["action_cluster_id"]
         combo = combo_lookup.get((hadm_id, action_cluster_id), tuple())
         combo_id = combo_to_id.get(combo, -1) # -1 for combos not found (e.g., empty)
-        
+
+        # Get chartevents context path
+        chartevents_context_info = chartevents_tensors_meta.get(traj_key)
+
         # Build consolidated trajectory info
         consolidated_traj = {
             # Basic trajectory info
@@ -301,6 +320,9 @@ def consolidate_trajectory_metadata(
             "has_medication_data": True,  # Always true if in med metadata
             "has_physiological_data": ic_info is not None,
             "has_complete_data": ic_info is not None and pred_info is not None,
+            
+            # New: Path to chartevents context tensor
+            "chartevents_context_path": chartevents_context_info.get("file_path") if chartevents_context_info else None,
         }
         
         consolidated_trajectories[traj_key] = consolidated_traj
@@ -323,6 +345,7 @@ def consolidate_trajectory_metadata(
         "source_metadata": {
             "med_metadata_path": med_metadata_path,
             "physio_metadata_path": physio_metadata_path,
+            "chartevents_metadata_path": chartevents_metadata_path,
             "med_data_path": med_data_path,
         },
         "trajectories": consolidated_trajectories,
@@ -438,8 +461,8 @@ def main():
     consolidated_metadata = consolidate_trajectory_metadata(
         med_metadata_path=args.med_metadata,
         physio_metadata_path=args.physio_metadata,
-        med_data_path=args.med_data,
         output_path=args.output,
+        med_data_path=args.med_data,
     )
     
     # Inspect if requested

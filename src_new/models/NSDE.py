@@ -193,8 +193,12 @@ class NSDE(LightningModule):
         net_input_dims = self.encoder_output_dim
         net_input_dims = net_input_dims + 2 if include_time else net_input_dims
         self.med_embed_dim = med_embed_dim
-        # Use LazyLinear to infer input dim on first forward while keeping params registered
-        self.med_proj = nn.LazyLinear(self.med_embed_dim)
+        # Initialize explicitly to avoid Lazy params (DDP requires materialized weights)
+        # Input dim equals 5*M (rate, pre_on, cumulative, decay, trigger)
+        if int(self.n_medications) > 0:
+            self.med_proj = nn.Linear(int(self.n_medications) * 5, int(self.med_embed_dim), bias=True)
+        else:
+            self.med_proj = None
 
         if self.use_encoder != "none":
             self.ic_consistency_weight = 10

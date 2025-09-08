@@ -1,0 +1,23 @@
+defaults:
+  - model: default
+  - data: default
+  - trainer: default
+  - _self_
+
+# General Experiment Settings
+seed: 64 # Random seed for initialization
+experiment_name: "sdehybrid_rc_last" # Wandb project name
+saving_dir: "/n/netscratch/mzitnik_lab/Lab/rconci/BIOMM/results" # Base directory for saving models and logs
+run_name: null # A specific name for the run. If null, a name is auto-generated.
+notes: "Default run from config." # Notes for this run.
+
+# Logging & Evaluation
+disable_wandb: false # Set to true to disable logging to Weights & Biases. The old --log_wandb is the opposite of this.
+HPC_work: true # Affects temp directories and other HPC-specific settings.
+run_eval: true # Run evaluation on the test set after training is complete.
+redirect_output: false # Redirect stdout/stderr to a log file instead of the terminal.
+log_file: "" # Optional explicit path to log file (default: train_<timestamp>.log).
+
+# Debugging
+audit_one_batch: false # If true, runs a one-batch audit of the dataloader and model inputs then exits.
+audit_print_samples: 3 # How many batch elements to print during the one-batch audit.
