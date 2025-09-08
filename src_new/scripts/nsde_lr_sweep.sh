@@ -20,6 +20,7 @@ for lr in "${LRS[@]}"; do
 
         nohup python ../models/NSDE_main.py \
             trainer.devices=[${gpu_counter}] \
+            trainer.max_epochs=25 \
             model.learning_rate=${lr} \
             model.use_encoder=${encoder} \
             data.data_root='../../data/mimic_3_data/processed_data' \
