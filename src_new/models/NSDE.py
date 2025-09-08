@@ -245,6 +245,7 @@ class NSDE(LightningModule):
             normalise_for_SDENN,
             self_reverting_prior_control,
             prior_tx_sigma_per_control: t.List[float],
+            prior_tx_sigma,
             prior_tx_mu,
             theta,
             SDE_control_weighting,
