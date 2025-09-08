@@ -541,9 +541,6 @@ class NSDE(LightningModule):
         else:
             self.prior_tx_sigma_per_control = torch.tensor(prior_tx_sigma_per_control, dtype=torch.float32)
 
-        if self.prior_tx_sigma_per_control.shape[0] != SDEnet_out_dims:
-            raise ValueError(
-                f"Length of prior_tx_sigma_per_control ({self.prior_tx_sigma_per_control.shape[0]}) must match SDEnet_out_dims ({SDEnet_out_dims})")
 
         self.prior_tx_mu = prior_tx_mu
         self.noise_scale = prior_tx_sigma
