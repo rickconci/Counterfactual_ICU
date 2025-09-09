@@ -29,8 +29,12 @@ for lr in "${LRS[@]}"; do
             trainer.strategy=auto \
             trainer.accumulate_grad_batches=1 \
             trainer.max_epochs=25 \
+            trainer.precision=bf16-mixed \
             model.learning_rate=${lr} \
             model.use_encoder=${encoder} \
+            model.loss_type=nll \
+            model.log_lik_scale_mode=annealing \
+            model.controller_type=mlp \
             run_name="${run_name}" \
             data.data_root='../../data/mimic_3_data/processed_data' \
             > logs/nsde_lr${lr}_${encoder}_gpu${gpu_counter}_$(date +%Y%m%d_%H%M%S).log 2>&1 &
@@ -50,6 +54,7 @@ echo "=== All 6 runs launched! ==="
 echo "LRs: 1e-3, 1e-4, 5e-4"
 echo "Encoders: none, raindrop"
 echo "GPUs: 1-6 (cycling through 1-7)"
+echo "Additional configs: bf16-mixed precision, NLL loss, annealing scale, MLP controller"
 echo ""
 echo "Monitor with:"
 echo "  nvidia-smi"

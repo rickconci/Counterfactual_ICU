@@ -1119,8 +1119,8 @@ class NSDE(LightningModule):
         nn_input = normalized_pressures  # [batch*samples, 2]
 
         # Add neural embedding context (stored from forward_latent)
-        if hasattr(self, 'static_neural_embedding') and self.static_neural_embedding is not None:
-            nn_input = torch.cat([nn_input, self.static_neural_embedding], dim=-1)
+        if hasattr(self, 'static_neural_embedding') and self.current_neural_embedding is not None:
+            nn_input = torch.cat([nn_input, self.current_neural_embedding], dim=-1)
 
         # Add time encoding
         if self.include_time:
@@ -1302,9 +1302,6 @@ class NSDE(LightningModule):
         if hasattr(self, 'current_med_tensors'):
             pass  # Already set from common_step
 
-        # Store neural embedding flattened for f() access
-        self.static_neural_embedding = neural_embedding.reshape(-1, self.encoder_SDENN_dims)
-
         # Initial state: just the 2 observables
         y0 = init_latents.reshape(-1, 2)  # [batch*samples, 2]
 
@@ -1313,7 +1310,7 @@ class NSDE(LightningModule):
             print(f"  init_latents shape: {init_latents.shape}")
             print(f"  y0 shape: {y0.shape}")
             print(f"  neural_embedding shape: {neural_embedding.shape}")
-            print(f"  static_neural_embedding shape: {self.static_neural_embedding.shape}")
+            print(f"  static_neural_embedding shape: {self.current_neural_embedding.shape}")
 
         # Integrate neural SDE
         options = {"dtype": torch.float32}
