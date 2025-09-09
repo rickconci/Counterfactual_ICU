@@ -41,9 +41,9 @@ for encoder in "${ENCODERS[@]}"; do
             model.controller_type=mlp \
             seed=${seed} \
             run_name="${run_name}" \
-            data_config.data_root='../../data/mimic_3_data/processed_data' \
-            data_config.test_both_filtered_and_unfiltered=true \
-            data_config.num_workers=4 \
+            data.data_root='../../data/mimic_3_data/processed_data' \
+            data.test_both_filtered_and_unfiltered=true \
+            data.num_workers=4 \
             > logs/nsde_lr${LR}_${encoder}_sigma0.3_seed${seed}_gpu${gpu_counter}_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
         echo "Process PID: $! | Log: logs/nsde_lr${LR}_${encoder}_sigma0.3_seed${seed}_gpu${gpu_counter}_*.log"
