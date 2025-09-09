@@ -41,7 +41,7 @@ for seed in "${SEEDS[@]}"; do
         data_config.num_workers=4 \
         model.controller_type=mlp \
         model.learning_rate=${LR} \
-        model.SDE_control_weighting=0\
+        model.SDE_control_weighting=0 \
         seed=${seed} \
         model.use_encoder=${ENCODER} \
         model.num_samples=3 \
