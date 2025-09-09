@@ -31,3 +31,6 @@ hybrid_sde_ablations.sh
 ### Baselines
 
 zenker_baseline.sh
+
+1) Download icu/inputevents_mv
+2) 

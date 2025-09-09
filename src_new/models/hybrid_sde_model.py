@@ -2814,6 +2814,7 @@ class Hybrid_SDE(LightningModule):
         )
 
         total_loss = loss + self.ic_consistency_weight * ic_consistency_loss
+        analytical_ics = expert_state
 
         # Optional control TV/L2 smoothness loss over mean path: mean ||u_t - u_{t-1}||^2
         if getattr(self, "use_control_tv_loss", False):
@@ -2852,6 +2853,7 @@ class Hybrid_SDE(LightningModule):
             "traj_ids": traj_ids,
             "per_sample_loss": per_sample_loss,
             "med_combo_ids": med_combo_ids,
+            "analytical_ics": analytical_ics,
         }
 
     def training_step(self, batch, batch_idx):
@@ -3146,6 +3148,7 @@ class Hybrid_SDE(LightningModule):
         decoded_traj = result["decoded_traj"]
         Y = result["Y"]
         combined_mask = result["combined_mask"]
+        analytical_ics = result["analytical_ics"]  # [B, 14]
 
         with torch.no_grad():
             mse_per_sample = ((decoded_traj.mean(1) - Y) ** 2) * combined_mask
@@ -3162,12 +3165,11 @@ class Hybrid_SDE(LightningModule):
                 seq_len = Y.shape[1]
 
                 for patient_idx in range(Y.shape[0]):
-                    patient_z1 = result["z1_for_sde"][patient_idx, 0].cpu().numpy()
-                    p_a_init, p_v_init, s_reflex_init, sv_init = patient_z1[:4]
-                    r_tpr_mod, f_hr_max, f_hr_min, r_tpr_max, r_tpr_min = patient_z1[
-                        4:9
-                    ]
-                    ca, cv, k_width, p_aset, tau = patient_z1[9:14]
+                    # Extract from analytical ICs directly (already in proper order)
+                    patient_analytical = analytical_ics[patient_idx].cpu().numpy()
+                    p_a_init, p_v_init, s_reflex_init, sv_init = patient_analytical[:4]
+                    r_tpr_mod, f_hr_max, f_hr_min, r_tpr_max, r_tpr_min = patient_analytical[4:9]
+                    ca, cv, k_width, p_aset, tau = patient_analytical[9:14]
 
                     zenker_model = ZenkerODE(
                         p_a_init=float(p_a_init),
