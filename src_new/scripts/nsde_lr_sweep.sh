@@ -32,7 +32,7 @@ for lr in "${LRS[@]}"; do
             trainer.precision=bf16-mixed \
             model.learning_rate=${lr} \
             model.use_encoder=${encoder} \
-            model.prior_tx_sigma= 0.3\
+            model.prior_tx_sigma= 0.3 \
             model.loss_type=nll \
             model.log_lik_scale_mode=annealing \
             model.controller_type=mlp \
