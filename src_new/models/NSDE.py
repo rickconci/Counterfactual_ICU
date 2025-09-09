@@ -1104,9 +1104,9 @@ class NSDE(LightningModule):
         nn_input = normalized_pressures  # [batch*samples, 2]
 
         # Add neural embedding context (stored from forward_latent)
-        if hasattr(self, 'current_neural_embedding') and self.current_neural_embedding is not None:
+        if (hasattr(self, 'current_neural_embedding') and self.current_neural_embedding is not None and
+                self.current_neural_embedding.shape[-1] > 0):
             nn_input = torch.cat([nn_input, self.current_neural_embedding], dim=-1)
-
         # Add time encoding
         if self.include_time:
             sin_time = torch.sin(torch.full_like(y[:, 0], fill_value=t)).unsqueeze(1)
@@ -1273,12 +1273,18 @@ class NSDE(LightningModule):
         self.current_med_values = med_traj_values
         self.current_med_mask = med_traj_mask
         self.current_med_time = med_traj_time
-        if neural_embedding.dim() == 3:  # [batch, samples, dims]
-            self.current_neural_embedding = neural_embedding.reshape(-1, neural_embedding.shape[-1])
-        elif neural_embedding.dim() == 2:  # [batch, dims] - expand for samples
-            self.current_neural_embedding = neural_embedding.unsqueeze(1).repeat(1, num_samples, 1).reshape(-1,neural_embedding.shape[-1])
+        # In forward_latent(), replace the neural embedding storage with:
+        if neural_embedding.shape[-1] > 0:  # Only store if there are actual dimensions
+            if neural_embedding.dim() == 3:  # [batch, samples, dims]
+                self.current_neural_embedding = neural_embedding.reshape(-1, neural_embedding.shape[-1])
+            elif neural_embedding.dim() == 2:  # [batch, dims] - expand for samples
+                self.current_neural_embedding = neural_embedding.unsqueeze(1).repeat(1, num_samples, 1).reshape(-1,
+                                                                                                                neural_embedding.shape[
+                                                                                                                    -1])
+            else:
+                raise ValueError(f"Unexpected neural_embedding shape: {neural_embedding.shape}")
         else:
-            raise ValueError(f"Unexpected neural_embedding shape: {neural_embedding.shape}")
+            self.current_neural_embedding = None  # No neural embedding dimensions
 
         # Store time grid helpers
         self._t0 = ts[0].to(self.device)
