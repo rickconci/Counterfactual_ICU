@@ -39,7 +39,7 @@ for encoder in "${ENCODERS[@]}"; do
             model.loss_type=nll \
             model.log_lik_scale_mode=annealing \
             model.controller_type=mlp \
-            seed_everything=${seed} \
+            cfg.seed=${seed} \
             run_name="${run_name}" \
             data.data_root='../../data/mimic_3_data/processed_data' \
             data.test_both_filtered_and_unfiltered=true \
