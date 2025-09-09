@@ -26,7 +26,7 @@ for seed in "${SEEDS[@]}"; do
     # Create informative run name for wandb
     run_name="hybrid_sde_lr${LR}_encoder_${ENCODER}_seed${seed}_gpu${gpu_counter}"
 
-    CUDA_VISIBLE_DEVICES=${gpu_counter} nohup python hybrid_sde_main.py -m \
+    CUDA_VISIBLE_DEVICES=${gpu_counter} nohup python ./models/hybrid_sde_main.py -m \
         trainer.accelerator=gpu \
         trainer.devices=1 \
         trainer.strategy=auto \
