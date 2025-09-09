@@ -89,7 +89,6 @@ def sigmoid(x):
     return 1 / (1 + torch.exp(-x))
 
 
-# TODO I changed this
 def normalise_expert_data(y):
     # If first 2 dims are NN outputs, we should skip them
     nn_output_dims = 2  # Number of NN output dimensions

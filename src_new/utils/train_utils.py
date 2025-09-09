@@ -827,7 +827,6 @@ def dpv(dpa_dt, c_a, c_v):
     Returns:
 
     """
-    # TODO note to self: we do not include ANY control here and assume this will be handled during the forward latent step (dependent on which model)
     return (1 / (c_v)) * (-c_a * dpa_dt)
 
 

@@ -1348,7 +1348,7 @@ def create_integrated_waveform_tensors(
     waveform_cache = WaveformRecordCache()
 
     debug_print("Preparing tasks for parallel processing...")
-    for hadm_id in list(patient_mapping.keys()):  # [:200]:  # TODO: remove this limit
+    for hadm_id in list(patient_mapping.keys()):
         if hadm_id not in patient_mapping or hadm_id not in icu_admission_map:
             continue
 

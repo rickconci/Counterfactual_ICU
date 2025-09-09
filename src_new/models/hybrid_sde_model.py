@@ -748,7 +748,6 @@ class Hybrid_SDE(LightningModule):
         activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "none": None}
         final_activation_real = activations[final_activation.lower()]
 
-        # TODO change net input dims to be 14 + number of meds if there is no encoder, else encoder dim + 14 + meds
 
         self.SDEnet = MLPSimple(
             input_dim=net_input_dims,
@@ -1055,7 +1054,7 @@ class Hybrid_SDE(LightningModule):
             self.log_lik_output_scale = float(self.hparams.log_lik_output_scale)
 
     def transform_sigmoid_to_physiological_ranges(self, sigmoid_values):
-        # TODO check this again in encoder setting
+
         """Simplified version using pre-computed ranges"""
         # Check input for NaN/inf
         if self.debug:
@@ -1535,7 +1534,6 @@ class Hybrid_SDE(LightningModule):
             #normalized_input = self.input_layer_norm(SDE_NN_input)
             SDE_NN_output_latents = self.SDEnet(SDE_NN_input)
 
-        # TODO do these clamps make sense
         # control_scales = torch.tensor([100.0, 30.0], device=SDE_NN_output_latents.device)
         # scaled_output = SDE_NN_output_latents * control_scales.unsqueeze(0)
         if self.force_no_controls:

@@ -639,7 +639,6 @@ class NSDE(LightningModule):
         activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "none": None}
         final_activation_real = activations[final_activation.lower()]
 
-        # TODO change net input dims to be 14 + number of meds if there is no encoder, else encoder dim + 14 + meds
 
         self.SDEnet = MLPSimple(
             input_dim=net_input_dims,
@@ -920,7 +919,6 @@ class NSDE(LightningModule):
             self.log_lik_output_scale = float(self.hparams.log_lik_output_scale)
 
     def transform_sigmoid_to_physiological_ranges(self, sigmoid_values):
-        # TODO check this again in encoder setting
         """Simplified version using pre-computed ranges"""
         # Check input for NaN/inf
         if self.debug:

@@ -42,9 +42,7 @@ def create_load_save_data(dataset_params: dict, data_path: str) -> dict:
         data = torch.load(final_data_path)
     else:
         print("Creating and saving a new dataset.")
-        # For now, create dummy data - this should be replaced with actual SDE generation
-        # TODO: Implement actual SDE data generation
-        data = _create_dummy_data(dataset_params)
+        # For now, create dummy data - this should be replaced with actual SDE generation        data = _create_dummy_data(dataset_params)
         
         # Save the dataset
         torch.save(data, final_data_path)

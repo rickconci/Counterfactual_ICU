@@ -108,7 +108,7 @@ class NODE(LightningModule):
         if use_encoder == "raindrop":
             # For Raindrop, d_model is its internal feature size.
             # Its output before projection will be d_model + d_pe if sensor_wise_mask is False
-            # TODO not quite sure if this is still right
+
             d_ob = max(int(encoder_hidden_dim / encoder_input_dim), 2)
             temporal_embedding_dim = encoder_input_dim * d_ob + 16  # d_model + d_pe
             max_len_ctx = (
@@ -209,8 +209,6 @@ class NODE(LightningModule):
 
         activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "none": None}
         final_activation_real = activations[final_activation.lower()]
-
-        # TODO change net input dims to be 14 + number of meds if there is no encoder, else encoder dim + 14 + meds
 
         self.ODEnet = MLPSimple(
             input_dim=net_input_dims,
@@ -330,7 +328,7 @@ class NODE(LightningModule):
 
 
     def transform_sigmoid_to_physiological_ranges(self, sigmoid_values):
-        # TODO check this again in encoder setting
+
         """Simplified version using pre-computed ranges"""
         # Check input for NaN/inf
         if self.debug:
@@ -709,7 +707,7 @@ class NODE(LightningModule):
         # Get the number of IC variables we have
         num_ic_vars = init_states.shape[-1]
 
-        # TODO compute loss over normalized values
+
 
         # predicted_ode_latents are already sigmoided, so use them directly
         sigmoid_predicted = predicted_ode_latents_sigmoid[
