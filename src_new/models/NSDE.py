@@ -1991,26 +1991,6 @@ class NSDE(LightningModule):
             control_energy = torch.tensor(0.0, device=total_loss.device)
 
         total_loss = total_loss + self.control_energy_weight * control_energy
-        # Log and print current per-control weights (adaptive ramp * global weighting)
-        current_ctrl_weights = self.get_current_per_control_weights().detach().cpu()
-        # Log via Lightning so it reaches the configured logger (e.g., wandb)
-        for i in range(current_ctrl_weights.numel()):
-            try:
-                self.log(f"train_ctrl_weight_{i}", float(current_ctrl_weights[i].item()), on_step=True, on_epoch=False,
-                         prog_bar=False, logger=True)
-            except Exception:
-                pass
-        # Also log dynamic per-control sigmas and weights succinctly
-        current_sigmas = self.get_current_per_control_sigmas().detach().cpu()
-        for i in range(current_sigmas.numel()):
-            try:
-                self.log(f"train_ctrl_sigma_{i}", float(current_sigmas[i].item()), on_step=True, on_epoch=False,
-                         prog_bar=False, logger=True)
-            except Exception:
-                pass
-        print(
-            f"Step {self.global_step}: control_energy={control_energy.item():.2e}, weight={self.control_energy_weight:.2e}, contribution={self.control_energy_weight * control_energy.item():.2e}, main_loss={loss.item():.2f}, weights={current_ctrl_weights.tolist()}, sigmas={current_sigmas.tolist()}"
-        )
 
         # Optional training plots (controls only), gated by plot_every
         should_plot_now = False
