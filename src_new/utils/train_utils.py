@@ -1,6 +1,8 @@
 # -*- coding:utf-8 -*-
 import logging
 import random
+import torch
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -8,6 +10,14 @@ import torch.nn as nn
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.nn import functional as F
 from tqdm import tqdm
+import math
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+import math
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+import torch
+import pandas as pd
 
 
 def get_device():
@@ -825,3 +835,536 @@ def dsdt(tau, k_width, p_a, p_aset, s_reflex):
     return (1.0 / tau) * (
         1.0 - 1.0 / (1 + torch.exp(-k_width * (p_a - p_aset))) - s_reflex
     )
+
+
+def midpoint(r: Tuple[float, float]) -> float:
+    return 0.5 * (r[0] + r[1])
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def _to_tensor(x, device, dtype):
+    if isinstance(x, torch.Tensor):
+        return x.to(device=device, dtype=dtype)
+    return torch.as_tensor(x, device=device, dtype=dtype)
+
+
+
+
+def _normalize_label(s: str) -> str:
+    """Normalize label text for matching across index_map and df_ranges."""
+    return str(s).strip().lower().replace("_", " ").replace("-", " ")
+
+def _stats_tensors_from_ranges(
+    df_ranges: pd.DataFrame,
+    labels,
+    group_col: str = 'item_label',
+    device=None,
+    dtype=torch.float32
+):
+    """
+    Build per-feature mean/std/lower/upper tensors (shape [K]) from df_ranges.
+    Label matching is normalized (lowercased, underscores -> spaces, etc.).
+    """
+    required = {'lower_bound', 'upper_bound', group_col}
+    if not required.issubset(df_ranges.columns):
+        missing = required - set(df_ranges.columns)
+        raise ValueError(f"df_ranges is missing required columns: {missing}")
+
+    # Normalize df_ranges labels
+    df_ranges = df_ranges.copy()
+    df_ranges['_norm_label'] = df_ranges[group_col].map(_normalize_label)
+    stats = df_ranges.set_index('_norm_label')[['lower_bound', 'upper_bound']]
+
+    # Normalize the labels list
+    norm_labels = [_normalize_label(l) for l in labels]
+
+    # Build tensors in the order of labels
+    try:
+        lb = torch.tensor([float(stats.loc[l, 'lower_bound']) for l in norm_labels],
+                          device=device, dtype=dtype)
+        ub = torch.tensor([float(stats.loc[l, 'upper_bound']) for l in norm_labels],
+                          device=device, dtype=dtype)
+    except KeyError as e:
+        raise KeyError(f"Label '{e.args[0]}' not found after normalization in df_ranges[{group_col}].")
+
+    mean = (lb + ub) / 2.0
+    std  = (ub - lb) / 6.0
+    return mean, std, lb, ub
+
+
+
+def denormalize_selected_from_batched_sample(
+    chartevents_sample: torch.Tensor,
+    df_ranges: pd.DataFrame,
+    index_map: dict,
+    group_col: str = 'item_label',
+    d_inp: int = 96,
+    use_mask: bool = True,
+    clip: bool = True,
+):
+    """
+    Vectorized inverse-normalization for a batched tensor.
+
+    Args:
+      chartevents_sample: torch.Tensor of shape [B, T, 2*d_inp]
+                          first d_inp = z-scored values,
+                          next d_inp  = **missing mask** (1 = missing, 0 = present; float/int/bool)
+      df_ranges: DataFrame with columns [group_col, lower_bound, upper_bound] (bounds are mean ± 3*std)
+      index_map: dict mapping item_label -> feature index (column in X) for features of interest
+      group_col: column name in df_ranges that matches item labels in index_map
+      d_inp: number of clinical features (e.g., 96)
+      use_mask: if True, use the provided missing mask; otherwise treat non-NaN as present
+      clip: clip z to [-3, 3] before inverse-transform (recommended)
+
+    Returns (all torch tensors):
+      original_values: [B, K] inverse-mapped to original scale
+      z_values:        [B, K] raw z-scores extracted at the last present timestep
+      timesteps:       [B, K] int64 indices of last present timestep (=-1 where none present)
+      means:           [K]
+      stds:            [K]
+      lower_bounds:    [K]
+      upper_bounds:    [K]
+      present_mask:    [B, K] bool, True where a present value was found
+    """
+    if not torch.is_tensor(chartevents_sample) or chartevents_sample.dim() != 3:
+        raise ValueError("chartevents_sample must be a torch.Tensor of shape [B, T, 2*d_inp].")
+
+    B, T, F_total = chartevents_sample.shape
+    if F_total != 2 * d_inp:
+        raise ValueError(f"Expected last dim = 2*d_inp ({2*d_inp}), got {F_total}.")
+
+    device = chartevents_sample.device
+    dtype = chartevents_sample.dtype
+
+    # Split into values and mask
+    X = chartevents_sample[:, :, :d_inp]           # [B, T, d_inp]
+    M = chartevents_sample[:, :, d_inp:]           # [B, T, d_inp]  (1 = missing, 0 = present)
+    
+    #print('X:', X[0, -1, :])
+    #print('M:', M[0, -1, :])
+
+    # Indices/labels of interest
+    labels = list(index_map.keys())
+    feat_idx = torch.tensor([index_map[l] for l in labels], device=device, dtype=torch.long)
+    if (feat_idx < 0).any() or (feat_idx >= d_inp).any():
+        raise IndexError("One or more feature indices in index_map are out of bounds for d_inp.")
+
+    # Select features of interest
+    X_sel = X.index_select(dim=2, index=feat_idx)                # [B, T, K]
+    #print('X_sel:', X_sel[0, -1, :])
+
+    if use_mask:
+        # Convert to boolean *missing* mask (True = missing), then invert to get presence
+        M_sel_missing = M.index_select(dim=2, index=feat_idx)
+        if M_sel_missing.dtype != torch.bool:
+            M_sel_missing = M_sel_missing > 0.5
+        present = ~M_sel_missing                                  # True = present
+    else:
+        present = ~torch.isnan(X_sel)
+    #print('present:', present[0, -1, :])
+
+    # Compute last present timestep per (B,K)
+    time_idx = torch.arange(T, device=device).view(1, T, 1)      # [1, T, 1]
+    # Put 0 where absent, then take max; fix up later where none are present
+    idx_weighted = torch.where(present, time_idx, torch.zeros(1, dtype=time_idx.dtype, device=device))
+    last_idx = idx_weighted.amax(dim=1)                          # [B, K], 0 if none present
+    any_present = present.any(dim=1)                             # [B, K] bool
+    last_idx = torch.where(any_present, last_idx, torch.full_like(last_idx, -1))
+
+    # Gather z-values at the last present timestep
+    last_idx_safe = torch.clamp(last_idx, min=0)                 # [B, K]
+    z_values = X_sel.gather(1, last_idx_safe.unsqueeze(1).expand(-1, 1, -1)).squeeze(1)  # [B, K]
+    z_values = torch.where(any_present, z_values, torch.full_like(z_values, float('nan')))
+
+    # Stats in K-order
+    means, stds, lower_bounds, upper_bounds = _stats_tensors_from_ranges(
+        df_ranges, labels, group_col=group_col, device=device, dtype=torch.float32
+    )
+    means = means.to(dtype)
+    stds = stds.to(dtype)
+    lower_bounds = lower_bounds.to(dtype)
+    upper_bounds = upper_bounds.to(dtype)
+
+    # Inverse transform
+    z_use = torch.clamp(z_values, -3.0, 3.0) if clip else z_values
+    original_values = z_use * stds.view(1, -1) + means.view(1, -1)              # [B, K]
+    original_values = torch.where(any_present, original_values, torch.full_like(original_values, float('nan')))
+
+    return (
+        original_values,         # [B, K]
+        z_values,                # [B, K]
+        last_idx.to(torch.long), # [B, K]
+        means,                   # [K]
+        stds,                    # [K]
+        lower_bounds,            # [K]
+        upper_bounds,            # [K]
+        any_present              # [B, K] bool
+    )
+
+
+
+# Order of ODE variables (L = 14)
+_EXPERT_ORDER = [
+    "p_a", "p_v", "s_reflex", "sv", "r_tpr_mod",
+    "f_hr_max", "f_hr_min", "r_tpr_max", "r_tpr_min",
+    "ca", "cv", "k_width", "p_aset", "tau",
+]
+
+def _midpoint_pair(pair):
+    return 0.5 * (float(pair[0]) + float(pair[1]))
+
+def _normalize_label(s: str) -> str:
+    return str(s).strip().lower().replace("_", " ").replace("-", " ")
+
+
+def _ranges_midpoint_tensor(physio_ranges: dict, device, dtype) -> torch.Tensor:
+    """
+    Build a [L] tensor of midpoints in _EXPERT_ORDER from a dict physio_ranges.
+    """
+    vals = []
+    for key in _EXPERT_ORDER:
+        pair = physio_ranges[key]
+        vals.append(_midpoint_pair(pair))
+    return torch.tensor(vals, device=device, dtype=dtype)
+
+def _build_full_state_from_equilibrium(
+    Pa: torch.Tensor, Pv: torch.Tensor, Hr: torch.Tensor,
+    eq: dict, physio_ranges: dict, device, dtype
+) -> torch.Tensor:
+    """
+    Assemble [B, L] in _EXPERT_ORDER using equilibrium outputs + midpoints.
+    """
+    B = Pa.shape[0]
+    base = _ranges_midpoint_tensor(physio_ranges, device, dtype).unsqueeze(0).expand(B, -1).clone()
+
+    # Write equilibrium-derived entries
+    # Indices by order:
+    idx = {name: i for i, name in enumerate(_EXPERT_ORDER)}
+
+    base[:, idx["p_a"]]        = eq["Pa"].to(dtype)
+    base[:, idx["p_v"]]        = eq["Pv"].to(dtype)
+    base[:, idx["s_reflex"]]   = eq["s"].to(dtype)
+    base[:, idx["sv"]]         = eq["SV"].to(dtype)
+    base[:, idx["r_tpr_mod"]]  = eq["r_tpr_mod"].to(dtype)
+    base[:, idx["p_aset"]]     = eq["p_aset_star"].to(dtype)
+
+    # The rest (f_hr_max, f_hr_min, r_tpr_max, r_tpr_min, ca, cv, k_width, tau)
+    # remain as midpoints from physio_ranges (already set in base)
+
+    return base
+
+def _dict_to_PhysioRanges(physio_ranges: dict):
+    """
+    Convert dict (like self.physio_ranges) to PhysioRanges dataclass expected by compute_stable_equilibrium_batch.
+    """
+    return PhysioRanges(
+        p_a=tuple(physio_ranges["p_a"]),
+        p_v=tuple(physio_ranges["p_v"]),
+        s_reflex=tuple(physio_ranges["s_reflex"]),
+        sv=tuple(physio_ranges["sv"]),
+        r_tpr_mod=tuple(physio_ranges["r_tpr_mod"]),
+        f_hr_max=tuple(physio_ranges["f_hr_max"]),
+        f_hr_min=tuple(physio_ranges["f_hr_min"]),
+        r_tpr_max=tuple(physio_ranges["r_tpr_max"]),
+        r_tpr_min=tuple(physio_ranges["r_tpr_min"]),
+        ca=tuple(physio_ranges["ca"]),
+        cv=tuple(physio_ranges["cv"]),
+        k_width=tuple(physio_ranges["k_width"]),
+        p_aset=tuple(physio_ranges["p_aset"]),
+        tau=tuple(physio_ranges["tau"]),
+    )
+
+def _pick_ic_or_fallback(ic_vals: torch.Tensor, ic_mask: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
+    """Prefer IC where mask==1 and finite; else fallback. All [B]."""
+    use_ic = (ic_mask == 1) & torch.isfinite(ic_vals)
+    return torch.where(use_ic, ic_vals, fallback)
+
+
+
+
+@dataclass
+class PhysioRanges:
+    p_a: Tuple[float, float] = (40.0, 180.0)
+    p_v: Tuple[float, float] = (0.0, 30.0)
+    s_reflex: Tuple[float, float] = (0.0, 1.0)
+    sv: Tuple[float, float] = (40.0, 120.0)
+    r_tpr_mod: Tuple[float, float] = (-1.0, 1.0)
+    f_hr_max: Tuple[float, float] = (2.0, 3.0)
+    f_hr_min: Tuple[float, float] = (0.9, 1.1)
+    r_tpr_max: Tuple[float, float] = (1.8, 2.4)
+    r_tpr_min: Tuple[float, float] = (0.45, 0.6)
+    ca: Tuple[float, float] = (2.0, 6.0)
+    cv: Tuple[float, float] = (90.0, 120.0)
+    k_width: Tuple[float, float] = (0.1, 0.3)
+    p_aset: Tuple[float, float] = (50.0, 90.0)
+    tau: Tuple[float, float] = (15.0, 25.0)
+
+
+
+
+
+def compute_stable_equilibrium_batch(
+    Pa: torch.Tensor,                   # [B] mmHg (arterial pressure)
+    Pv: torch.Tensor,                   # [B] mmHg (venous/CVP)
+    Hr: torch.Tensor,                   # [B] heart rate (Hz or bpm; see hr_units)
+    *,
+    # Units & priors
+    hr_units: str = "hz",               # "hz" (default) or "bpm"
+    hr_prior_bpm: float = 75.0,         # used if both Pa & Hr missing; ~1.25 Hz
+    pv_prior: float = 8.0,              # physiologic CVP prior
+    pv_minmax: Tuple[float, float] = (2.0, 15.0),  # clamp for CVP prior
+    paset_prior: Optional[torch.Tensor] = None,    # [B] or scalar; default midpoint(ranges.p_aset)
+
+    # Model params (broadcastable to [B] or None => midpoints)
+    f_hr_min: Optional[torch.Tensor] = None,
+    f_hr_max: Optional[torch.Tensor] = None,
+    r_tpr_min: Optional[torch.Tensor] = None,
+    r_tpr_max: Optional[torch.Tensor] = None,
+    k_width: Optional[torch.Tensor] = None,
+    r_tpr_mod_fixed: Optional[torch.Tensor] = 0.0,
+
+    # Ranges & numerics
+    ranges = None,                      # PhysioRanges(); pass your instance or None => defaults inside
+    eps: float = 1e-6,
+) -> Dict[str, torch.Tensor]:
+    """
+    Robust, NaN-proof batched solver.
+    - Fills any missing Pa/Pv/Hr analytically:
+        * If Hr present & Pa missing:   Pa from baroreflex with paset_prior.
+        * If Pa present & Hr missing:   Hr from baroreflex with paset_prior.
+        * If both Pa & Hr missing:      use hr_prior_bpm + paset_prior to infer a consistent pair.
+        * If Pv missing:                Pv <- pv_prior (clamped).
+    - Then runs the same core logic (R_base, SV, r_tpr_mod adjust-on-violation).
+    - Uses safe logs and final NaN trapping; returns provenance flags.
+    """
+
+    # ---- Helpers ----
+    class _DefaultRanges:
+        # Fallback if ranges is None
+        p_a       = (40.0, 180.0)
+        p_v       = (0.0, 30.0)
+        s_reflex  = (0.0, 1.0)
+        sv        = (40.0, 120.0)
+        r_tpr_mod = (-1.0, 1.0)
+        f_hr_max  = (2.0, 3.0)
+        f_hr_min  = (0.9, 1.1)
+        r_tpr_max = (1.8, 2.4)
+        r_tpr_min = (0.45, 0.6)
+        ca        = (2.0, 6.0)
+        cv        = (90.0, 120.0)
+        k_width   = (0.1, 0.3)
+        p_aset    = (50.0, 90.0)
+        tau       = (15.0, 25.0)
+
+    rng = ranges if ranges is not None else _DefaultRanges()
+
+    def _mid(pair):  # pair = (lo, hi)
+        return 0.5 * (pair[0] + pair[1])
+
+    def _to_full(x, default_pair, B, device, dtype):
+        if x is None:
+            return torch.full((B,), _mid(default_pair), device=device, dtype=dtype)
+        if torch.is_tensor(x):
+            return x.to(device=device, dtype=dtype).expand(B)
+        return torch.full((B,), float(x), device=device, dtype=dtype)
+
+    def _fill_nan_with(x: torch.Tensor, fill: float) -> torch.Tensor:
+        return torch.where(torch.isnan(x), torch.full_like(x, fill), x)
+
+    def _safe_log_ratio_one_minus_over(x: torch.Tensor) -> torch.Tensor:
+        # log((1 - x)/x) computed stably
+        return torch.log1p(-x) - torch.log(x)
+
+    def _nan_to_num_like(x: torch.Tensor) -> torch.Tensor:
+        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # ---- Shape checks ----
+    if not (Pa.ndim == Pv.ndim == Hr.ndim == 1):
+        raise ValueError("Pa, Pv, Hr must be 1-D tensors [B].")
+
+    B, device, dtype = Pa.shape[0], Pa.device, Pa.dtype
+
+    # ---- Unit handling ----
+    Hr_in = Hr.clone()
+    if hr_units.lower() == "bpm":
+        Hr = Hr / 60.0
+
+    # ---- Param vectors (midpoints where None) ----
+    f_hr_min = _to_full(f_hr_min, rng.f_hr_min, B, device, dtype)
+    f_hr_max = _to_full(f_hr_max, rng.f_hr_max, B, device, dtype)
+    r_tpr_min = _to_full(r_tpr_min, rng.r_tpr_min, B, device, dtype)
+    r_tpr_max = _to_full(r_tpr_max, rng.r_tpr_max, B, device, dtype)
+    k_width   = _to_full(k_width,   rng.k_width,   B, device, dtype)
+    if r_tpr_mod_fixed is None:
+        r_tpr_mod_fixed = torch.zeros(B, device=device, dtype=dtype)
+    elif not torch.is_tensor(r_tpr_mod_fixed):
+        r_tpr_mod_fixed = torch.full((B,), float(r_tpr_mod_fixed), device=device, dtype=dtype)
+    else:
+        r_tpr_mod_fixed = r_tpr_mod_fixed.to(device=device, dtype=dtype).expand(B)
+
+    if paset_prior is None:
+        paset_prior = torch.full((B,), _mid(rng.p_aset), device=device, dtype=dtype)
+    else:
+        paset_prior = (paset_prior if torch.is_tensor(paset_prior)
+                       else torch.tensor(paset_prior)).to(device=device, dtype=dtype).expand(B)
+
+    # ---- Sanitize params (avoid NaNs/zeros) ----
+    f_hr_min = _fill_nan_with(f_hr_min, _mid(rng.f_hr_min))
+    f_hr_max = _fill_nan_with(f_hr_max, _mid(rng.f_hr_max))
+    k_width  = _fill_nan_with(k_width,  _mid(rng.k_width)).clamp_min(eps)
+    denom_hr = (f_hr_max - f_hr_min)
+    denom_hr = torch.where(torch.isnan(denom_hr), torch.full_like(denom_hr, _mid(rng.f_hr_max) - _mid(rng.f_hr_min)), denom_hr)
+    denom_hr = denom_hr.clamp_min(eps)
+
+    # ---- Presence masks ----
+    mPa = torch.isfinite(Pa)
+    mPv = torch.isfinite(Pv)
+    mHr = torch.isfinite(Hr)
+
+    # Provenance flags
+    Pa_from_HR_paset = torch.zeros(B, device=device, dtype=dtype)
+    Hr_from_Pa_paset = torch.zeros(B, device=device, dtype=dtype)
+    Pv_from_prior    = torch.zeros(B, device=device, dtype=dtype)
+    PaHr_joint_fill  = torch.zeros(B, device=device, dtype=dtype)
+    param_sanitized  = torch.zeros(B, device=device, dtype=dtype)  # set if any param was NaN
+
+    # Track if any param had NaN originally
+    any_param_nan = torch.isnan(_to_full(None, rng.f_hr_min, B, device, dtype))  # dummy False
+    any_param_nan |= torch.isnan(f_hr_min) | torch.isnan(f_hr_max) | torch.isnan(k_width)
+    param_sanitized = any_param_nan.to(dtype)
+
+    # ---- Joint fallback when BOTH Pa & Hr are missing ----
+    Pa_filled = Pa.clone()
+    Hr_filled = Hr.clone()
+
+    both_missing = (~mPa) & (~mHr)
+    if both_missing.any():
+        # Use HR prior (in Hz), infer Pa via baroreflex with paset_prior
+        hr_prior_hz = torch.full((B,), hr_prior_bpm / 60.0, device=device, dtype=dtype)
+        s0 = ((hr_prior_hz - f_hr_min) / denom_hr).clamp(eps, 1.0 - eps)
+        log_ratio = _safe_log_ratio_one_minus_over(s0)
+        Pa_filled[both_missing] = paset_prior[both_missing] - (1.0 / k_width[both_missing]) * log_ratio[both_missing]
+        Hr_filled[both_missing] = hr_prior_hz[both_missing]
+        PaHr_joint_fill[both_missing] = 1.0
+
+    # ---- One-sided fills ----
+    # If Hr present & Pa missing -> infer Pa
+    need_Pa = (~mPa) & mHr
+    if need_Pa.any():
+        s_from_HR = ((Hr_filled[need_Pa] - f_hr_min[need_Pa]) / denom_hr[need_Pa]).clamp(eps, 1.0 - eps)
+        log_ratio = _safe_log_ratio_one_minus_over(s_from_HR)
+        Pa_filled[need_Pa] = paset_prior[need_Pa] - (1.0 / k_width[need_Pa]) * log_ratio
+        Pa_from_HR_paset[need_Pa] = 1.0
+
+    # If Pa present & Hr missing -> infer Hr
+    need_Hr = mPa & (~mHr)
+    if need_Hr.any():
+        s_baro = torch.sigmoid(-k_width[need_Hr] * (Pa_filled[need_Hr] - paset_prior[need_Hr]))
+        Hr_filled[need_Hr] = f_hr_min[need_Hr] + s_baro * (f_hr_max[need_Hr] - f_hr_min[need_Hr])
+        Hr_from_Pa_paset[need_Hr] = 1.0
+
+    # ---- Pv prior if missing ----
+    Pv_filled = Pv.clone()
+    need_Pv = ~mPv
+    if need_Pv.any():
+        lo, hi = pv_minmax
+        Pv_filled[need_Pv] = torch.full_like(Pv_filled[need_Pv], pv_prior).clamp(min=lo, max=hi)
+        Pv_from_prior[need_Pv] = 1.0
+
+    # After fills, everything should be finite; enforce backstops just in case
+    Pa_filled = torch.where(torch.isfinite(Pa_filled), Pa_filled, paset_prior)  # Pa ~ paset if anything slipped
+    Hr_filled = torch.where(torch.isfinite(Hr_filled), Hr_filled, (f_hr_min + f_hr_max) * 0.5)
+    Pv_filled = torch.where(torch.isfinite(Pv_filled), Pv_filled, torch.full_like(Pv_filled, pv_prior).clamp(*pv_minmax))
+
+    # ---- Core model (same equations), all finite now ----
+    s_HR = ((Hr_filled - f_hr_min) / denom_hr).clamp(eps, 1.0 - eps)
+
+    # p_aset* that makes baro stationary at Pa_filled
+    log_ratio = _safe_log_ratio_one_minus_over(s_HR)
+    p_aset_star = Pa_filled - (1.0 / k_width) * log_ratio
+
+    # Resistances
+    delta_r = (r_tpr_max - r_tpr_min)
+    R_base = r_tpr_min + s_HR * delta_r
+
+    R_tpr_try = (R_base + r_tpr_mod_fixed)
+    R_tpr = torch.where(torch.isfinite(R_tpr_try), R_tpr_try, torch.full_like(R_tpr_try, 1.0))
+    R_tpr = R_tpr.clamp_min(eps)
+
+    # Stroke volume candidate
+    Hr_safe = Hr_filled.clamp_min(eps)
+    SV_star = (Pa_filled - Pv_filled) / (Hr_safe * R_tpr)
+
+    # Bounds and modulation adjustment
+    SV_lo, SV_hi = rng.sv
+    rmod_lo, rmod_hi = rng.r_tpr_mod
+
+    within_sv_star = (SV_star >= SV_lo) & (SV_star <= SV_hi)
+
+    SV_clipped = SV_star.clamp(min=SV_lo, max=SV_hi)
+    R_needed = (Pa_filled - Pv_filled) / (Hr_safe * SV_clipped.clamp_min(eps))
+    rmod_needed = R_needed - R_base
+    rmod_final = torch.where(within_sv_star, r_tpr_mod_fixed, rmod_needed)
+    rmod_final = rmod_final.clamp(min=rmod_lo, max=rmod_hi)
+
+    R_tpr_final = (R_base + rmod_final).clamp_min(eps)
+    SV_final = (Pa_filled - Pv_filled) / (Hr_safe * R_tpr_final)
+
+    # Consistency check
+    s_baro = torch.sigmoid(-k_width * (Pa_filled - p_aset_star))
+    consistency_error_raw = s_HR - s_baro
+    consistency_error_had_nan = ~torch.isfinite(consistency_error_raw)
+    consistency_error = _nan_to_num_like(consistency_error_raw)
+
+    # Feasibility flags
+    within_sv_bounds = (SV_final >= SV_lo) & (SV_final <= SV_hi)
+    within_rmod_bounds = (rmod_final >= rmod_lo) & (rmod_final <= rmod_hi)
+    pos_outflow = Pa_filled > Pv_filled
+    pos_resistance = R_tpr_final > 0
+    feasible = (within_sv_bounds & within_rmod_bounds & pos_outflow & pos_resistance).to(dtype)
+
+    # Optional: return HR in original units as well, if helpful
+    Hr_out = Hr_filled if hr_units.lower() == "hz" else Hr_filled * 60.0
+
+    # ---- Final NaN guards (belt & suspenders) ----
+    for t in [Pa_filled, Pv_filled, Hr_out, s_HR, p_aset_star, R_base, R_tpr_final, SV_final, rmod_final]:
+        if not torch.isfinite(t).all():
+            # Last-resort clamp if something slipped (shouldn't happen)
+            t = _nan_to_num_like(t)
+
+    return {
+        # Inputs after inference (Hr returned in same unit family as input)
+        "Pa": Pa_filled,
+        "Pv": Pv_filled,
+        "Hr": Hr_out,
+
+        # Reflex & setpoint
+        "s": s_HR,
+        "p_aset_star": p_aset_star,
+        "s_baro_at_p_aset_star": s_baro,
+        "consistency_error": consistency_error,
+        "consistency_error_had_nan": consistency_error_had_nan.to(dtype),
+
+        # Resistances & flows
+        "R_base": R_base,
+        "R_tpr": R_tpr_final,
+        "SV": SV_final,
+        "r_tpr_mod": rmod_final,
+
+        # Bounds & status (as tensors for convenience)
+        "sv_bounds": torch.tensor(rng.sv, device=device, dtype=dtype),
+        "r_tpr_mod_bounds": torch.tensor(rng.r_tpr_mod, device=device, dtype=dtype),
+        "within_sv_bounds": within_sv_bounds.to(dtype),
+        "within_rmod_bounds": within_rmod_bounds.to(dtype),
+        "pos_outflow": pos_outflow.to(dtype),
+        "feasible": feasible,
+
+        # Provenance flags
+        "Pa_inferred_from_HR_paset": Pa_from_HR_paset,
+        "Hr_inferred_from_Pa_paset": Hr_from_Pa_paset,
+        "Pv_from_prior": Pv_from_prior,
+        "PaHr_joint_fill": PaHr_joint_fill,
+        "param_sanitized": param_sanitized,
+    }

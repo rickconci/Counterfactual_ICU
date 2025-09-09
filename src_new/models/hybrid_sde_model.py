@@ -6,6 +6,7 @@ import typing as t
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 import torch
 import torchsde
@@ -19,6 +20,7 @@ from ZenkerModel import ZenkerODE
 import torch.nn.functional as F
 
 import torch.utils.checkpoint as checkpoint
+import logging
 
 # Add the project root and utils directory to Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -26,7 +28,18 @@ utils_path = os.path.join(project_root, "src_new", "utils")
 sys.path.insert(0, project_root)
 sys.path.insert(0, utils_path)
 
-from src_new.utils.train_utils import zenker_derivatives
+from src_new.utils.train_utils import (
+    zenker_derivatives, 
+    compute_stable_equilibrium_batch, 
+    denormalize_selected_from_batched_sample, 
+    _normalize_label, 
+    _build_full_state_from_equilibrium, 
+    _dict_to_PhysioRanges,
+    _midpoint_pair,
+    _EXPERT_ORDER,
+    _pick_ic_or_fallback
+)
+
 from src_new.utils.utils_beta import (
     CV_params,
     CV_params_divisors,
@@ -49,7 +62,7 @@ AUTO_DEBUG_ACTIVATED = False
 
 
 def activate_auto_debug_mode(model_instance, location: str, tensor_name: str, tensor_value=None):
-    """Activate global debug mode and log comprehensive state information."""
+    """Handle NaN/Inf detection based on configuration."""
     global AUTO_DEBUG_ACTIVATED, DEBUG
     
     if not AUTO_DEBUG_ACTIVATED:
@@ -57,13 +70,17 @@ def activate_auto_debug_mode(model_instance, location: str, tensor_name: str, te
         DEBUG = True
         model_instance.debug = True
         
+        # Get debug behavior from model instance or default to "kill"
+        debug_behavior = getattr(model_instance, 'debug_on_nan_inf', 'kill')
+        
         print("\n" + "="*80)
-        print("🚨 AUTO-DEBUG MODE ACTIVATED 🚨")
+        print("🚨 NaN/Inf DETECTED 🚨")
         print("="*80)
         print(f"Location: {location}")
         print(f"Tensor: {tensor_name}")
         print(f"Global step: {getattr(model_instance, 'global_step', 'unknown')}")
         print(f"Current epoch: {getattr(model_instance, 'current_epoch', 'unknown')}")
+        print(f"Debug behavior: {debug_behavior}")
         print("="*80)
         
         # Log tensor statistics if provided
@@ -142,10 +159,73 @@ def activate_auto_debug_mode(model_instance, location: str, tensor_name: str, te
         except Exception as e:
             print(f"Could not print trajectories: {e}")
         
-        print("="*80 + "\n")
+        print("="*80)
         
-        # Set breakpoint for debugging
-        import pdb; pdb.set_trace()
+        # Handle different debug behaviors
+        if debug_behavior == "kill":
+            print("💀 EXITING FOR SWEEP CONTINUATION 💀")
+            print("="*80 + "\n")
+            
+            # Clean exit strategy to avoid NFS issues
+            try:
+                # Try to cleanup any open files/resources gracefully
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
+                
+                # Close any open matplotlib figures
+                try:
+                    import matplotlib.pyplot as plt
+                    plt.close('all')
+                except:
+                    pass
+                
+                # Try to flush any pending I/O
+                try:
+                    import sys
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                except:
+                    pass
+                
+                # Use sys.exit instead of os._exit for cleaner shutdown
+                import sys
+                sys.exit(1)
+            except Exception:
+                # If graceful exit fails, force exit
+                import os
+                os._exit(1)
+        elif debug_behavior == "debug":
+            # Avoid blocking if stdout is redirected or no TTY is available
+            import sys
+            has_tty = hasattr(sys, "stdin") and sys.stdin is not None and sys.stdin.isatty()
+            if getattr(model_instance, "redirect_output", False) or not has_tty:
+                print("[AUTO-DEBUG] No TTY or output redirected; raising instead of entering pdb.")
+                raise RuntimeError(f"NaN/Inf detected in {tensor_name} at {location} (non-interactive environment)")
+            print("🔧 ENTERING INTERACTIVE DEBUG MODE 🔧")
+            print("="*80 + "\n")
+            # Set up debug mode - the model will continue with debug prints
+            model_instance.debug = True
+            DEBUG = True
+            
+            # Enter interactive debug mode
+            import pdb
+            pdb.set_trace()
+        elif debug_behavior == "raise":
+            print("⚠️  RAISING EXCEPTION ⚠️")
+            print("="*80 + "\n")
+            # Raise a custom exception
+            raise RuntimeError(f"NaN/Inf detected in {tensor_name} at {location}")
+        else:
+            print(f"❌ UNKNOWN DEBUG BEHAVIOR: {debug_behavior} ❌")
+            print("="*80 + "\n")
+            # Default to kill mode
+            import sys
+            sys.exit(1)
 
 
 def check_for_nan_inf(tensor, name: str, location: str, model_instance=None, raise_error: bool = True):
@@ -310,7 +390,9 @@ class Hybrid_SDE(LightningModule):
         force_zenker_defaults,
         plot_control_samples,
         plot_include_burn_in=True,
+        debug_on_nan_inf="kill",
         id_to_combo_map=None,
+        redirect_output=False,
         **kwargs,
     ):
         super().__init__()
@@ -403,6 +485,8 @@ class Hybrid_SDE(LightningModule):
         self.force_zenker_defaults = force_zenker_defaults
         self.plot_control_samples = plot_control_samples
         self.plot_include_burn_in = bool(plot_include_burn_in)
+        self.debug_on_nan_inf = debug_on_nan_inf
+        self.redirect_output = bool(redirect_output)
 
         self.noise_type = "diagonal"  # required
         self.sde_type = "ito"  # required
@@ -604,6 +688,22 @@ class Hybrid_SDE(LightningModule):
         # Blend between pure low-pass derivative and raw control derivative
         # 1.0 -> pure low-pass du=(u_hat-u)/tau; 0.0 -> raw du=u_hat (interpreted as direct derivative)
         self.control_lowpass_blend = 0.1
+        # Base control scales for adaptive ramp (configurable)
+        try:
+            base_scales_cfg = kwargs.get("base_control_scales", None)
+            if base_scales_cfg is None:
+                # Default per original: [1, 1, 0.1, 0.1]
+                base_scales_list = [1.0, 1.0, 0.1, 0.1]
+            else:
+                base_scales_list = [float(x) for x in list(base_scales_cfg)]
+        except Exception:
+            base_scales_list = [1.0, 1.0, 0.1, 0.1]
+        base_scales_tensor = torch.tensor(base_scales_list, dtype=torch.float32)
+        # Align base scales to current number of control heads
+        if base_scales_tensor.numel() != self.SDEnet_out_dims:
+            repeats = (self.SDEnet_out_dims + base_scales_tensor.numel() - 1) // base_scales_tensor.numel()
+            base_scales_tensor = base_scales_tensor.repeat(repeats)[: self.SDEnet_out_dims]
+        self.register_buffer("base_control_scales", base_scales_tensor)
         # Ratio cap for diffusion vs. drift scaling on controls (sigma <= ratio * weight)
         try:
             self.control_sigma_ratio = float(kwargs.get("control_sigma_ratio", 0.1))
@@ -615,11 +715,8 @@ class Hybrid_SDE(LightningModule):
         except Exception:
             self.max_plotted_patients = 4
 
-        net_input_dims = (
-            self.encoder_output_dim
-            if SDE_input_state == "full"
-            else self.encoder_output_dim - len(encoder_input_dim)
-        )
+        # Base network input dims start from encoder output dims
+        net_input_dims = self.encoder_output_dim
         net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         # Medication embedding config (project variable med context dims -> fixed size)
@@ -844,6 +941,13 @@ class Hybrid_SDE(LightningModule):
             "tau": (15, 25),
         }
 
+        self.indx_interest = {'Heart rate': 0, 'Arterial BP Mean': 6, 'CVP': 8}
+        self.df_ranges = df_ranges = pd.DataFrame({
+            'item_label': ['Heart rate', 'Arterial BP Mean', 'CVP'],
+            'lower_bound': [33.9, 26.7, -5.2],
+            'upper_bound': [142.8, 134.5, 28.7],
+        }) 
+
         # In __init__, add these parameters (you'll need to pass them as arguments):
         self.first_two_normalization_mu = torch.tensor(
             [78.937, 8.505], dtype=torch.float32
@@ -940,7 +1044,7 @@ class Hybrid_SDE(LightningModule):
             # Keep a scalar for debug logging purposes
             self.log_lik_output_scale = float(self.hparams.log_lik_output_scale)
         elif self.hparams.log_lik_scale_mode == "annealing":
-            anneal_start_val = 10.0
+            anneal_start_val = 3.0
             anneal_end_val = float(self.hparams.log_lik_output_scale)
             self.scale_scheduler = LinearScheduler(
                 iters=self.hparams.anneal_iters, startval=anneal_start_val, endval=anneal_end_val, start=0
@@ -1061,10 +1165,10 @@ class Hybrid_SDE(LightningModule):
 
     def get_adaptive_control_scales(self, current_step):
         """Gradually increase control authority as training progresses"""
-        base_scales = torch.tensor([1, 1, 0.1, 0.1], dtype=torch.float32)
+        base_scales = self.base_control_scales
 
         # Start with 1% control authority, ramp up to 100% over 1000 steps
-        ramp_progress = min(current_step / 50.0, 1.0)
+        ramp_progress = min(current_step / 150.0, 1.0)
         scale_multiplier = 0.01 + 0.99 * ramp_progress
 
         return base_scales * scale_multiplier
@@ -1291,12 +1395,12 @@ class Hybrid_SDE(LightningModule):
             raise RuntimeError("Non-finite values in med_context. Auto-debug mode activated.")
         
         if self.debug:
-            try:
-                print(
-                    f"  [DBG] med_tensor:{med_tensor.shape} {med_tensor[0,:]}"
-                )
-            except Exception:
-                pass
+            
+            pass
+                #print(
+                #)
+                ##    f"  [DBG] med_tensor:{med_tensor.shape} {med_tensor[0,:]}"
+            
 
         # If GAT controller is selected, build node-wise features and branch here
         if (
@@ -1411,9 +1515,9 @@ class Hybrid_SDE(LightningModule):
                 print(
                     f"  [DBG] SDE_NN_input: shape={tuple(SDE_NN_input.shape)} mean={SDE_NN_input.mean().item():.4e} std={SDE_NN_input.std().item():.4e} min={SDE_NN_input.min().item():.4e} max={SDE_NN_input.max().item():.4e}"
                 )
-                print(
-                    f"  [DBG] SDE_NN_input[0, :]:{SDE_NN_input[0, :]}"
-                )
+                #print(
+                #    f"  [DBG] SDE_NN_input[0, :]:{SDE_NN_input[0, :]}"
+                #)
             except Exception:
                 pass
 
@@ -1873,52 +1977,6 @@ class Hybrid_SDE(LightningModule):
         
         return g_out
 
-    def _prepare_no_encoder_initial_state(self, init_states, ic_mask):
-        """
-        Prepares safe initial conditions for the no-encoder case.
-        - For first 5 IC values: use init_states if ic_mask=1, else sample from physio bounds
-        - For remaining positions (6-14): always sample from physio bounds
-        """
-        batch_size = init_states.shape[0]
-        num_ic_vars = init_states.shape[-1]  # Should be 5
-
-        # Initialize tensor for all 14 expert variables
-        safe_expert_states = torch.zeros(
-            batch_size, self.expert_latent_dims, device=init_states.device
-        )
-
-        # Use midpoint of physiological ranges for all positions
-        # Calculate midpoint between min and max for each variable
-        first_two_means = self.first_two_normalization_mu.to(init_states.device)
-        remaining_midpoints = self.physio_min_vals[2:] + 0.5 * (
-            self.physio_max_vals[2:] - self.physio_min_vals[2:]
-        )
-        midpoint_states = torch.cat([first_two_means, remaining_midpoints])
-        sampled_states = midpoint_states.unsqueeze(0).repeat(batch_size, 1)
-
-        # Start with sampled values for all positions
-        safe_expert_states = sampled_states
-
-        # For the first num_ic_vars (should be 5), use actual values where ic_mask=1
-        for i in range(min(num_ic_vars, self.expert_latent_dims)):
-            safe_expert_states[:, i] = torch.where(
-                ic_mask[:, i] == 1,
-                init_states[:, i],  # Use actual measured value
-                safe_expert_states[:, i],  # Keep sampled value
-            )
-
-        if self.debug:
-            print("[DEBUG] _prepare_no_encoder_initial_state:")
-            print(f"  batch_size: {batch_size}")
-            print(f"  safe_expert_states shape: {safe_expert_states.shape}")
-            print(
-                f"  Used actual IC values: {ic_mask.sum().item()}/{ic_mask.numel()} positions"
-            )
-            print(f"  Sample values for patient 0: {safe_expert_states[0, :5]}")
-            print(f"  Physio bounds - min: {self.physio_min_vals[:5]}")
-            print(f"  Physio bounds - max: {self.physio_max_vals[:5]}")
-
-        return safe_expert_states
 
     def prior_diext_dt(self, t):
         factor = -2 * (t - 5) / 5
@@ -2090,6 +2148,13 @@ class Hybrid_SDE(LightningModule):
             )  # 18 = i_ext (2) + init_latents (14) + 1 each for rest
         # print(f"Aug_y0: {aug_y0[0]}")
         # breakpoint()
+
+        # Final sanitization to prevent numerical issues in SDE solver
+        try:
+            aug_y0 = torch.nan_to_num(aug_y0, nan=0.0, posinf=1e6, neginf=-1e6)
+            aug_y0 = torch.clamp(aug_y0, -1e6, 1e6)
+        except Exception:
+            pass
 
         # Reshape for SDE integration
         aug_y0 = aug_y0.reshape(-1, dim_aug)
@@ -2428,90 +2493,132 @@ class Hybrid_SDE(LightningModule):
         return mse_cf, mse_ite, std_preds_cf
 
     def _prepare_encoder_input(self, X, init_states):
-        """Prepares the input for the `forward_enc` method based on whether an encoder is used."""
-        if self.use_encoder != "none":
-            # When using an encoder, provide only the observable variables.
-            # The encoder will infer the full latent state.
-            X_for_encoder = select_tensor_by_index_list_advanced(X, [0, 1, 2, 3])
-        else:
-            # When not using an encoder, we manually construct the initial latent state.
-            # This state must match the dimensions expected by the SDE dynamics.
-            # It consists of the control signal (i_ext, starts at 0) and the expert variables.
-            batch_size = X.shape[0]
-            zeros_for_i_ext = torch.zeros(
-                batch_size, self.SDEnet_out_dims, device=self.device
-            )
-            expert_inits = init_states[:, : self.expert_latent_dims]
-            X_for_encoder = torch.cat([zeros_for_i_ext, expert_inits], dim=1)
+        """Deprecated: encoder directly consumes Raindrop sources; kept for API compat."""
+        return X
 
-        if self.debug:
-            print(
-                f"[DEBUG] _prepare_encoder_input: use_encoder='{self.use_encoder}', output_shape={X_for_encoder.shape}"
-            )
+    def _prepare_no_encoder_initial_state(self, init_states, ic_mask):
+        """Deprecated: replaced by analytical ICs from chartevents + equilibrium."""
+        return init_states
 
-        return X_for_encoder
 
     def _prepare_sde_initial_state(
         self, predicted_ode_latents, neural_embedding, init_states, ic_mask
     ):
+        """Deprecated: replaced by analytical ICs + fusion with neural embedding."""
+        return torch.cat([init_states.unsqueeze(1).repeat(1, self.num_samples, 1), neural_embedding], dim=-1)
+
+    
+    def _extract_physio_from_chartevents(self, cd_rd_src, df_ranges, indx_interest, group_col='item_label'):
         """
-        Prepares the initial state for the SDE by combining the interpolated initial
-        conditions with the encoder's two-headed output.
+        Uses your existing `denormalize_selected_from_batched_sample` to get original-scale values.
+        Returns dict {normalized_label: [B] tensor}.
         """
-        # Number of variables provided by the IC tensor
-        num_ic_vars = init_states.shape[-1]
+        original_values, _, _, _, _, _, _, _ = denormalize_selected_from_batched_sample(
+            cd_rd_src, df_ranges, indx_interest, group_col=group_col, use_mask=True, clip=True
+        )
+        labels = list(indx_interest.keys())
+        norm_labels = [_normalize_label(l) for l in labels]
+        return {nl: original_values[:, i] for i, nl in enumerate(norm_labels)}
 
-        # Part 1: Take the accurate interpolated values
-        init_states_expanded = init_states.unsqueeze(1).repeat(1, self.num_samples, 1)
-        if self.debug:
-            print(
-                f"Interpolated part dims: {init_states_expanded.shape}. Expect: [23 x 7 x 5]"
-            )
+    def _compute_full_analytical_zenker_initial_conditions(
+        self,
+        cd_rd_src,                 # [B, T, 2*d_inp] (values then mask)
+        init_states: torch.Tensor, # [B, 5], IC[:,0]=ABP mean (Pa), IC[:,1]=CVP (Pv), IC[:,2]=Hr (if present)
+        ic_mask: torch.Tensor,     # [B, 5], 1 if IC entry present
+    ) -> torch.Tensor:
+        """
+        Return [B, L] with L=len(_EXPERT_ORDER)=14 in the fixed order _EXPERT_ORDER.
+        Policy:
+        - Pa := IC[:,0] if present else Arterial BP from chartevents
+        - Pv := IC[:,1] if present else CVP from chartevents
+        - Hr := IC[:,2] if present else Heart Rate from chartevents
+        - Remaining parameters set to midpoints of self.physio_ranges
+        - p_aset, s_reflex, r_tpr_mod, SV come from the equilibrium solution
+        """
+        if getattr(self, "debug", False):
+            try:
+                print("[DEBUG] _compute_full_analytical_zenker_initial_conditions: start")
+                cd_shape = tuple(cd_rd_src.shape) if hasattr(cd_rd_src, "shape") else "NA"
+                ic_shape = tuple(init_states.shape) if hasattr(init_states, "shape") else "NA"
+                mask_shape = tuple(ic_mask.shape) if hasattr(ic_mask, "shape") else "NA"
+                print(f"  cd_rd_src shape={cd_shape}  init_states shape={ic_shape}  ic_mask shape={mask_shape}")
+                print(f"  physio_ranges keys: {list(self.physio_ranges.keys())[:8]} ... ({len(self.physio_ranges)})")
+                try:
+                    print(f"  indx_interest size={len(self.indx_interest)} sample keys={list(self.indx_interest.keys())[:8]}")
+                except Exception:
+                    print("  indx_interest: <unavailable or not a mapping>")
+            except Exception as e:
+                print(f"[WARN] Debug print failed at start: {e}")
+        # 1) denormalized fallbacks from chartevents
+        ce_vals = self._extract_physio_from_chartevents(
+            cd_rd_src, self.df_ranges, self.indx_interest, group_col='item_label'
+        )
+        #print('ce_vals:', ce_vals)
 
-        ic_mask_expanded = ic_mask.unsqueeze(1).repeat(1, self.num_samples, 1)
+        if getattr(self, "debug", False):
+            try:
+                ce_keys = list(ce_vals.keys())
+                print(f"  ce_vals keys (normalized) sample: {ce_keys[:8]} total={len(ce_keys)}")
+            except Exception as e:
+                print(f"[WARN] Debug print failed on ce_vals: {e}")
+        
+        
+        
+        # Prefer the exact key used in indx_interest ('Arterial BP Mean'),
+        # but fall back to 'Arterial BP' if present
+        pa_key = _normalize_label('Arterial BP Mean')
+        Pa_ce  = ce_vals[pa_key]  # [B]
+        Pv_ce  = ce_vals[_normalize_label('CVP')]          # [B]
+        # handle either "Heart Rate" or "Heart_rate"
+        hr_key = _normalize_label('Heart Rate')
+        Hr_ce  = ce_vals[hr_key]
+        if getattr(self, "debug", False):
+            try:
+                print(f"  chosen keys -> Pa:{pa_key} Pv:{_normalize_label('CVP')} Hr:{hr_key}")
+            except Exception:
+                pass
 
-        # For the first num_ic_vars variables, use mask to choose between actual and inferred
-        expert_part_1 = torch.where(
-            ic_mask_expanded == 1,
-            init_states_expanded,
-            predicted_ode_latents[:, :, :num_ic_vars],
+        B = Pa_ce.shape[0]
+        device = Pa_ce.device
+        dtype = Pa_ce.dtype
+     
+        # 2) prefer IC for Pa, Pv; always use chartevents for Hr
+        Pa = _pick_ic_or_fallback(init_states[:, 0].to(device=device, dtype=dtype),
+                                ic_mask[:, 0].to(device=device),
+                                Pa_ce)
+        Pv = _pick_ic_or_fallback(init_states[:, 1].to(device=device, dtype=dtype),
+                                ic_mask[:, 1].to(device=device),
+                                Pv_ce)
+        Hr = Hr_ce
+
+        #print('pre-sanitize:')
+        #print('Pa:', Pa)
+        #print('Pv:', Pv)
+        #print('Hr:', Hr)
+
+        # 3) equilibrium (vectorized)
+        eq = compute_stable_equilibrium_batch(
+            Pa, Pv, Hr,
+            ranges=_dict_to_PhysioRanges(self.physio_ranges), hr_units="bpm"
+        )
+        print('consistency_error:', eq['consistency_error'])
+
+        # 4) assemble full [B, L] in fixed order
+        expert_state = _build_full_state_from_equilibrium(
+            Pa, Pv, Hr, eq, self.physio_ranges, device, dtype
         )
 
-        # For remaining ODE variables, always use inferred values
-        expert_part_2 = predicted_ode_latents[:, :, num_ic_vars:]
+        if getattr(self, "debug", False):
+            print("[DEBUG] _compute_full_analytical_zenker_initial_conditions")
+            print(f"  expert_state: {expert_state.shape}  (B={B}, L={expert_state.shape[1]})")
+            print(f"  first row (subset): {expert_state[0, :]}")
+            try:
+                print(f"  _EXPERT_ORDER length: {len(_EXPERT_ORDER)}")
+            except Exception:
+                pass
 
-        # Combine all expert variables
-        expert_part = torch.cat([expert_part_1, expert_part_2], dim=-1)
-
-        # By fiat, we replace the inferred ODE vals with the actual init states
-        # Part 2: Take the inferred values for the remaining ODE variables from the specific head
-        # inferred_part = predicted_ode_latents[:, :, num_ic_vars:]
-
-        # Part 3: The separate neural embedding
-        neural_part = neural_embedding
-
-        # Concatenate to form the full initial state for the SDE.
-        # Note: The neural part comes *after* the expert ODE part.
-        # expert_part = torch.cat([expert_part, inferred_part], dim=-1)
-        z1_for_sde = torch.cat([expert_part, neural_part], dim=-1)
-
-        if self.debug:
-            print(f"Z1 for SDE dim: {z1_for_sde.shape}. Expect: [23 x 7 x 18]")
-
-        if self.debug:
-            print(
-                f"  final z1_for_sde shape: {z1_for_sde.shape}, snippet:\n{z1_for_sde[0, 0, :6]}"
-            )
-
-        if torch.isnan(z1_for_sde).any() or torch.isinf(z1_for_sde).any():
-            nan_cnt = int(torch.isnan(z1_for_sde).sum().item())
-            inf_cnt = int(torch.isinf(z1_for_sde).sum().item())
-            activate_auto_debug_mode(self, "_prepare_sde_initial_state", "z1_for_sde", z1_for_sde)
-            raise RuntimeError(
-                f"Non-finite values in final z1_for_sde: NaN={nan_cnt}, Inf={inf_cnt}. Auto-debug mode activated."
-            )
-
-        return z1_for_sde
+        return expert_state
+            
 
     def common_step(self, batch, batch_idx):
         if self.debug and batch_idx == 0:
@@ -2608,27 +2715,54 @@ class Hybrid_SDE(LightningModule):
             # --- End Legacy Path ---
 
             # --- New Path ---
-            # The initial state for the SDE includes expert variables and the neural embedding.
-            initial_condition = self._prepare_no_encoder_initial_state(
-                init_states, ic_mask
-            )  # [B, expert_latent_dims]
+            # Build expert initial state analytically from chartevents + IC, then fuse with neural embedding.
+            expert_state = self._compute_full_analytical_zenker_initial_conditions(
+                ce_rd_src, init_states, ic_mask
+            )  # [B, 14]
             neural_embedding_expanded = neural_embedding.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, D_neural]
-            expert_init_expanded = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, 14]
+            expert_init_expanded = expert_state.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, 14]
             z1_for_sde = torch.cat([expert_init_expanded, neural_embedding_expanded], dim=-1)  # [B, S, 14 + D_neural]
+            # Sanitize initial latents: clamp expert latents and normalize/clamp neural embedding
+            try:
+                expert_part = z1_for_sde[..., : self.expert_latent_dims]
+                neural_part = z1_for_sde[..., self.expert_latent_dims :]
+                expert_part = torch.clamp(expert_part, min=self.physio_min_vals, max=self.physio_max_vals)
+                if neural_part.numel() > 0:
+                    try:
+                        neural_part = F.layer_norm(neural_part, neural_part.shape[-1:])
+                    except Exception:
+                        pass
+                    neural_part = torch.clamp(neural_part, -50.0, 150.0)
+                z1_for_sde = torch.cat([expert_part, neural_part], dim=-1)
+            except Exception:
+                pass
 
-            # IC consistency loss is no longer applicable in this architecture.
             ic_consistency_loss = torch.tensor(0.0, device=self.device)
             # === ARCHITECTURE CHANGE: END ===
             
         else: # No encoder path
-            # When no encoder is used, include zeros neural embedding in the initial state for consistency.
+            # When no encoder is used, fuse analytical expert state with a zero neural embedding.
             neural_embedding = torch.zeros(batch_size, self.encoder_SDENN_dims, device=self.device)
-            initial_condition = self._prepare_no_encoder_initial_state(
-                init_states, ic_mask
-            )  # [B, expert_latent_dims]
+            expert_state = self._compute_full_analytical_zenker_initial_conditions(
+                ce_rd_src, init_states, ic_mask
+            )  # [B, 14]
             neural_embedding_expanded = neural_embedding.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, D_neural]
-            expert_init_expanded = initial_condition.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, 14]
+            expert_init_expanded = expert_state.unsqueeze(1).repeat(1, self.num_samples, 1)  # [B, S, 14]
             z1_for_sde = torch.cat([expert_init_expanded, neural_embedding_expanded], dim=-1)  # [B, S, 14 + D_neural]
+            # Sanitize initial latents: clamp expert latents and normalize/clamp neural embedding
+            try:
+                expert_part = z1_for_sde[..., : self.expert_latent_dims]
+                neural_part = z1_for_sde[..., self.expert_latent_dims :]
+                expert_part = torch.clamp(expert_part, min=self.physio_min_vals, max=self.physio_max_vals)
+                if neural_part.numel() > 0:
+                    try:
+                        neural_part = F.layer_norm(neural_part, neural_part.shape[-1:])
+                    except Exception:
+                        pass
+                    neural_part = torch.clamp(neural_part, -50.0, 150.0)
+                z1_for_sde = torch.cat([expert_part, neural_part], dim=-1)
+            except Exception:
+                pass
             logqp0 = 0
             ic_consistency_loss = torch.tensor(0.0, device=self.device)
 
@@ -2651,7 +2785,7 @@ class Hybrid_SDE(LightningModule):
             med_traj_mask=med_trajectory_mask,
             med_traj_time=med_trajectory_time,
         )
-
+        decoded_traj = self.forward_dec(latent_traj)
         try:
             self._debug_predicted_traj = decoded_traj.detach().clone()
             self._debug_true_traj = Y.detach().clone()
@@ -2660,8 +2794,6 @@ class Hybrid_SDE(LightningModule):
         except Exception as e:
             if self.debug:
                 print(f"[WARN] Failed to store debug trajectories: {e}")
-
-        decoded_traj = self.forward_dec(latent_traj)
         # Mask for loss computation (already respects valid lengths)
         combined_mask = Y_mask
         if self.debug:
@@ -2697,9 +2829,9 @@ class Hybrid_SDE(LightningModule):
                         try:
                             # tv_loss should be available from the computation above
                             self.log("train_tv_loss", tv_loss.detach(), on_step=True, on_epoch=True, prog_bar=False,
-                                     logger=True)
+                                     logger=True, sync_dist=True)
                             self.log("train_tv_contribution", self.control_tv_weight * tv_loss.detach(), on_step=True,
-                                     on_epoch=True, prog_bar=False, logger=True)
+                                     on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
                         except:
                             pass
                     total_loss = total_loss + self.control_tv_weight * tv_loss
@@ -2816,10 +2948,16 @@ class Hybrid_SDE(LightningModule):
             step = int(getattr(self, "global_step", 0))
             interval = max(1, int(getattr(self, "plot_every", 1)))
             should_plot_now = (step % interval) == 0
-        except Exception:
+            if self.debug:
+                print(f"[DEBUG] Plotting check: step={step}, interval={interval}, should_plot_now={should_plot_now}, plot_outputs_train={self.plot_outputs_train}")
+        except Exception as e:
             should_plot_now = self.plot_outputs_train
+            if self.debug:
+                print(f"[DEBUG] Plotting check failed: {e}, using plot_outputs_train={self.plot_outputs_train}")
 
-        if self.plot_outputs_train and should_plot_now:
+        if self.plot_outputs_train and should_plot_now and self._is_rank_zero():
+            if self.debug:
+                print(f"[DEBUG] Generating control plots at step {getattr(self, 'global_step', 'unknown')} (rank 0 only)")
             try:
                 self.plot_nature_with_controls(
                     result["decoded_traj"],
@@ -2832,9 +2970,13 @@ class Hybrid_SDE(LightningModule):
                     result.get("latent_traj"),
                     result.get("med_combo_ids")
                 )
+                if self.debug:
+                    print(f"[DEBUG] Control plots generated successfully")
             except Exception as e:
                 if self.debug:
                     print(f"[WARN] Training control plot failed: {e}")
+                    import traceback
+                    print(f"[WARN] Full traceback: {traceback.format_exc()}")
 
         # Disabled CSV exporting for speed as requested
 
@@ -2846,6 +2988,7 @@ class Hybrid_SDE(LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
+            sync_dist=True,
         )
         self.log(
             "train_control_energy",
@@ -2854,6 +2997,7 @@ class Hybrid_SDE(LightningModule):
             on_epoch=True,
             prog_bar=False,
             logger=True,
+            sync_dist=True,
         )
         self.log(
             "train_main_loss",
@@ -2862,6 +3006,7 @@ class Hybrid_SDE(LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
+            sync_dist=True,
         )
         self.log(
             "train_ic_consistency_loss",
@@ -2870,12 +3015,13 @@ class Hybrid_SDE(LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
+            sync_dist=True,
         )
         self.log(
-            f"train_{self.loss_type}", recon_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
+            f"train_{self.loss_type}", recon_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
         )
         self.log(
-            "train_KL", kl_div, on_step=True, on_epoch=True, prog_bar=True, logger=True
+            "train_KL", kl_div, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
         )
 
         # Log optimizer learning rate (first param group) and SDEnet Frobenius norm of weights
@@ -2921,6 +3067,7 @@ class Hybrid_SDE(LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
+            sync_dist=True,
         )
         self.log(
             "val_main_loss",
@@ -2929,6 +3076,7 @@ class Hybrid_SDE(LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
+            sync_dist=True,
         )
         self.log(
             "val_ic_consistency_loss",
@@ -2937,6 +3085,7 @@ class Hybrid_SDE(LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
+            sync_dist=True,
         )
         self.log(
             f"val_{self.loss_type}",
@@ -2945,6 +3094,7 @@ class Hybrid_SDE(LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
+            sync_dist=True,
         )
         self.log(
             "val_KL",
@@ -2953,6 +3103,7 @@ class Hybrid_SDE(LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
+            sync_dist=True,
         )
 
         # Store per-combo losses for epoch-end analysis
@@ -2985,12 +3136,12 @@ class Hybrid_SDE(LightningModule):
         suffix = "_all" if dataloader_idx == 0 else "_filtered"
 
         # Log with dataset-specific names
-        self.log(f"test_total_loss{suffix}", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log(f"test_main_loss{suffix}", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"test_total_loss{suffix}", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log(f"test_main_loss{suffix}", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log(f"test_ic_consistency_loss{suffix}", result["ic_consistency_loss"], on_step=False, on_epoch=True,
-                 prog_bar=True, logger=True)
-        self.log(f"test_{self.loss_type}{suffix}", result["recon_loss"], on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log(f"test_KL{suffix}", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                 prog_bar=True, logger=True, sync_dist=True)
+        self.log(f"test_{self.loss_type}{suffix}", result["recon_loss"], on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log(f"test_KL{suffix}", kl_div, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
 
         # Compute additional test metrics
@@ -3005,8 +3156,8 @@ class Hybrid_SDE(LightningModule):
             valid_elements = combined_mask.sum()
             valid_mse = mse_per_sample.sum() / valid_elements
             valid_mae = mae_per_sample.sum() / valid_elements
-            self.log(f"test_mse{suffix}", valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log(f"test_mae{suffix}", valid_mae, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"test_mse{suffix}", valid_mse, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+            self.log(f"test_mae{suffix}", valid_mae, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
             if self.test_zenker:
                 zenker_predictions = torch.zeros_like(Y)
@@ -3059,10 +3210,10 @@ class Hybrid_SDE(LightningModule):
                 zenker_mae = zenker_mae_per_sample.sum() / valid_elements
 
                 self.log(f"test_zenker_mse{suffix}", zenker_mse, on_step=False, on_epoch=True, prog_bar=True,
-                         logger=True)
+                         logger=True, sync_dist=True)
                 self.log(f"test_zenker_mae{suffix}", zenker_mae, on_step=False, on_epoch=True, prog_bar=True,
-                         logger=True)
-        if batch_idx < 3:
+                         logger=True, sync_dist=True)
+        if batch_idx < 3 and self._is_rank_zero():
             self.plot_nature_style_with_uncertainty(
                 decoded_traj, Y, combined_mask, batch_idx, suffix, result["med_combo_ids"]
             )
@@ -3214,6 +3365,19 @@ class Hybrid_SDE(LightningModule):
                     print(f"{row[0]:<15} {row[1]:<18} {row[2]:<18} {row[3]}")
             print("=" * 60)
 
+    def _is_rank_zero(self):
+        """Check if this is the main process (rank 0) in DDP training."""
+        try:
+            if hasattr(self, 'trainer') and self.trainer is not None:
+                rank = self.trainer.global_rank
+                if self.debug:
+                    print(f"[DEBUG] DDP rank check: global_rank={rank}, is_rank_zero={rank == 0}")
+                return rank == 0
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG] DDP rank check failed: {e}, defaulting to rank 0")
+        return True  # Fallback to True if we can't determine rank
+    
     def _setup_plot_style(self):
         """Shared plotting style configuration"""
         plt.rcParams.update(
@@ -3421,8 +3585,17 @@ class Hybrid_SDE(LightningModule):
     ):
         """Plot BP + controls with detailed control analysis (Zenker baseline removed)."""
 
+        if self.debug:
+            print(f"[DEBUG] plot_nature_with_controls called with shapes: pred={predictions_full.shape}, targets={targets.shape}, mask={combined_mask.shape}")
+            print(f"[DEBUG] i_ext_path shape: {i_ext_path.shape if i_ext_path is not None else 'None'}")
+            print(f"[DEBUG] train_dir: {self.train_dir}")
+
         colors = self._setup_plot_style()  # Use same style
-        os.makedirs(os.path.join(self.train_dir, "control_plots"), exist_ok=True)
+        control_plots_dir = os.path.join(self.train_dir, "control_plots")
+        os.makedirs(control_plots_dir, exist_ok=True)
+        
+        if self.debug:
+            print(f"[DEBUG] Created control_plots directory: {control_plots_dir}")
 
         # Optionally skip burn-in period for plotting
         dt = 10  # Time step in seconds between trajectory points
@@ -3437,9 +3610,12 @@ class Hybrid_SDE(LightningModule):
 
         try:
             import matplotlib.pyplot as plt
-
             plt.switch_backend("Agg")
-        except Exception:
+            if self.debug:
+                print(f"[DEBUG] Matplotlib backend set to Agg")
+        except Exception as e:
+            if self.debug:
+                print(f"[WARN] Failed to set matplotlib backend: {e}")
             pass
 
         pred_mean = predictions_full.mean(1).detach()
@@ -3463,9 +3639,18 @@ class Hybrid_SDE(LightningModule):
 
         # Only allow rank 0 to write plots (avoid DDP duplicates)
         if getattr(self, 'trainer', None) is not None and not self.trainer.is_global_zero:
+            if self.debug:
+                print(f"[DEBUG] Skipping plot generation - not global zero rank")
             return
 
-        for patient_idx in range(min(self.max_plotted_patients, predictions_full.shape[0])):
+        num_patients = min(self.max_plotted_patients, predictions_full.shape[0])
+        if self.debug:
+            print(f"[DEBUG] Starting control plot generation for {num_patients} patients")
+
+        for patient_idx in range(num_patients):
+            if self.debug:
+                print(f"[DEBUG] Processing patient {patient_idx}/{num_patients}")
+            
             patient_mask = combined_mask[patient_idx]
             time_seconds = np.arange(patient_mask.shape[0]) * 10
 
@@ -3478,6 +3663,9 @@ class Hybrid_SDE(LightningModule):
             )
             control_mean_patient = control_mean[patient_idx].detach().cpu().numpy()
             control_std_patient = control_std[patient_idx].detach().cpu().numpy()
+            
+            if self.debug:
+                print(f"[DEBUG] Patient {patient_idx} data shapes: pred_mean={pred_mean_patient.shape}, true={true_patient.shape}, control_mean={control_mean_patient.shape}")
 
             arterial_mask = patient_mask[:, 0].cpu().numpy().astype(bool)
             venous_mask = patient_mask[:, 1].cpu().numpy().astype(bool)
@@ -3526,12 +3714,19 @@ class Hybrid_SDE(LightningModule):
                 control_mean_patient.shape[1] if control_mean_patient.ndim == 2 else 1
             )
             nrows = 1 + num_latent_panels + 2 * num_controls
+            
+            if self.debug:
+                print(f"[DEBUG] Patient {patient_idx}: Creating figure with {nrows} rows, {num_controls} controls")
+            
             fig, axes = plt.subplots(
                 nrows, 1, figsize=(8, 2.0 * nrows + 3), sharex=True
             )
             if nrows == 1:
                 axes = [axes]
             ax1 = axes[0]
+            
+            if self.debug:
+                print(f"[DEBUG] Patient {patient_idx}: Figure created successfully, starting plot generation")
 
             # === TOP PANEL: Use same styling as uncertainty plots ===
             arterial_true = true_patient[:, 0].copy()
@@ -3859,24 +4054,38 @@ class Hybrid_SDE(LightningModule):
             )
             plt.tight_layout()
 
-            if self.log_wandb and getattr(self, 'trainer', None) is not None and self.trainer.is_global_zero and getattr(self, 'logger', None) is not None and hasattr(self.logger, 'experiment'):
+            wandb_condition = self.log_wandb and getattr(self, 'trainer', None) is not None and self.trainer.is_global_zero and getattr(self, 'logger', None) is not None and hasattr(self.logger, 'experiment')
+            if self.debug:
+                print(f"[DEBUG] Patient {patient_idx}: wandb_condition={wandb_condition}, log_wandb={self.log_wandb}, trainer={getattr(self, 'trainer', None) is not None}, is_global_zero={getattr(self.trainer, 'is_global_zero', 'no_trainer') if getattr(self, 'trainer', None) is not None else 'no_trainer'}")
+            
+            # Always save locally first
+            if self.debug:
+                print(f"[DEBUG] Patient {patient_idx}: Saving to file")
+            try:
+                last_hadm = int(getattr(self, "_last_hadm_ids", [None])[patient_idx])
+                last_traj = int(getattr(self, "_last_traj_ids", [None])[patient_idx])
+                id_suffix = f"_hadm{last_hadm}_traj{last_traj}" if last_hadm is not None and last_traj is not None else ""
+            except Exception:
+                id_suffix = ""
+            out_path = os.path.join(
+                self.train_dir,
+                f"control_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}{suffix}_controls.png",
+            )
+            if self.debug:
+                print(f"[DEBUG] About to save plot to: {out_path}")
+            plt.savefig(out_path, dpi=300, bbox_inches="tight")
+            print(f"[PLOT] Saved: {out_path}")
+            
+            # Also log to wandb if enabled
+            if wandb_condition:
+                if self.debug:
+                    print(f"[DEBUG] Patient {patient_idx}: Also logging to wandb")
                 try:
                     self.logger.experiment.log({f"enhanced_control_plot_batch_{batch_idx}_patient_{patient_idx}{suffix}": wandb.Image(plt)})
-                except Exception:
-                    pass
-            else:
-                try:
-                    last_hadm = int(getattr(self, "_last_hadm_ids", [None])[patient_idx])
-                    last_traj = int(getattr(self, "_last_traj_ids", [None])[patient_idx])
-                    id_suffix = f"_hadm{last_hadm}_traj{last_traj}" if last_hadm is not None and last_traj is not None else ""
-                except Exception:
-                    id_suffix = ""
-                out_path = os.path.join(
-                    self.train_dir,
-                    f"control_plots/{epoch_tag}_patient{patient_idx}_batch{batch_idx}{id_suffix}{suffix}_controls.png",
-                )
-                plt.savefig(out_path, dpi=300, bbox_inches="tight")
-                print(f"[PLOT] Saved: {out_path}")
+                except Exception as e:
+                    if self.debug:
+                        print(f"[WARN] Failed to log to wandb: {e}")
+            
             plt.close()
 
     def plot_mse_evolution(self, chart_type):

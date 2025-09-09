@@ -1,13 +1,13 @@
 # Training duration
-max_epochs: 10 # Maximum number of epochs to train.
+max_epochs: 40 # Maximum number of epochs to train.
 min_epochs: 1 # Minimum number of epochs to train.
 max_steps: -1 # Max steps to train for. Set to a positive integer to override max_epochs.
 
 # Hardware
 accelerator: "gpu" # Which accelerator to use ("gpu", "mps", "cpu", "auto").
 devices: 4 # Number of devices to use.
-strategy: "ddp_find_unused_parameters_true" # Distributed training strategy. auto
-accumulate_grad_batches: 2 # Number of gradient accumulation steps.
+strategy: "ddp_find_unused_parameters_true" # Distributed training strategy. auto ddp_find_unused_parameters_true
+accumulate_grad_batches: 1 # Number of gradient accumulation steps.
 
 # Optimization
 gradient_clip_val: 1.0 # The value to clip gradients at.

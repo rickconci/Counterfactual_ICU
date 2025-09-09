@@ -25,6 +25,7 @@ from lightning.pytorch.loggers import WandbLogger
 import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 
 # Helper to suppress annoying pandas future warnings
 import warnings
@@ -66,10 +67,64 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
+class Tee:
+    """Write to multiple streams (used to tee stderr to terminal and log)."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+        self.flush()
+
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        # Preserve TTY behavior if any underlying stream is a TTY (for tqdm)
+        try:
+            return any(getattr(s, "isatty", lambda: False)() for s in self.streams)
+        except Exception:
+            return False
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     # Set seed for reproducibility
     set_seed(cfg.seed)
+
+    # Redirect stdout/stderr to a file if configured
+    if getattr(cfg, "redirect_output", False):
+        original_stderr = sys.stderr
+        try:
+            out_dir = HydraConfig.get().runtime.output_dir
+        except Exception:
+            out_dir = os.getcwd()
+        log_name = getattr(cfg, "log_file", None)
+        if not log_name or not isinstance(log_name, str) or not log_name.strip():
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_name = f"train_{ts}.log"
+        os.makedirs(out_dir, exist_ok=True)
+        log_path = os.path.join(out_dir, log_name)
+        log_fp = open(log_path, "a", buffering=1)
+        import atexit
+        atexit.register(log_fp.close)
+        # Redirect ONLY stdout to preserve TQDM progress bar on stderr
+        sys.stdout = log_fp
+        try:
+            print(f"[REDIRECT] Output redirected to {log_path}", file=original_stderr)
+        except Exception:
+            pass
+        # Tee stderr to both terminal and log so errors are captured but tqdm remains visible
+        sys.stderr = Tee(original_stderr, log_fp)
 
     # Print the full configuration
     print("--- Configuration ---")
@@ -79,17 +134,17 @@ def main(cfg: DictConfig) -> None:
     # Initialize DataModule
     print("Initializing DataModule...")
     data_module = MIMICDataModule(
-        data_root=cfg.data.data_root,
-        icu_stays_path=cfg.data.icu_stays_path,
-        batch_size=cfg.data.batch_size,
-        num_workers=cfg.data.num_workers,
-        max_samples=cfg.data.max_samples,
-        split_mode=cfg.data.split_mode,
-        ood_holdout_ratio=cfg.data.ood_holdout_ratio,
-        filter_flat_trajectories=cfg.data.filter_flat_trajectories,
-        test_both_filtered_and_unfiltered=cfg.data.test_both_filtered_and_unfiltered,
-        use_raindrop_context=cfg.data.use_raindrop_context,
-        expert_latent_dim=cfg.data.expert_latent_dim,
+        data_root=cfg.data_config.data_root,
+        icu_stays_path=cfg.data_config.icu_stays_path,
+        batch_size=cfg.data_config.batch_size,
+        num_workers=cfg.data_config.num_workers,
+        max_samples=cfg.data_config.max_samples,
+        split_mode=cfg.data_config.split_mode,
+        ood_holdout_ratio=cfg.data_config.ood_holdout_ratio,
+        filter_flat_trajectories=cfg.data_config.filter_flat_trajectories,
+        test_both_filtered_and_unfiltered=cfg.data_config.test_both_filtered_and_unfiltered,
+        use_raindrop_context=cfg.data_config.use_raindrop_context,
+        expert_latent_dim=cfg.data_config.expert_latent_dim,
         random_state=cfg.seed
     )
     print("Setting up data...")
@@ -114,7 +169,7 @@ def main(cfg: DictConfig) -> None:
     else:
         anneal_iters = 2000 # Default value, will not be used by the model in other modes
 
-    # Hydra handles the output directory automatically
+    # Use Hydra's automatic output directory (includes informative naming)
     train_dir_final = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     print(f"All outputs will be saved to: {train_dir_final}")
     
@@ -188,8 +243,8 @@ def main(cfg: DictConfig) -> None:
         log_wandb=not cfg.disable_wandb,
         adjoint=cfg.model.adjoint,
         plot_every=cfg.model.plot_every,
-        batch_size=cfg.data.batch_size,
-        dataset=cfg.data.dataset_type,
+        batch_size=cfg.data_config.batch_size,
+        dataset=cfg.data_config.dataset_type,
         id_to_combo_map=(
             getattr(data_module.train_dataset, 'id_to_combo_map', None)
             if hasattr(data_module, 'train_dataset') and data_module.train_dataset is not None
@@ -216,12 +271,14 @@ def main(cfg: DictConfig) -> None:
         force_zenker_defaults=cfg.model.force_zenker_defaults,
         plot_control_samples=cfg.model.plot_control_samples,
         plot_include_burn_in=getattr(cfg.model, "plot_include_burn_in", True),
+        debug_on_nan_inf=cfg.debug_on_nan_inf,
+        redirect_output=cfg.redirect_output,
     )
 
     # Setup Logging & Callbacks
     logger = None
     if not cfg.disable_wandb:
-        run_name = cfg.run_name or f"{cfg.model.use_encoder}_{cfg.data.split_mode}_lr{cfg.model.learning_rate}_seed{cfg.seed}"
+        run_name = cfg.run_name or f"{cfg.model.use_encoder}_{cfg.data_config.split_mode}_lr{cfg.model.learning_rate}_seed{cfg.seed}"
         logger = WandbLogger(
             project=cfg.experiment_name,
             name=run_name,
@@ -253,8 +310,10 @@ def main(cfg: DictConfig) -> None:
         )
         callbacks.append(early_stop_callback)
 
-    progress_bar = TQDMProgressBar(refresh_rate=10)
-    callbacks.append(progress_bar)
+    # Add progress bar if enabled (kept on stderr even when stdout is redirected)
+    if getattr(cfg, 'show_progress_bar', True):
+        progress_bar = TQDMProgressBar(refresh_rate=1)
+        callbacks.append(progress_bar)
 
     # Initialize Trainer
     print("Initializing Trainer...")
@@ -279,17 +338,22 @@ def main(cfg: DictConfig) -> None:
         num_sanity_val_steps=0 if cfg.trainer.disable_sanity_check else 1,
         limit_val_batches=0 if cfg.trainer.disable_sanity_check else 1.0,
     )
+    # Train the model
+    print("Starting training...")
     if DEBUG:
         print("[DEBUG] main_beta.py: Trainer initialized. Starting fit...")
     trainer.fit(model, data_module)
     if DEBUG:
         print("[DEBUG] main_beta.py: Trainer fit completed.")
-    # At the end of main(), after trainer.fit():
-    if cfg.run_eval:
-        print("Running evaluation on test set...")
-        test_results = trainer.test(ckpt_path="best", dataloaders=data_module)
-
-        if cfg.data.test_both_filtered_and_unfiltered:
+    print("Training finished.")
+    
+    # Test the model - ALWAYS run tests after training
+    print("Starting testing...")
+    try:
+        # Use the best checkpoint for testing
+        test_results = trainer.test(ckpt_path="best", datamodule=data_module)
+        
+        if cfg.data_config.test_both_filtered_and_unfiltered:
             print(f"Test results (All trajectories): {test_results[0]}")
             print(f"Test results (Filtered trajectories): {test_results[1]}")
 
@@ -317,16 +381,14 @@ def main(cfg: DictConfig) -> None:
             if not cfg.disable_wandb and logger is not None:
                 for key, value in test_results[0].items():
                     logger.experiment.log({f"test/{key}": value})
-
-    # Train the model
-    print("Starting training...")
-    trainer.fit(model, datamodule=data_module)
-    print("Training finished.")
-    
-    # Test the model
-    print("Starting testing...")
-    trainer.test(model, datamodule=data_module)
-    print("Testing finished.")
+        
+        print("Testing finished successfully.")
+        
+    except Exception as e:
+        print(f"Error during testing: {e}")
+        print("Testing failed, but training completed successfully.")
+        # Re-raise the exception to ensure the process fails if testing is critical
+        raise
 
     if not cfg.disable_wandb:
         wandb.finish()

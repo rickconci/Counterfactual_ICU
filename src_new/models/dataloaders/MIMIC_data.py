@@ -642,6 +642,7 @@ class MIMICDataModule(L.LightningDataModule):
                 self.test_dataset_all = MIMICDataset(
                     data_root=self.data_root,
                     split="test",
+                    split_mode=self.split_mode,
                     random_state=self.random_state,
                     max_samples=self.max_samples,
                     filter_flat_trajectories=False
@@ -649,8 +650,10 @@ class MIMICDataModule(L.LightningDataModule):
                 self.test_dataset_filtered = MIMICDataset(
                     self.data_root,
                     split="test",
+                    split_mode=self.split_mode,
                     random_state=self.random_state,
                     max_samples=self.max_samples,
+                    ood_holdout_ratio=self.ood_holdout_ratio,
                     filter_flat_trajectories=True  # Filtered data only
                 )
                 if len(self.test_dataset_all) > 0 and self.context_input_dim is None:

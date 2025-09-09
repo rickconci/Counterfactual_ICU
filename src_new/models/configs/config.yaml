@@ -1,23 +1,30 @@
 defaults:
   - model: default
-  - data: default
+  - data_config: default
   - trainer: default
   - _self_
 
 # General Experiment Settings
 seed: 64 # Random seed for initialization
 experiment_name: "sdehybrid_rc_last" # Wandb project name
-saving_dir: "/n/netscratch/mzitnik_lab/Lab/rconci/BIOMM/results" # Base directory for saving models and logs
+saving_dir: "/n/holylfs06/LABS/mzitnik_lab/Lab/rconci/Counterfactual_ICU/results" # Base directory for saving models and logs
 run_name: null # A specific name for the run. If null, a name is auto-generated.
 notes: "Default run from config." # Notes for this run.
+
+# Hydra configuration for informative output directories
+hydra:
+  run:
+    dir: ${saving_dir}/enc_${model.use_encoder}_split_${data_config.split_mode}_lr${model.learning_rate}_bs${data_config.batch_size}_epochs${trainer.max_epochs}_seed${seed}_${now:%Y%m%d_%H%M%S}
 
 # Logging & Evaluation
 disable_wandb: false # Set to true to disable logging to Weights & Biases. The old --log_wandb is the opposite of this.
 HPC_work: true # Affects temp directories and other HPC-specific settings.
 run_eval: true # Run evaluation on the test set after training is complete.
-redirect_output: false # Redirect stdout/stderr to a log file instead of the terminal.
-log_file: "" # Optional explicit path to log file (default: train_<timestamp>.log).
+redirect_output: true # Redirect stdout/stderr to a log file instead of the terminal.
+log_file: "training_output.log" # Optional explicit path to log file (default: train_<timestamp>.log).
+show_progress_bar: true # Show TQDM progress bar even when output is redirected.
 
 # Debugging
 audit_one_batch: false # If true, runs a one-batch audit of the dataloader and model inputs then exits.
 audit_print_samples: 3 # How many batch elements to print during the one-batch audit.
+debug_on_nan_inf: "raise" # What to do when NaN/Inf detected: "kill" (exit immediately), "debug" (enter debug mode), "raise" (raise exception)
