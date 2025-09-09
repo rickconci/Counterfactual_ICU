@@ -156,7 +156,6 @@ class MIMICDataset(Dataset):
 
             # Filter out flat trajectories if enabled
             if self.filter_flat_trajectories:
-                print(f"Before filtering: {len(all_trajectories)} trajectories")
 
                 filtered_trajectories = []
 
@@ -179,8 +178,6 @@ class MIMICDataset(Dataset):
                         print(f"Error loading trajectory {traj_key}: {e}")
                         continue
 
-                print(f"After filtering: {len(filtered_trajectories)} trajectories")
-                print(f"Filtered out {len(all_trajectories)-len(filtered_trajectories)} flat trajectories")
                 all_trajectories = filtered_trajectories
             else:
                 #print("Flat trajectory filtering is disabled")
