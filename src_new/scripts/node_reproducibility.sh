@@ -73,7 +73,7 @@ for seed in "${SEEDS[@]}"; do
         model.loss_type=nll \
         model.log_lik_scale_mode=annealing \
         model.controller_type=mlp \
-        seed_everything=${seed} \
+        +seed_everything=${seed} \
         run_name="${run_name}" \
         data.data_root='../../data/mimic_3_data/processed_data' \
         data.test_both_filtered_and_unfiltered=true \
