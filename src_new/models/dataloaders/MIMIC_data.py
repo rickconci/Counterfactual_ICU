@@ -154,34 +154,34 @@ class MIMICDataset(Dataset):
                 }
             )
 
-            # Filter out flat trajectories if enabled
-            if self.filter_flat_trajectories:
+        # Filter out flat trajectories if enabled
+        if self.filter_flat_trajectories:
 
-                filtered_trajectories = []
+            filtered_trajectories = []
 
-                for traj in all_trajectories:
-                    traj_key = traj["traj_key"]
+            for traj in all_trajectories:
+                traj_key = traj["traj_key"]
 
-                    # Load prediction targets to check flatness
-                    p_out_path = os.path.join(self.target_tensor_dir, f"pred_targets_{traj_key}.pt")
-                    if not os.path.exists(p_out_path):
-                        continue
+                # Load prediction targets to check flatness
+                p_out_path = os.path.join(self.target_tensor_dir, f"pred_targets_{traj_key}.pt")
+                if not os.path.exists(p_out_path):
+                    continue
 
-                    try:
-                        p_out_values, p_out_mask, _, _, _ = torch.load(p_out_path)
+                try:
+                    p_out_values, p_out_mask, _, _, _ = torch.load(p_out_path)
 
-                        # Use the class method to check flatness
-                        if not self.is_trajectory_flat(p_out_values, p_out_mask):
-                            filtered_trajectories.append(traj)
+                    # Use the class method to check flatness
+                    if not self.is_trajectory_flat(p_out_values, p_out_mask):
+                        filtered_trajectories.append(traj)
 
-                    except Exception as e:
-                        print(f"Error loading trajectory {traj_key}: {e}")
-                        continue
+                except Exception as e:
+                    print(f"Error loading trajectory {traj_key}: {e}")
+                    continue
 
-                all_trajectories = filtered_trajectories
-            else:
-                #print("Flat trajectory filtering is disabled")
-                pass
+            all_trajectories = filtered_trajectories
+        else:
+            #print("Flat trajectory filtering is disabled")
+            pass
 
         # Split by subject_id instead of hadm_id to prevent data leakage
         subject_trajectory_counts = {}
