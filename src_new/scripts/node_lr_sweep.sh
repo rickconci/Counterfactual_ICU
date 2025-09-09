@@ -36,6 +36,7 @@ for lr in "${LRS[@]}"; do
             model.loss_type=nll \
             model.log_lik_scale_mode=annealing \
             model.controller_type=mlp \
+            model.num_samples=1 \
             run_name="${run_name}" \
             data.data_root='../../data/mimic_3_data/processed_data' \
             > logs/node_lr${lr}_${encoder}_sigma0_gpu${gpu_counter}_$(date +%Y%m%d_%H%M%S).log 2>&1 &
