@@ -617,12 +617,6 @@ class NSDE(LightningModule):
         except Exception:
             self.max_plotted_patients = 4
 
-        net_input_dims = (
-            self.encoder_output_dim
-            if SDE_input_state == "full"
-            else self.encoder_output_dim - len(encoder_input_dim)
-        )
-        net_input_dims = net_input_dims + 2 if include_time else net_input_dims
 
         # Medication embedding config (project variable med context dims -> fixed size)
         self.n_medications = int(n_medications)
@@ -634,21 +628,12 @@ class NSDE(LightningModule):
             self.med_proj = nn.Linear(int(self.n_medications) * 5, int(self.med_embed_dim), bias=True)
         else:
             self.med_proj = None
-
-        if self.use_encoder != "none":
-            self.ic_consistency_weight = 0
-            # add fixed med embedding dims
-            net_input_dims = net_input_dims + self.med_embed_dim
-        else:
-            self.ic_consistency_weight = 0
-            # expert latents + fixed med embedding dims + neural embedding
-            net_input_dims = self.expert_latent_dims + self.med_embed_dim + encoder_SDENN_dims
-            net_input_dims = net_input_dims + 2 if include_time else net_input_dims
-
-        # Append physics-derived feature count (ΔP, r_tpr, f_hr, F, dpa_base, dpv_base, sigma, s_dot)
+        self.ic_consistency_weight = 0
         net_input_dims = 2  # Current pressures [p_a, p_v]
-        net_input_dims += self.encoder_SDENN_dims  # Neural embedding
-        net_input_dims += 2 if include_time else 0  # Time encoding [sin(t), cos(t)]
+        if self.encoder_SDENN_dims > 0:
+            net_input_dims += self.encoder_SDENN_dims  # Neural embedding (if exists)
+        if self.include_time:
+            net_input_dims += 2  # Time encoding [sin(t), cos(t)]
         net_input_dims += self.med_embed_dim
 
         activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "none": None}
