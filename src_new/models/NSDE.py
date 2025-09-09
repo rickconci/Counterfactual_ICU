@@ -2289,9 +2289,7 @@ class NSDE(LightningModule):
     def on_save_checkpoint(self, checkpoint):
         # print('SAVING CHECKPOINT')
         # Manually add mu, sigma, theta to the checkpoint dictionary
-        checkpoint["mu"] = self.mu
         checkpoint["sigma"] = self.sigma
-        checkpoint["theta"] = self.theta
 
     def on_load_checkpoint(self, checkpoint):
         # print('LOADING CHECKPOINT')
