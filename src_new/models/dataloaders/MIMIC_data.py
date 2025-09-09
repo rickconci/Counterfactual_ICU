@@ -369,7 +369,7 @@ class MIMICDataset(Dataset):
                 ce_rd_src, ce_rd_times, ce_rd_length = torch.load(chartevents_context_path)
         elif chartevents_context_path:
             # Fallback path construction
-            fallback_path = os.path.join(data_root, "chartevents_tensors_output", "chartevents_context",
+            fallback_path = os.path.join(self.data_root, "chartevents_tensors_output", "chartevents_context",
                                          f"chartevents_context_{traj_key}.pt")
             if os.path.exists(fallback_path):
                 ce_rd_src, ce_rd_times, ce_rd_length = torch.load(fallback_path)
