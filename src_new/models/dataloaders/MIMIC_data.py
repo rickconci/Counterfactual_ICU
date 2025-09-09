@@ -643,16 +643,14 @@ class MIMICDataModule(L.LightningDataModule):
         if stage == "test" or stage is None:
             if self.test_both_filtered_and_unfiltered:
                 self.test_dataset_all = MIMICDataset(
-                    self.data_root,
-                    self.icu_stays_path,
+                    data_root=self.data_root,
                     split="test",
                     random_state=self.random_state,
                     max_samples=self.max_samples,
-                    filter_flat_trajectories=False  # All data
+                    filter_flat_trajectories=False
                 )
                 self.test_dataset_filtered = MIMICDataset(
                     self.data_root,
-                    self.icu_stays_path,
                     split="test",
                     random_state=self.random_state,
                     max_samples=self.max_samples,
