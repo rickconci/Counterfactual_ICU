@@ -45,6 +45,7 @@ for seed in "${SEEDS[@]}"; do
         model.log_lik_scale_mode=learnable \
         model.direct_pressure_controls=false \
         model.test_zenker=true \
+        data.data_root='../../data/mimic_3_data/processed_data' \
         run_name="${run_name}" \
         > logs/hybrid_sde_lr${LR}_${ENCODER}_seed${seed}_gpu${gpu_counter}_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
