@@ -1,0 +1,18 @@
+# hydra/launcher: ray
+# Runs locally; each job requests 1 GPU.
+_target_: hydra_plugins.hydra_ray_launcher.ray_launcher.RayLauncher
+
+ray:
+  # start a local Ray runtime
+  init:
+    address: null
+
+remote:
+  # resources per job
+  num_gpus: 1
+  num_cpus: 16
+  max_calls: 1
+
+cluster:
+  mode: local   # single machine
+  logging_level: INFO

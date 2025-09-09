@@ -1,0 +1,29 @@
+# @package _global_
+
+defaults:
+  - config
+
+# Enable the profiler
+profiler: true
+
+# Override trainer settings for a short profiling run
+trainer:
+  max_epochs: 1
+  limit_train_batches: 5
+  limit_val_batches: 1
+  overfit_batches: 5 # Overfit on 5 batches
+  accelerator: 'gpu'
+  devices: 1
+  strategy: 'auto'
+  
+# Override data config for profiling
+data_config:
+  batch_size: 64
+
+# Override model config to disable plotting during profiling
+model:
+  plot_outputs_train: false
+  plot_every: 999999  # Effectively disable by setting to a very high number
+
+# It can be helpful to disable logging to wandb during profiling
+disable_wandb: true

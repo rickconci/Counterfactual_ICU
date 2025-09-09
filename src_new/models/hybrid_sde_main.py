@@ -5,27 +5,14 @@ import tempfile
 import sys
 from datetime import datetime
 
-import numpy as np
-import torch
-
 # <<< New global DEBUG variable >>>
 DEBUG = False
 
-from dataloaders.MIMIC_data import MIMICDataModule
-from hybrid_sde_model import Hybrid_SDE
-from synthetic_data import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
-from lightning.pytorch import Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-from lightning.pytorch.loggers import WandbLogger
 
-import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
-from lightning.pytorch.loggers import WandbLogger
-import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
+
 
 # Helper to suppress annoying pandas future warnings
 import warnings
@@ -53,18 +40,6 @@ def str2bool(v):
     if s in ("no", "false", "f", "n", "0"):
         return False
     raise argparse.ArgumentTypeError("Boolean value expected (true/false)")
-
-
-def set_seed(seed):
-    seed_everything(seed, workers=True)
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # if using multi-GPU
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 class Tee:
@@ -98,6 +73,30 @@ class Tee:
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
+    # Moved imports into main to avoid Ray serialization errors
+    import numpy as np
+    import torch
+    import wandb
+    import lightning as L
+    from dataloaders.MIMIC_data import MIMICDataModule
+    from hybrid_sde_model import Hybrid_SDE
+    from synthetic_data import create_load_save_data, CVDataModule_IID, CVDataModule_OOD
+    from lightning.pytorch import Trainer, seed_everything
+    from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
+    from lightning.pytorch.loggers import WandbLogger
+    from lightning.pytorch.profilers import PyTorchProfiler
+
+    def set_seed(seed):
+        seed_everything(seed, workers=True)
+        random.seed(seed)
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # if using multi-GPU
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     # Set seed for reproducibility
     set_seed(cfg.seed)
 
@@ -273,6 +272,7 @@ def main(cfg: DictConfig) -> None:
         plot_include_burn_in=getattr(cfg.model, "plot_include_burn_in", True),
         debug_on_nan_inf=cfg.debug_on_nan_inf,
         redirect_output=cfg.redirect_output,
+        direct_pressure_controls=cfg.model.direct_pressure_controls,
     )
 
     # Setup Logging & Callbacks
@@ -315,6 +315,20 @@ def main(cfg: DictConfig) -> None:
         progress_bar = TQDMProgressBar(refresh_rate=1)
         callbacks.append(progress_bar)
 
+    # Initialize Profiler if enabled
+    profiler = None
+    if cfg.get("profiler", False):
+        profiler = PyTorchProfiler(
+            dirpath=train_dir_final,
+            filename="simple_perf_logs",
+            export_to_chrome=False,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            sort_by_key="cuda_time_total",
+        )
+        print("Simple PyTorch Profiler enabled. Performance logs will be saved to the output directory.")
+
     # Initialize Trainer
     print("Initializing Trainer...")
     trainer = L.Trainer(
@@ -335,24 +349,38 @@ def main(cfg: DictConfig) -> None:
         overfit_batches=cfg.trainer.overfit_batches,
         logger=logger,
         callbacks=callbacks,
+        profiler=profiler,
         num_sanity_val_steps=0 if cfg.trainer.disable_sanity_check else 1,
         limit_val_batches=0 if cfg.trainer.disable_sanity_check else 1.0,
     )
-    # Train the model
-    print("Starting training...")
-    if DEBUG:
-        print("[DEBUG] main_beta.py: Trainer initialized. Starting fit...")
-    trainer.fit(model, data_module)
-    if DEBUG:
-        print("[DEBUG] main_beta.py: Trainer fit completed.")
-    print("Training finished.")
-    
-    # Test the model - ALWAYS run tests after training
+    # Train the model, unless in test_only mode
+    if not getattr(cfg, "test_only", False):
+        print("Starting training...")
+        if DEBUG:
+            print("[DEBUG] main_beta.py: Trainer initialized. Starting fit...")
+        try:
+            trainer.fit(model, data_module)
+            if DEBUG:
+                print("[DEBUG] main_beta.py: Trainer fit completed.")
+        except KeyboardInterrupt:
+            print("\n[INTERRUPT] Caught KeyboardInterrupt. Stopping training gracefully and proceeding to testing with best checkpoint...")
+        except RuntimeError as e:
+            print(f"\n[ERROR] Caught RuntimeError: {e}. Proceeding to testing with best available checkpoint...")
+        finally:
+            print("Training finished.")
+
+    # Test the model
     print("Starting testing...")
+    ckpt_for_testing = "last"
+    if getattr(cfg, "test_only", False):
+        if not getattr(cfg, "ckpt_path", None):
+            raise ValueError("When test_only is True, a ckpt_path must be provided in the config.")
+        ckpt_for_testing = cfg.ckpt_path
+        print(f"Running in test-only mode. Loading checkpoint from: {ckpt_for_testing}")
+
     try:
-        # Use the best checkpoint for testing
-        test_results = trainer.test(ckpt_path="best", datamodule=data_module)
-        
+        test_results = trainer.test(model=model, ckpt_path=ckpt_for_testing, datamodule=data_module)
+
         if cfg.data_config.test_both_filtered_and_unfiltered:
             print(f"Test results (All trajectories): {test_results[0]}")
             print(f"Test results (Filtered trajectories): {test_results[1]}")
@@ -381,9 +409,9 @@ def main(cfg: DictConfig) -> None:
             if not cfg.disable_wandb and logger is not None:
                 for key, value in test_results[0].items():
                     logger.experiment.log({f"test/{key}": value})
-        
+
         print("Testing finished successfully.")
-        
+
     except Exception as e:
         print(f"Error during testing: {e}")
         print("Testing failed, but training completed successfully.")

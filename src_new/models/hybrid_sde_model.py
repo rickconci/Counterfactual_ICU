@@ -623,8 +623,11 @@ class Hybrid_SDE(LightningModule):
         else:
             self.prior_tx_sigma_per_control = torch.tensor(prior_tx_sigma_per_control, dtype=torch.float32)
 
-        if self.prior_tx_sigma_per_control.shape[0] != SDEnet_out_dims:
-            raise ValueError(f"Length of prior_tx_sigma_per_control ({self.prior_tx_sigma_per_control.shape[0]}) must match SDEnet_out_dims ({SDEnet_out_dims})")
+        if self.prior_tx_sigma_per_control.shape[0] != self.SDEnet_out_dims:
+            # Align length by repeating/truncating to match effective control heads
+            effective_heads = int(self.SDEnet_out_dims)
+            reps = (effective_heads + self.prior_tx_sigma_per_control.numel() - 1) // self.prior_tx_sigma_per_control.numel()
+            self.prior_tx_sigma_per_control = self.prior_tx_sigma_per_control.repeat(reps)[:effective_heads]
             
         self.prior_tx_mu = prior_tx_mu
 
@@ -769,7 +772,7 @@ class Hybrid_SDE(LightningModule):
         # Head 0 (dpv_dt): ~0.1 mmHg/s
         # Head 1 (dsv_dt): ~0.02 units per time step
         # Head 2 (dt_ca): ~0.01 units per time step
-        # Head 3 (dt_r_tpr_mod): ~0.01 units per time step
+        # Head 3 (dpa_dt): ~0.01 mmHg/s
         default_scales = torch.tensor([0.1, 0.02, 0.01, 0.01], dtype=torch.float32)
         if self.SDEnet_out_dims != len(default_scales):
             # Fallback: repeat or truncate to match dims
@@ -1774,7 +1777,7 @@ class Hybrid_SDE(LightningModule):
                 print(f"  control derivs (first sample): {dt_i_ext_SDE[0]}")
                 try:
                     print(
-                        f"  dpv_dt(after ctl) mean={dpv_dt.mean().item():.4f}, dt_ca mean={dt_ca.mean().item():.6f}, dt_r_tpr_mod mean={dt_r_tpr_mod.mean().item():.6f}"
+                        f"  dpa_dt(after ctl) mean={dpa_dt.mean().item():.4f}, dpv_dt(after ctl) mean={dpv_dt.mean().item():.4f}, dt_ca mean={dt_ca.mean().item():.6f}"
                     )
                 except Exception:
                     pass
@@ -3875,12 +3878,12 @@ class Hybrid_SDE(LightningModule):
 
             # === Controls: one subplot per control dimension ===
             control_cmap = plt.cm.get_cmap("tab10", num_controls)
-            control_short = ["dpv", "sv", "ca", "r_tpr_mod"]
+            control_short = ["dpv", "sv", "ca", "dpa"]
             control_pretty = [
                 "Venous pressure",
                 "Stroke volume",
                 "Arterial compliance",
-                "TPR modifier",
+                "Arterial pressure",
             ]
             for control_idx in range(num_controls):
                 axc = axes[1 + num_latent_panels + 2 * control_idx]

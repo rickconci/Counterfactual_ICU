@@ -11,6 +11,7 @@ python src_new/models/hybrid_sde_main.py -m \
   model.num_samples=3 \
   model.loss_type=nll \
   model.log_lik_scale_mode=annealing
+  model.direct_pressure_controls=true,false
 
 
 python src_new/models/hybrid_sde_main.py -m \
@@ -26,3 +27,39 @@ python src_new/models/hybrid_sde_main.py -m \
   model.num_samples=1 \ 
   model.loss_type=mse \
   model.log_lik_scale_mode=fixed
+
+
+python hybrid_sde_main.py -m \
+
+
+python -m hybrid_sde_main \
+  -m \
+  hydra/launcher=ray \
+  trainer.max_epochs=10 \
+  data_config.batch_size=64 \
+  model.learning_rate='1e-4,5e-4' \
+  model.use_encoder='raindrop,none' \
+  model.num_samples=3 \
+  model.loss_type=nll \
+  model.log_lik_scale_mode=learnable \
+  model.direct_pressure_controls='true,false' \
+  model.plot_outputs_train=true \
+  model.plot_every=20
+
+
+
+
+CUDA_VISIBLE_DEVICES=3 python hybrid_sde_main.py -m \
+  trainer.accelerator=gpu trainer.devices=1 trainer.strategy=auto \
+  trainer.precision=bf16-mixed trainer.accumulate_grad_batches=1 \
+  trainer.max_epochs=25 \
+  model.plot_outputs_train=true model.plot_every=15 \
+  data_config.batch_size=64 \
+  model.controller_type=mlp \
+  model.learning_rate=1e-4 \
+  seed=96 \
+  model.use_encoder=raindrop \
+  model.num_samples=3 \
+  model.loss_type=nll \
+  model.log_lik_scale_mode=learnable \
+  model.direct_pressure_controls=false

@@ -1,8 +1,6 @@
 """
-Synthetic data generation and data modules for cardiovascular SDE experiments.
-
-This module provides functions and classes for generating synthetic cardiovascular
-data using SDEs and creating PyTorch Lightning data modules for training.
+IMPORTANT: THIS FILE IS NOT USED IN THE CURRENT IMPLEMENTATION.
+PLEASE IGNORE AND USE SYNTHETIC DIR INSTEAD.
 """
 
 import os

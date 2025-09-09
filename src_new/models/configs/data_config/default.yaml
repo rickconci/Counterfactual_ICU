@@ -14,7 +14,7 @@ max_samples: null # Max dataset length (set to an integer for debugging, null fo
 split_mode: "random" # Data split mode. Choices: 'random', 'in_distribution_meds_combo', 'ood_meds_combo'
 ood_holdout_ratio: 0.1 # Percentage of medication combos to hold out for OOD test set.
 filter_flat_trajectories: false # Whether to only train and test on non-flat trajectories.
-test_both_filtered_and_unfiltered: false # If true, test on both all trajectories and filtered (non-flat) trajectories.
+test_both_filtered_and_unfiltered: true # If true, test on both all trajectories and filtered (non-flat) trajectories.
 
 # --- Model-related Data Settings ---
 use_raindrop_context: true # Whether to use the pre-processed Raindrop context tensors.
