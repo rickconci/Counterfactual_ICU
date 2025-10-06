@@ -19,3 +19,8 @@ wandb/
 model_checkpoints/
 data/input_data/
 processed_data/
+OldScripts/
+data/ 
+outputs_cluster_types/
+outputs_combo_hist
+outputs_showcase
